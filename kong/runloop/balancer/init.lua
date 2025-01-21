@@ -1,18 +1,18 @@
-local pl_tablex = require "pl.tablex"
-local utils = require "kong.tools.utils"
+local hostname_type = require("kong.tools.ip").hostname_type
 local hooks = require "kong.hooks"
-local get_certificate = require("kong.runloop.certificate").get_certificate
 local recreate_request = require("ngx.balancer").recreate_request
+local uuid = require("kong.tools.uuid").uuid
 
 local healthcheckers = require "kong.runloop.balancer.healthcheckers"
 local balancers = require "kong.runloop.balancer.balancers"
+local upstream_ssl = require "kong.runloop.upstream_ssl"
 local upstreams = require "kong.runloop.balancer.upstreams"
 local targets = require "kong.runloop.balancer.targets"
 
 
 -- due to startup/require order, cannot use the ones from 'kong' here
 local dns_client = require "kong.resty.dns.client"
-
+local replace_dashes_lower  = require("kong.tools.string").replace_dashes_lower
 
 local toip = dns_client.toip
 local sub = string.sub
@@ -27,19 +27,21 @@ local table = table
 local table_concat = table.concat
 local run_hook = hooks.run_hook
 local var = ngx.var
-
+local get_updated_now_ms = require("kong.tools.time").get_updated_now_ms
+local is_http_module   = ngx.config.subsystem == "http"
 
 local CRIT = ngx.CRIT
 local ERR = ngx.ERR
 local WARN = ngx.WARN
-local EMPTY_T = pl_tablex.readonly {}
+local EMPTY_T = require("kong.tools.table").EMPTY
 
 
 local set_authority
-local set_upstream_cert_and_key
+
+local fallback_upstream_client_cert = upstream_ssl.fallback_upstream_client_cert
+
 if ngx.config.subsystem ~= "stream" then
   set_authority = require("resty.kong.grpc").set_authority
-  set_upstream_cert_and_key = require("resty.kong.tls").set_upstream_cert_and_key
 end
 
 
@@ -47,7 +49,6 @@ local get_query_arg
 do
   local sort = table.sort
   local get_uri_args = ngx.req.get_uri_args
-  local limit = 100
 
   -- OpenResty allows us to reuse the table that it populates with the request
   -- query args. The table is cleared by `ngx.req.get_uri_args` on each use, so
@@ -55,15 +56,22 @@ do
   --
   -- @see https://github.com/openresty/lua-resty-core/pull/288
   -- @see https://github.com/openresty/lua-resty-core/blob/3c3d0786d6e26282e76f39f4fe5577d316a47a09/lib/resty/core/request.lua#L196-L208
-  local cache = require("table.new")(0, limit)
-
+  local cache
+  local limit
 
   function get_query_arg(name)
+    if not limit then
+      limit = kong and kong.configuration and kong.configuration.lua_max_uri_args or 100
+      cache = require("table.new")(0, limit)
+    end
+
     local query, err = get_uri_args(limit, cache)
 
     if err == "truncated" then
       log(WARN, "could not fetch all query string args for request, ",
-                "hash value may be empty/incomplete")
+                "hash value may be empty/incomplete, please consider ",
+                 "increasing the value of 'lua_max_uri_args' ",
+                 "(currently at ",  limit, ")")
 
     elseif not query then
       log(ERR, "failed fetching query string args: ", err or "unknown error")
@@ -122,10 +130,10 @@ local function get_value_to_hash(upstream, ctx)
       identifier = var.remote_addr
 
     elseif hash_on == "header" then
-      identifier = ngx.req.get_headers()[upstream[header_field_name]]
-      if type(identifier) == "table" then
-        identifier = table_concat(identifier)
-      end
+      -- since nginx 1.23.0/openresty 1.25.3.1
+      -- ngx.var will automatically combine all header values with identical name
+      local header_name = replace_dashes_lower(upstream[header_field_name])
+      identifier = var["http_" .. header_name]
 
     elseif hash_on == "cookie" then
       identifier = var["cookie_" .. upstream.hash_on_cookie]
@@ -137,7 +145,7 @@ local function get_value_to_hash(upstream, ctx)
           ctx = ngx.ctx
         end
 
-        identifier = utils.uuid()
+        identifier = uuid()
 
         ctx.balancer_data.hash_cookie = {
           key = upstream.hash_on_cookie,
@@ -298,6 +306,7 @@ local function execute(balancer_data, ctx)
   if dns_cache_only then
     -- retry, so balancer is already set if there was one
     balancer = balancer_data.balancer
+    upstream = balancer_data.upstream
 
   else
     -- first try, so try and find a matching balancer/upstream object
@@ -313,6 +322,8 @@ local function execute(balancer_data, ctx)
 
       -- store for retries
       balancer_data.balancer = balancer
+      -- store for use in subrequest `ngx.location.capture("kong_buffered_http")`
+      balancer_data.upstream = upstream
 
       -- calculate hash-value
       -- only add it if it doesn't exist, in case a plugin inserted one
@@ -322,30 +333,14 @@ local function execute(balancer_data, ctx)
         balancer_data.hash_value = hash_value
       end
 
-      if ctx and ctx.service and not ctx.service.client_certificate then
-        -- service level client_certificate is not set
-        local cert, res, err
-        local client_certificate = upstream.client_certificate
-
-        -- does the upstream object contains a client certificate?
-        if client_certificate then
-          cert, err = get_certificate(client_certificate)
-          if not cert then
-            log(ERR, "unable to fetch upstream client TLS certificate ",
-                     client_certificate.id, ": ", err)
-            return
-          end
-
-          res, err = set_upstream_cert_and_key(cert.cert, cert.key)
-          if not res then
-            log(ERR, "unable to apply upstream client TLS certificate ",
-                     client_certificate.id, ": ", err)
-          end
-        end
-      end
+      fallback_upstream_client_cert(ctx, upstream)
     end
   end
 
+  if not ctx then
+    ctx = ngx.ctx
+  end
+  ctx.KONG_UPSTREAM_DNS_START = get_updated_now_ms()
   local ip, port, hostname, handle
   if balancer then
     -- have to invoke the ring-balancer
@@ -364,10 +359,23 @@ local function execute(balancer_data, ctx)
     balancer_data.balancer_handle = handle
 
   else
+    -- Note: balancer_data.retry_callback is only set by PDK once in access phase
+    -- if kong.service.set_target_retry_callback is called
+    if balancer_data.try_count ~= 0 and balancer_data.retry_callback then
+      local pok, perr, err = pcall(balancer_data.retry_callback)
+      if not pok or not perr then
+        log(ERR, "retry handler failed: ", err or perr)
+        return nil, "failure to get a peer from retry handler", 503
+      end
+    end
+
     -- have to do a regular DNS lookup
     local try_list
     local hstate = run_hook("balancer:to_ip:pre", balancer_data.host)
     ip, port, try_list = toip(balancer_data.host, balancer_data.port, dns_cache_only)
+    if not dns_cache_only then
+      ctx.KONG_UPSTREAM_DNS_END_AT = get_updated_now_ms()
+    end
     run_hook("balancer:to_ip:post", hstate)
     hostname = balancer_data.host
     if not ip then
@@ -415,7 +423,7 @@ local function post_health(upstream, hostname, ip, port, is_healthy)
   end
 
   local ok, err
-  if ip and (utils.hostname_type(ip) ~= "name") then
+  if ip and (hostname_type(ip) ~= "name") then
     ok, err = healthchecker:set_target_status(ip, port, hostname, is_healthy)
   else
     ok, err = healthchecker:set_all_target_statuses_for_hostname(hostname, port, is_healthy)
@@ -458,7 +466,11 @@ local function set_host_header(balancer_data, upstream_scheme, upstream_host, is
 
     var.upstream_host = new_upstream_host
 
-    if is_balancer_phase then
+   -- stream module does not support ngx.balancer.recreate_request
+    -- and we do not need to recreate the request in balancer_by_lua
+    -- some nginx proxy variables will compile when init upstream ssl connection
+    -- https://github.com/nginx/nginx/blob/master/src/stream/ngx_stream_proxy_module.c#L1070
+    if is_balancer_phase and is_http_module then
       return recreate_request()
     end
   end
@@ -466,11 +478,17 @@ local function set_host_header(balancer_data, upstream_scheme, upstream_host, is
   return true
 end
 
-
+local function after_balance(balancer_data, ctx)
+  if balancer_data and balancer_data.balancer_handle then
+    local balancer = balancer_data.balancer
+    balancer:afterBalance(ctx, balancer_data.balancer_handle)
+  end
+end
 
 return {
   init = init,
   execute = execute,
+  after_balance = after_balance,
   on_target_event = targets.on_target_event,
   on_upstream_event = upstreams.on_upstream_event,
   get_upstream_by_name = upstreams.get_upstream_by_name,

@@ -19,23 +19,64 @@ local function get_database()
   return db
 end
 
+
+local function database_has_relation(state, arguments)
+  local table_name = arguments[1]
+  local schema = arguments[2] or "public"
+  local db = get_database()
+  local res, err
+  if database_type() == 'postgres' then
+    res, err = db.connector:query(string.format(
+        "select true"
+        .. " from pg_tables"
+        .. " where tablename = '%s'"
+        .. " and schemaname = '%s'",
+        table_name, schema))
+  else
+    return false
+  end
+  if err then
+    return false
+  end
+  return not(not(res[1]))
+end
+
+say:set("assertion.database_has_relation.positive", "Expected schema to have table %s")
+say:set("assertion.database_has_relation.negative", "Expected schema not to have table %s")
+assert:register("assertion", "database_has_relation", database_has_relation, "assertion.database_has_relation.positive", "assertion.database_has_relation.negative")
+
+
+local function database_has_trigger(state, arguments)
+  local trigger_name = arguments[1]
+  local db = get_database()
+  local res, err
+  if database_type() == 'postgres' then
+    res, err = db.connector:query(string.format(
+        "select true"
+        .. " from pg_trigger"
+        .. " where tgname = '%s'",
+        trigger_name))
+  else
+    return false
+  end
+  if err then
+    return false
+  end
+  return not(not(res[1]))
+end
+
+say:set("assertion.database_has_trigger.positive", "Expected database to have trigger %s")
+say:set("assertion.database_has_trigger.negative", "Expected database not to have trigger %s")
+assert:register("assertion", "database_has_trigger", database_has_trigger, "assertion.database_has_trigger.positive", "assertion.database_has_trigger.negative")
+
+
 local function table_has_column(state, arguments)
   local table = arguments[1]
   local column_name = arguments[2]
   local postgres_type = arguments[3]
-  local cassandra_type = arguments[4] or postgres_type
   local db = get_database()
   local res, err
-  if database_type() == 'cassandra' then
-    res, err = db.connector:query(string.format(
-        "select *"
-        .. " from system_schema.columns"
-        .. " where table_name = '%s'"
-        .. "   and column_name = '%s'"
-        .. "   and type = '%s'"
-        .. " allow filtering",
-        table, column_name, cassandra_type))
-  elseif database_type() == 'postgres' then
+  if database_type() == 'postgres' then
     res, err = db.connector:query(string.format(
         "select true"
         .. " from information_schema.columns"
@@ -110,7 +151,7 @@ local function start_kong()
     admin_listen          = "0.0.0.0:9001",
     admin_ssl             = false,
     admin_gui_ssl         = false,
-    nginx_conf = "spec/fixtures/custom_nginx.template"
+    nginx_conf            = "spec/fixtures/custom_nginx.template",
   }
 end
 
@@ -138,6 +179,42 @@ local function all_phases(phrase, f)
   return it_when("all_phases", phrase, f)
 end
 
+
+--- Get a Busted test handler for migration tests.
+--
+-- This convenience function determines the appropriate Busted handler
+-- (`busted.describe` or `busted.pending`) based on the "old Kong version"
+-- that migrations are running on and the specified version range.
+--
+-- @function get_busted_handler
+-- @param min_version The minimum Kong version (inclusive)
+-- @param max_version The maximum Kong version (inclusive)
+-- @return `busted.describe` if Kong's version is within the specified range,
+--         `busted.pending` otherwise.
+-- @usage
+-- local handler = get_busted_handler("3.3.0", "3.6.0")
+-- handler("some migration test", function() ... end)
+local get_busted_handler
+do
+  local function get_version_num(v1, v2)
+    if v2 then
+      assert(#v2 == #v1, string.format("different version format: %s and %s", v1, v2))
+    end
+    return assert(tonumber((v1:gsub("%.", ""))), "invalid version: " .. v1)
+  end
+
+  function get_busted_handler(min_version, max_version)
+    local old_version_var = assert(os.getenv("OLD_KONG_VERSION"), "old version not set")
+    local old_version = string.match(old_version_var, "[^/]+$")
+
+    local old_version_num = get_version_num(old_version)
+    local min_v_num = min_version and get_version_num(min_version, old_version) or 0
+    local max_v_num = max_version and get_version_num(max_version, old_version) or math.huge
+
+    return old_version_num >= min_v_num and old_version_num <= max_v_num and busted.describe or busted.pending
+  end
+end
+
 return {
   database_type = database_type,
   get_database = get_database,
@@ -151,5 +228,6 @@ return {
   old_after_up = old_after_up,
   new_after_up = new_after_up,
   new_after_finish = new_after_finish,
-  all_phases = all_phases
+  all_phases = all_phases,
+  get_busted_handler = get_busted_handler,
 }

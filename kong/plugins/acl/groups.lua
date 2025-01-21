@@ -1,7 +1,4 @@
-local tablex = require "pl.tablex"
-
-
-local EMPTY = tablex.readonly {}
+local EMPTY = require("kong.tools.table").EMPTY
 
 
 local kong = kong
@@ -196,6 +193,16 @@ local function group_in_groups(groups_to_check, groups)
   end
 end
 
+local function warmup_groups_cache(consumer_id)
+  local cache_key = kong.db.acls:cache_key(consumer_id)
+  local _, err = kong.cache:get(cache_key, nil,
+                                         load_groups_into_memory,
+                                         { id = consumer_id })
+  if err then
+    return nil, err
+  end
+end
+
 
 return {
   get_current_consumer_id = get_current_consumer_id,
@@ -203,4 +210,5 @@ return {
   get_authenticated_groups = get_authenticated_groups,
   consumer_in_groups = consumer_in_groups,
   group_in_groups = group_in_groups,
+  warmup_groups_cache = warmup_groups_cache,
 }

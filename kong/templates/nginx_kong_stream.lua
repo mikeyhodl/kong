@@ -10,24 +10,19 @@ lua_socket_pool_size   ${{LUA_SOCKET_POOL_SIZE}};
 lua_socket_log_errors  off;
 lua_max_running_timers 4096;
 lua_max_pending_timers 16384;
-lua_ssl_verify_depth   ${{LUA_SSL_VERIFY_DEPTH}};
-> if lua_ssl_trusted_certificate_combined then
-lua_ssl_trusted_certificate '${{LUA_SSL_TRUSTED_CERTIFICATE_COMBINED}}';
-> end
+
+include 'nginx-kong-stream-inject.conf';
 
 lua_shared_dict stream_kong                        5m;
 lua_shared_dict stream_kong_locks                  8m;
 lua_shared_dict stream_kong_healthchecks           5m;
-lua_shared_dict stream_kong_process_events         5m;
 lua_shared_dict stream_kong_cluster_events         5m;
 lua_shared_dict stream_kong_rate_limiting_counters 12m;
 lua_shared_dict stream_kong_core_db_cache          ${{MEM_CACHE_SIZE}};
 lua_shared_dict stream_kong_core_db_cache_miss     12m;
 lua_shared_dict stream_kong_db_cache               ${{MEM_CACHE_SIZE}};
 lua_shared_dict stream_kong_db_cache_miss          12m;
-> if database == "cassandra" then
-lua_shared_dict stream_kong_cassandra              5m;
-> end
+lua_shared_dict stream_kong_secrets                5m;
 
 > if ssl_ciphers then
 ssl_ciphers ${{SSL_CIPHERS}};
@@ -38,7 +33,17 @@ ssl_ciphers ${{SSL_CIPHERS}};
 $(el.name) $(el.value);
 > end
 
+> if ssl_cipher_suite == 'old' then
+lua_ssl_conf_command CipherString DEFAULT:@SECLEVEL=0;
+proxy_ssl_conf_command CipherString DEFAULT:@SECLEVEL=0;
+ssl_conf_command CipherString DEFAULT:@SECLEVEL=0;
+> end
+
 init_by_lua_block {
+> if test and coverage then
+    require 'luacov'
+    jit.off()
+> end -- test and coverage
     -- shared dictionaries conflict between stream/http modules. use a prefix.
     local shared = ngx.shared
     local stream_shdict_prefix = "stream_"
@@ -89,7 +94,7 @@ server {
 > end
 
 > if stream_proxy_ssl_enabled then
-    listen unix:${{PREFIX}}/stream_tls_terminate.sock ssl proxy_protocol;
+    listen unix:${{SOCKET_PATH}}/${{STREAM_TLS_TERMINATE_SOCK}} ssl proxy_protocol;
 > end
 
     access_log ${{PROXY_STREAM_ACCESS_LOG}};
@@ -110,17 +115,20 @@ server {
     ssl_certificate     $(ssl_cert[i]);
     ssl_certificate_key $(ssl_cert_key[i]);
 > end
-    ssl_session_cache   shared:StreamSSL:10m;
+    ssl_session_cache   shared:StreamSSL:${{SSL_SESSION_CACHE_SIZE}};
     ssl_certificate_by_lua_block {
         Kong.ssl_certificate()
     }
+    ssl_client_hello_by_lua_block {
+        Kong.ssl_client_hello()
+    }
 > end
 
-    set $tls_sni_name 'kong_upstream';
+    set $upstream_host '';
     preread_by_lua_block {
         Kong.preread()
     }
-    proxy_ssl_name $tls_sni_name;
+    proxy_ssl_name $upstream_host;
 
     proxy_ssl on;
     proxy_ssl_server_name on;
@@ -170,7 +178,7 @@ server {
 }
 
 server {
-    listen unix:${{PREFIX}}/stream_tls_passthrough.sock proxy_protocol;
+    listen unix:${{SOCKET_PATH}}/${{STREAM_TLS_PASSTHROUGH_SOCK}} proxy_protocol;
 
     access_log ${{PROXY_STREAM_ACCESS_LOG}};
     error_log ${{PROXY_STREAM_ERROR_LOG}} ${{LOG_LEVEL}};
@@ -200,7 +208,7 @@ server {
 
 > if database == "off" then
 server {
-    listen unix:${{PREFIX}}/stream_config.sock;
+    listen unix:${{SOCKET_PATH}}/${{STREAM_CONFIG_SOCK}};
 
     error_log  ${{ADMIN_ERROR_LOG}} ${{LOG_LEVEL}};
 
@@ -211,7 +219,7 @@ server {
 > end -- database == "off"
 
 server {        # ignore (and close }, to ignore content)
-    listen unix:${{PREFIX}}/stream_rpc.sock;
+    listen unix:${{SOCKET_PATH}}/${{STREAM_RPC_SOCK}};
     error_log  ${{ADMIN_ERROR_LOG}} ${{LOG_LEVEL}};
     content_by_lua_block {
         Kong.stream_api()
@@ -219,14 +227,12 @@ server {        # ignore (and close }, to ignore content)
 }
 > end -- #stream_listeners > 0
 
-> if not legacy_worker_events then
 server {
-    listen unix:${{PREFIX}}/stream_worker_events.sock;
+    listen unix:${{SOCKET_PATH}}/${{STREAM_WORKER_EVENTS_SOCK}};
     error_log  ${{ADMIN_ERROR_LOG}} ${{LOG_LEVEL}};
     access_log off;
     content_by_lua_block {
       require("resty.events.compat").run()
     }
 }
-> end -- not legacy_worker_events
 ]]

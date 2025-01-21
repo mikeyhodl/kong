@@ -1,4 +1,4 @@
-local base = require "resty.core.base"
+local get_request = require("resty.core.base").get_request
 
 
 local workspaces = {}
@@ -34,14 +34,18 @@ function workspaces.get_workspace()
 end
 
 
+function workspaces.get_workspace_name()
+  return "default"
+end
+
+
 function workspaces.set_workspace(ws)
   ngx.ctx.workspace = ws and ws.id
 end
 
 
 function workspaces.get_workspace_id(ctx)
-  local r = base.get_request()
-  if not r then
+  if not get_request() then
     return nil
   end
 

@@ -4,14 +4,16 @@ assert:set_parameter("TableFormatLevel", 5) -- when displaying tables, set a big
 ------------------------
 -- START TEST HELPERS --
 ------------------------
+
 local client
 local targets, balancers
 
+require "spec.helpers" -- initialize db
 local dns_utils = require "kong.resty.dns.utils"
 local mocker = require "spec.fixtures.mocker"
-local utils = require "kong.tools.utils"
+local uuid = require "kong.tools.uuid"
 
-local ws_id = utils.uuid()
+local ws_id = uuid.uuid()
 
 local helpers = require "spec.helpers.dns"
 local gettime = helpers.gettime
@@ -19,6 +21,7 @@ local sleep = helpers.sleep
 local dnsSRV = function(...) return helpers.dnsSRV(client, ...) end
 local dnsA = function(...) return helpers.dnsA(client, ...) end
 local dnsAAAA = function(...) return helpers.dnsAAAA(client, ...) end
+local dnsExpire = helpers.dnsExpire
 
 
 
@@ -197,12 +200,16 @@ end
 -- END TEST HELPERS --
 ----------------------
 
+for _, enable_new_dns_client in ipairs{ false, true } do
 
-describe("[consistent_hashing]", function()
-
+describe("[consistent_hashing]" .. (enable_new_dns_client and "[new dns]" or ""), function()
+  local srv_name = enable_new_dns_client and "_test._tcp.gelato.io"
+                                         or  "gelato.io"
   local snapshot
 
   setup(function()
+    _G.busted_new_dns_client = enable_new_dns_client
+
     _G.package.loaded["kong.resty.dns.client"] = nil -- make sure module is reloaded
     _G.package.loaded["kong.runloop.balancer.targets"] = nil -- make sure module is reloaded
 
@@ -217,14 +224,10 @@ describe("[consistent_hashing]", function()
 
     _G.kong = kong
 
-    kong.worker_events = require "resty.worker.events"
+    kong.worker_events = require "resty.events.compat"
     kong.worker_events.configure({
-      shm = "kong_process_events", -- defined by "lua_shared_dict"
-      timeout = 5,            -- life time of event data in shm
-      interval = 1,           -- poll interval (seconds)
-
-      wait_interval = 0.010,  -- wait before retry fetching event data
-      wait_max = 0.5,         -- max wait time before discarding event
+      listening = "unix:",
+      testing = true,
     })
 
     local function empty_each()
@@ -268,6 +271,7 @@ describe("[consistent_hashing]", function()
       -- so that CI and docker can have reliable results
       -- but remove `search` and `domain`
       search = {},
+      cache_purge = true,
     })
     snapshot = assert:snapshot()
   end)
@@ -315,10 +319,10 @@ describe("[consistent_hashing]", function()
         res[addr..":"..port] = (res[addr..":"..port] or 0) + 1
         res[host..":"..port] = (res[host..":"..port] or 0) + 1
       end
-      assert(15 == res["1.2.3.4:123"] or nil == res["1.2.3.4:123"], "mismatch")
-      assert(15 == res["mashape.com:123"] or nil == res["mashape.com:123"], "mismatch")
-      assert(15 == res["5.6.7.8:321"] or nil == res["5.6.7.8:321"], "mismatch")
-      assert(15 == res["getkong.org:321"] or nil == res["getkong.org:321"], "mismatch")
+      assert.is_true(15 == res["1.2.3.4:123"] or nil == res["1.2.3.4:123"], "mismatch")
+      assert.is_true(15 == res["mashape.com:123"] or nil == res["mashape.com:123"], "mismatch")
+      assert.is_true(15 == res["5.6.7.8:321"] or nil == res["5.6.7.8:321"], "mismatch")
+      assert.is_true(15 == res["getkong.org:321"] or nil == res["getkong.org:321"], "mismatch")
     end)
     it("evaluate the change in the continuum", function()
       local res1 = {}
@@ -355,8 +359,8 @@ describe("[consistent_hashing]", function()
       -- increasing the number of addresses from 5 to 6 should change 49% of
       -- targets if we were using a simple distribution, like an array.
       -- anyway, we should be below than 20%.
-      assert((dif/100) < 49, "it should be better than a simple distribution")
-      assert((dif/100) < 20, "it is still to much change ")
+      assert.is_true((dif/100) < 49, "it should be better than a simple distribution")
+      assert.is_true((dif/100) < 20, "it is still to much change ")
 
 
       add_target(b, "10.0.0.7", 7, 100)
@@ -380,10 +384,10 @@ describe("[consistent_hashing]", function()
       -- targets, and from 6 to 8, 76%, if we were using a simple distribution,
       -- like an array.
       -- either way, we should be below than 40% and 25%.
-      assert((dif/100) < 83, "it should be better than a simple distribution")
-      assert((dif/100) < 40, "it is still to much change ")
-      assert((dif2/100) < 76, "it should be better than a simple distribution")
-      assert((dif2/100) < 25, "it is still to much change ")
+      assert.is_true((dif/100) < 83, "it should be better than a simple distribution")
+      assert.is_true((dif/100) < 40, "it is still to much change ")
+      assert.is_true((dif2/100) < 76, "it should be better than a simple distribution")
+      assert.is_true((dif2/100) < 25, "it is still to much change ")
     end)
     it("gets an IP address and port number; consistent hashing skips unhealthy addresses", function()
       dnsA({
@@ -540,8 +544,8 @@ describe("[consistent_hashing]", function()
             error("unknown action received: "..tostring(action))
           end
           if action ~= "health" then
-            assert(ip == "mashape1.com" or ip == "mashape2.com")
-            assert(port == 8001 or port == 8002)
+            assert.is_true(ip == "mashape1.com" or ip == "mashape2.com")
+            assert.is_true(port == 8001 or port == 8002)
             assert.equals("mashape.com", hostname)
           end
         end
@@ -553,10 +557,10 @@ describe("[consistent_hashing]", function()
         { name = "mashape2.com", address = "12.34.56.2" },
       })
       dnsSRV({
-        { name = "mashape.com", target = "mashape1.com", port = 8001, weight = 5 },
-        { name = "mashape.com", target = "mashape2.com", port = 8002, weight = 5 },
+        { name = srv_name, target = "mashape1.com", port = 8001, weight = 5 },
+        { name = srv_name, target = "mashape2.com", port = 8002, weight = 5 },
       })
-      add_target(b, "mashape.com", 123, 100)
+      add_target(b, srv_name, 123, 100)
       ngx.sleep(0)
       assert.equal(2, count_add)
       assert.equal(0, count_remove)
@@ -847,6 +851,7 @@ describe("[consistent_hashing]", function()
       -- expire the existing record
       record.expire = 0
       record.expired = true
+      dnsExpire(client, record)
       -- do a lookup to trigger the async lookup
       client.resolve("really.really.really.does.not.exist.host.test", {qtype = client.TYPE_A})
       sleep(1) -- provide time for async lookup to complete
@@ -883,15 +888,15 @@ describe("[consistent_hashing]", function()
         { name = "mashape.com", address = "1.2.3.5" },
       })
       dnsSRV({
-        { name = "gelato.io", target = "1.2.3.6", port = 8001, weight = 5 },
-        { name = "gelato.io", target = "1.2.3.6", port = 8002, weight = 5 },
+        { name = srv_name, target = "1.2.3.6", port = 8001, weight = 5 },
+        { name = srv_name, target = "1.2.3.6", port = 8002, weight = 5 },
       })
       local b = new_balancer({
         dns = client,
         wheelSize = 1000,
       })
       add_target(b, "mashape.com", 80, 10)
-      add_target(b, "gelato.io", 80, 10)  --> port + weight will be ignored
+      add_target(b, srv_name, 80, 10)  --> port + weight will be ignored
       local count = count_indices(b)
       local state = copyWheel(b)
       -- 33%: 106 points
@@ -903,7 +908,7 @@ describe("[consistent_hashing]", function()
         ["1.2.3.6:8002"] = 53,
       }, count)
 
-      add_target(b, "gelato.io", 80, 20)  --> port + weight will be ignored
+      add_target(b, srv_name, 80, 20)  --> port + weight will be ignored
       count = count_indices(b)
       assert.same({
         ["1.2.3.4:80"]   = 106,
@@ -978,16 +983,16 @@ describe("[consistent_hashing]", function()
     end)
     it("renewed DNS SRV record; no changes", function()
       local record = dnsSRV({
-        { name = "gelato.io", target = "1.2.3.6", port = 8001, weight = 5 },
-        { name = "gelato.io", target = "1.2.3.6", port = 8002, weight = 5 },
-        { name = "gelato.io", target = "1.2.3.6", port = 8003, weight = 5 },
+        { name = srv_name, target = "1.2.3.6", port = 8001, weight = 5 },
+        { name = srv_name, target = "1.2.3.6", port = 8002, weight = 5 },
+        { name = srv_name, target = "1.2.3.6", port = 8003, weight = 5 },
       })
       dnsA({
         { name = "getkong.org", address = "9.9.9.9" },
       })
       local b = new_balancer({
         hosts = {
-          { name = "gelato.io" },
+          { name = srv_name },
           { name = "getkong.org", port = 123, weight = 10 },
         },
         dns = client,
@@ -996,9 +1001,9 @@ describe("[consistent_hashing]", function()
       local state = copyWheel(b)
       record.expire = gettime() -1 -- expire current dns cache record
       dnsSRV({    -- create a new record (identical)
-        { name = "gelato.io", target = "1.2.3.6", port = 8001, weight = 5 },
-        { name = "gelato.io", target = "1.2.3.6", port = 8002, weight = 5 },
-        { name = "gelato.io", target = "1.2.3.6", port = 8003, weight = 5 },
+        { name = srv_name, target = "1.2.3.6", port = 8001, weight = 5 },
+        { name = srv_name, target = "1.2.3.6", port = 8002, weight = 5 },
+        { name = srv_name, target = "1.2.3.6", port = 8003, weight = 5 },
       })
       -- create a spy to check whether dns was queried
       spy.on(client, "resolve")
@@ -1006,7 +1011,7 @@ describe("[consistent_hashing]", function()
       -- invoke balancer, to expire record and re-query dns
       --b:_hit_all()
       targets.resolve_targets(b.targets)
-      assert.spy(client.resolve).was_called_with("gelato.io",nil, nil)
+      assert.spy(client.resolve).was_called_with(srv_name,nil, nil)
       assert.same(state, copyWheel(b))
     end)
     it("low weight with zero-indices assigned doesn't fail", function()
@@ -1046,20 +1051,20 @@ describe("[consistent_hashing]", function()
       -- depending on order of insertion it is either 1 or 0 indices
       -- but it may never error.
       dnsSRV({
-        { name = "gelato.io", target = "1.2.3.6", port = 8001, weight = 0 },
-        { name = "gelato.io", target = "1.2.3.6", port = 8002, weight = 0 },
+        { name = srv_name, target = "1.2.3.6", port = 8001, weight = 0 },
+        { name = srv_name, target = "1.2.3.6", port = 8002, weight = 0 },
       })
       local b = new_balancer({
         hosts = {
           -- port and weight will be overridden by the above
-          { name = "gelato.io", port = 80, weight = 99999 },
+          { name = srv_name, port = 80, weight = 99999 },
         },
         dns = client,
         wheelSize = 100,
       })
       local ip, port = b:getPeer(false, nil, "test")
       assert.equal("1.2.3.6", ip)
-      assert(port == 8001 or port == 8002, "port expected 8001 or 8002")
+      assert.is_true(port == 8001 or port == 8002, "port expected 8001 or 8002")
     end)
     it("recreate Kong issue #2131", function()
       -- erasing does not remove the address from the host
@@ -1120,3 +1125,5 @@ describe("[consistent_hashing]", function()
     end)
   end)
 end)
+
+end

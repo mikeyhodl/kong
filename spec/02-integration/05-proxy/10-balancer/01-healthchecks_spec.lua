@@ -1,17 +1,19 @@
 local bu = require "spec.fixtures.balancer_utils"
 local cjson = require "cjson"
 local helpers = require "spec.helpers"
-local utils = require "kong.tools.utils"
+local uuid = require "kong.tools.uuid"
 
 
 local https_server = helpers.https_server
 
+-- we are not testing the ring balancer, but the health check. It's OK
+-- to have some variance in the number of requests each server responds.
+local ACCEPTED_LB_VAR = 0.3
 
 for _, strategy in helpers.each_strategy() do
   local bp
 
-  local DB_UPDATE_PROPAGATION = strategy == "cassandra" and 0.1 or 0
-  local DB_UPDATE_FREQUENCY   = strategy == "cassandra" and 0.1 or 0.1
+  local DB_UPDATE_FREQUENCY   = 0.1
   local proxy_port_1 = 9000
   local proxy_port_ssl = 9443
   local proxy_port_grpc = 9002
@@ -36,12 +38,12 @@ for _, strategy in helpers.each_strategy() do
       }
 
       fixtures.dns_mock:SRV {
-        name = "my.srv.test.com",
-        target = "a.my.srv.test.com",
+        name = "_srv._pro.my.srv.test.test",
+        target = "a.my.srv.test.test",
         port = 80,  -- port should fail to connect
       }
       fixtures.dns_mock:A {
-        name = "a.my.srv.test.com",
+        name = "a.my.srv.test.test",
         address = "127.0.0.1",
       }
 
@@ -55,7 +57,7 @@ for _, strategy in helpers.each_strategy() do
       }
 
       fixtures.dns_mock:SRV {
-        name = "srv-changes-port.test",
+        name = "_srv._pro.srv-changes-port.test",
         target = "a-changes-port.test",
         port = 90,  -- port should fail to connect
       }
@@ -80,7 +82,6 @@ for _, strategy in helpers.each_strategy() do
         proxy_listen = default_proxy_listen,
         nginx_conf = "spec/fixtures/custom_nginx.template",
         db_update_frequency = DB_UPDATE_FREQUENCY,
-        db_update_propagation = DB_UPDATE_PROPAGATION,
       }, nil, nil, fixtures))
 
     end)
@@ -113,7 +114,7 @@ for _, strategy in helpers.each_strategy() do
       })
       -- the following port will not be used, will be overwritten by
       -- the mocked SRV record.
-      bu.add_target(bp, upstream_id, "my.srv.test.com", 80)
+      bu.add_target(bp, upstream_id, "_srv._pro.my.srv.test.test", 80)
       local api_host = bu.add_api(bp, upstream_name)
       bu.end_testcase_setup(strategy, bp)
 
@@ -300,7 +301,7 @@ for _, strategy in helpers.each_strategy() do
       })
       -- the following port will not be used, will be overwritten by
       -- the mocked SRV record.
-      bu.add_target(bp, upstream_id, "srv-changes-port.test", 80)
+      bu.add_target(bp, upstream_id, "_srv._pro.srv-changes-port.test", 80)
       local api_host = bu.add_api(bp, upstream_name, { connect_timeout = 100, })
       bu.end_testcase_setup(strategy, bp)
 
@@ -327,7 +328,7 @@ for _, strategy in helpers.each_strategy() do
         assert.equals("UNHEALTHY", health.data[1].health)
         assert.equals("UNHEALTHY", health.data[1].data.addresses[1].health)
 
-        local status = bu.put_target_address_health(upstream_id, "srv-changes-port.test:80", "a-changes-port.test:90", "healthy")
+        local status = bu.put_target_address_health(upstream_id, "_srv._pro.srv-changes-port.test:80", "a-changes-port.test:90", "healthy")
         assert.same(204, status)
       end, 15)
 
@@ -381,8 +382,13 @@ for _, strategy in helpers.each_strategy() do
         assert.is.table(health.data[1])
         assert.equals("HEALTHCHECKS_OFF", health.data[1].health)
         assert.equals("HEALTHCHECKS_OFF", health.data[1].data.addresses[1].health)
-      end, 15)
 
+        local balancer_health = bu.get_balancer_health(upstream_name)
+        assert.is.table(balancer_health)
+        assert.is.table(balancer_health.data)
+        assert.equals("HEALTHCHECKS_OFF", balancer_health.data.health)
+        assert.equals("HEALTHY", balancer_health.data.balancer_health)
+      end, 15)
     end)
 
     it("an upstream that is removed and readed keeps the health status", function()
@@ -459,6 +465,8 @@ for _, strategy in helpers.each_strategy() do
       -- remove the upstream
       if strategy ~= "off" then
         bu.remove_upstream(bp, upstream_id)
+      else
+        bp.done()
       end
 
       -- add the upstream again
@@ -520,6 +528,8 @@ for _, strategy in helpers.each_strategy() do
 
     lazy_setup(function()
       bp = bu.get_db_utils_for_dc_and_admin_api(strategy, {
+        "snis",
+        "certificates",
         "services",
         "routes",
         "upstreams",
@@ -655,7 +665,6 @@ for _, strategy in helpers.each_strategy() do
         lua_ssl_trusted_certificate = "spec/fixtures/kong_spec.crt",
         stream_listen = "off",
         db_update_frequency = DB_UPDATE_FREQUENCY,
-        db_update_propagation = DB_UPDATE_PROPAGATION,
         plugins = "bundled,fail-once-auth",
       }))
     end)
@@ -681,7 +690,6 @@ for _, strategy in helpers.each_strategy() do
           prefix = "servroot2",
           log_level = "debug",
           db_update_frequency = DB_UPDATE_FREQUENCY,
-          db_update_propagation = DB_UPDATE_PROPAGATION,
         })
       end)
 
@@ -1091,7 +1099,7 @@ for _, strategy in helpers.each_strategy() do
               local api_host, service_id = bu.add_api(bp, upstream_name, { connect_timeout = 50, })
 
               -- add a plugin
-              local plugin_id = utils.uuid()
+              local plugin_id = uuid.uuid()
               bp.plugins:insert({
                 id = plugin_id,
                 service = { id = service_id },
@@ -1155,6 +1163,176 @@ for _, strategy in helpers.each_strategy() do
                 -- server2 will only respond for part of the test,
                 -- then server1 will take over.
                 local server2_oks = math.floor(requests / 4)
+                local server1_oks = requests - server2_oks
+                local server1 = https_server.new(port1, localhost)
+                local server2 = https_server.new(port2, localhost)
+                server1:start()
+                server2:start()
+
+                -- Go hit them with our test requests
+                local client_oks1, client_fails1 = bu.client_requests(bu.SLOTS, api_host)
+
+                -- set server2 unhealthy
+                assert(bu.direct_request(localhost, port2, "/unhealthy"))
+                assert
+                  .with_timeout(5)
+                  .eventually(function()
+                    local client = helpers.http_client(localhost, port2)
+                    local res = assert(client:send({
+                      method = "GET",
+                      path = "/status", })
+                    )
+                    client:close()
+                    return res.status == 500
+                  end)
+                  .is_truthy()
+
+                -- Another test requests hit
+                local client_oks2, client_fails2 = bu.client_requests(bu.SLOTS, api_host)
+                local client_oks = client_oks1 + client_oks2
+                local client_fails = client_fails1 + client_fails2
+
+                -- collect server results; hitcount
+                local count1 = server1:shutdown()
+                local count2 = server2:shutdown()
+
+                -- verify
+                assert.near(server1_oks, count1.ok, server1_oks * ACCEPTED_LB_VAR)
+                assert.near(server2_oks, count2.ok, server2_oks * ACCEPTED_LB_VAR)
+                assert.are.equal(0, count1.fail)
+                assert.near(nfails, count2.fail, nfails * ACCEPTED_LB_VAR)
+
+                assert.are.equal(requests - nfails, client_oks)
+                assert.are.equal(nfails, client_fails)
+              end
+            end)
+
+            it("perform passive health checks in downstream status code was changed", function()
+
+              for nfails = 1, 3 do
+
+                bu.begin_testcase_setup(strategy, bp)
+                -- configure healthchecks
+                local upstream_name, upstream_id = bu.add_upstream(bp, {
+                  healthchecks = bu.healthchecks_config {
+                    passive = {
+                      unhealthy = {
+                        http_failures = nfails,
+                      }
+                    }
+                  }
+                })
+                local port1 = bu.add_target(bp, upstream_id, localhost)
+                local port2 = bu.add_target(bp, upstream_id, localhost)
+                local api_host, service_id = bu.add_api(bp, upstream_name)
+                bp.plugins:insert({
+                  name = "pre-function",
+                  service = { id = service_id },
+                  config = {
+                    header_filter ={
+                      [[
+                        ngx.exit(200)
+                    ]],
+                    },
+                  }
+                })
+
+                bu.end_testcase_setup(strategy, bp)
+
+                -- setup target servers:
+                -- server2 will only respond for part of the test,
+                -- then server1 will take over.
+                local server1 = https_server.new(port1, localhost)
+                local server2 = https_server.new(port2, localhost)
+                server1:start()
+                server2:start()
+
+                -- set test parameters
+                local req_burst = 10
+                local total_requests = req_burst * 2
+                local target2_reqs = req_burst / 2
+                local target1_reqs = total_requests - target2_reqs
+
+                -- Go hit them with our test requests
+                local client_oks1, client_fails1 = bu.client_requests(req_burst, api_host)
+                assert(bu.direct_request(localhost, port2, "/unhealthy"))
+                assert
+                  .with_timeout(5)
+                  .eventually(function()
+                    local client = helpers.http_client(localhost, port2)
+                    local res = assert(client:send({
+                      method = "GET",
+                      path = "/status", })
+                    )
+                    client:close()
+                    return res.status == 500
+                  end)
+                  .is_truthy()
+
+                local client_oks2, client_fails2 = bu.client_requests(req_burst, api_host)
+
+                local client_oks = client_oks1 + client_oks2
+                local client_fails = client_fails1 + client_fails2
+
+                -- collect server results; hitcount
+                local count1 = server1:shutdown()
+                local count2 = server2:shutdown()
+
+                -- verify
+                assert.near(target1_reqs, count1.ok, target1_reqs * ACCEPTED_LB_VAR)
+                assert.near(target2_reqs, count2.ok, target2_reqs * ACCEPTED_LB_VAR)
+                assert.are.equal(0, count1.fail)
+                assert.are.equal(nfails, count2.fail)
+
+                assert.are.equal(client_oks, total_requests)
+                assert.are.equal(0, client_fails)
+              end
+            end)
+
+            it("#flaky perform passive health checks in downstream status code was changed with subrequest", function()
+
+              for nfails = 1, 3 do
+
+                bu.begin_testcase_setup(strategy, bp)
+                -- configure healthchecks
+                local upstream_name, upstream_id = bu.add_upstream(bp, {
+                  healthchecks = bu.healthchecks_config {
+                    passive = {
+                      unhealthy = {
+                        http_failures = nfails,
+                      }
+                    }
+                  }
+                })
+                local port1 = bu.add_target(bp, upstream_id, localhost)
+                local port2 = bu.add_target(bp, upstream_id, localhost)
+                local api_host, service_id = bu.add_api(bp, upstream_name)
+                bp.plugins:insert({
+                  name = "pre-function",
+                  service = { id = service_id },
+                  config = {
+                    access = {
+                      [[
+                        kong.service.request.enable_buffering()
+                      ]],
+                    },
+                    header_filter ={
+                      [[
+                        ngx.exit(200)
+                    ]],
+                    },
+                  }
+                })
+
+                bu.end_testcase_setup(strategy, bp)
+
+                local requests = bu.SLOTS * 2 -- go round the balancer twice
+
+                -- setup target servers:
+                -- server2 will only respond for part of the test,
+                -- then server1 will take over.
+                local server2_oks = math.floor(requests / 4)
+                local server1_oks = requests - server2_oks
                 local server1 = https_server.new(port1, localhost)
                 local server2 = https_server.new(port2, localhost)
                 server1:start()
@@ -1173,13 +1351,13 @@ for _, strategy in helpers.each_strategy() do
                 local count2 = server2:shutdown()
 
                 -- verify
-                assert.are.equal(requests - server2_oks - nfails, count1.ok)
-                assert.are.equal(server2_oks, count2.ok)
+                assert.near(server1_oks, count1.ok, server1_oks * ACCEPTED_LB_VAR)
+                assert.near(server2_oks, count2.ok, server2_oks * ACCEPTED_LB_VAR)
                 assert.are.equal(0, count1.fail)
                 assert.are.equal(nfails, count2.fail)
 
-                assert.are.equal(requests - nfails, client_oks)
-                assert.are.equal(nfails, client_fails)
+                assert.are.equal(client_oks, requests)
+                assert.are.equal(0, client_fails)
               end
             end)
 
@@ -1261,8 +1439,10 @@ for _, strategy in helpers.each_strategy() do
 
                 if health_threshold[i] < 100 then
                   assert.equals("HEALTHY", health.data.health)
+                  assert.equals("HEALTHY", health.data.balancer_health)
                 else
                   assert.equals("UNHEALTHY", health.data.health)
+                  assert.equals("UNHEALTHY", health.data.balancer_health)
                 end
 
                 -- 75% healthy
@@ -1280,8 +1460,10 @@ for _, strategy in helpers.each_strategy() do
 
                 if health_threshold[i] < 75 then
                   assert.equals("HEALTHY", health.data.health)
+                  assert.equals("HEALTHY", health.data.balancer_health)
                 else
                   assert.equals("UNHEALTHY", health.data.health)
+                  assert.equals("UNHEALTHY", health.data.balancer_health)
                 end
 
                 -- 50% healthy
@@ -1421,7 +1603,7 @@ for _, strategy in helpers.each_strategy() do
                   local requests = bu.SLOTS * 2 -- go round the balancer twice
                   local port1 = helpers.get_available_port()
                   local port2 = helpers.get_available_port()
-  
+
                   -- setup target servers:
                   -- server2 will only respond for part of the test,
                   -- then server1 will take over.
@@ -1430,7 +1612,7 @@ for _, strategy in helpers.each_strategy() do
                   local server2 = https_server.new(port2, "localhost", "http", true)
                   server1:start()
                   server2:start()
-  
+
                   -- configure healthchecks
                   bu.begin_testcase_setup(strategy, bp)
                   local upstream_name, upstream_id = bu.add_upstream(bp, {
@@ -1598,7 +1780,7 @@ for _, strategy in helpers.each_strategy() do
 
                 for i = 1, 3 do
                   hosts[i] = {
-                    hostname = bu.gen_multi_host(),
+                    hostname = "_srv._pro." .. bu.gen_multi_host(),
                     port1 = helpers.get_available_port(),
                     port2 = helpers.get_available_port(),
                   }
@@ -1667,14 +1849,14 @@ for _, strategy in helpers.each_strategy() do
                   })
                   bu.end_testcase_setup(strategy, bp)
 
-                  -- 1) server1 and server2 take requests
+                  -- 1. server1 and server2 take requests
                   local oks, fails = bu.client_requests(bu.SLOTS, api_host)
                   -- server2 goes unhealthy
                   assert(bu.direct_request(localhost, port2, "/unhealthy", protocol, hostname))
                   -- Wait until healthchecker detects
                   bu.poll_wait_address_health(upstream_id, hostname, port1, localhost, port2, "UNHEALTHY")
 
-                  -- 2) server1 takes all requests
+                  -- 2. server1 takes all requests
                   do
                     local o, f = bu.client_requests(bu.SLOTS, api_host)
                     oks = oks + o
@@ -1686,7 +1868,7 @@ for _, strategy in helpers.each_strategy() do
                   -- Give time for healthchecker to detect
                   bu.poll_wait_address_health(upstream_id, hostname, port1, localhost, port2, "HEALTHY")
 
-                  -- 3) server1 and server2 take requests again
+                  -- 3. server1 and server2 take requests again
                   do
                     local o, f = bu.client_requests(bu.SLOTS, api_host)
                     oks = oks + o
@@ -1773,17 +1955,23 @@ for _, strategy in helpers.each_strategy() do
 
                   bu.end_testcase_setup(strategy, bp)
 
-                  -- 1) target1 and target2 take requests
-                  local oks, fails = bu.client_requests(bu.SLOTS, api_host)
+                  -- set test parameters
+                  local req_burst = 10
+                  local total_requests = req_burst * 3
+                  local target1_reqs = req_burst * 2
+                  local target2_reqs = req_burst
+
+                  -- 1. target1 and target2 take requests
+                  local oks, fails = bu.client_requests(req_burst, api_host)
 
                   -- target2 goes unhealthy
                   assert(bu.direct_request(localhost, port1, "/unhealthy", protocol, "target2.test"))
                   -- Wait until healthchecker detects
                   bu.poll_wait_health(upstream_id, "target2.test", port1, "UNHEALTHY")
 
-                  -- 2) target1 takes all requests
+                  -- 2. target1 takes all requests
                   do
-                    local o, f = bu.client_requests(bu.SLOTS, api_host)
+                    local o, f = bu.client_requests(req_burst, api_host)
                     oks = oks + o
                     fails = fails + f
                   end
@@ -1793,9 +1981,9 @@ for _, strategy in helpers.each_strategy() do
                   -- Give time for healthchecker to detect
                   bu.poll_wait_health(upstream_id, "target2.test", port1, "HEALTHY")
 
-                  -- 3) server1 and server2 take requests again
+                  -- 3. server1 and server2 take requests again
                   do
-                    local o, f = bu.client_requests(bu.SLOTS, api_host)
+                    local o, f = bu.client_requests(req_burst, api_host)
                     oks = oks + o
                     fails = fails + f
                   end
@@ -1803,11 +1991,11 @@ for _, strategy in helpers.each_strategy() do
                   -- collect server results; hitcount
                   local results = server1:shutdown()
                   ---- verify
-                  assert.are.equal(bu.SLOTS * 2, results["target1.test"].ok)
-                  assert.are.equal(bu.SLOTS, results["target2.test"].ok)
+                  assert.near(target1_reqs, results["target1.test"].ok, target1_reqs * ACCEPTED_LB_VAR)
+                  assert.near(target2_reqs, results["target2.test"].ok, target2_reqs * ACCEPTED_LB_VAR)
                   assert.are.equal(0, results["target1.test"].fail)
                   assert.are.equal(0, results["target1.test"].fail)
-                  assert.are.equal(bu.SLOTS * 3, oks)
+                  assert.are.equal(total_requests, oks)
                   assert.are.equal(0, fails)
                 end
               end)
@@ -1984,7 +2172,7 @@ for _, strategy in helpers.each_strategy() do
               server1:start()
               server2:start()
 
-              -- 1) server1 and server2 take requests
+              -- 1. server1 and server2 take requests
               local oks, fails = bu.client_requests(bu.SLOTS, api_host)
 
               -- manually bring it down using the endpoint
@@ -1997,7 +2185,7 @@ for _, strategy in helpers.each_strategy() do
                 bu.poll_wait_health(upstream_id, localhost, port2, "UNHEALTHY")
               end
 
-              -- 2) server1 takes all requests
+              -- 2. server1 takes all requests
               do
                 local o, f = bu.client_requests(bu.SLOTS, api_host)
                 oks = oks + o
@@ -2014,7 +2202,7 @@ for _, strategy in helpers.each_strategy() do
                 bu.poll_wait_health(upstream_id, localhost, port2, "HEALTHY")
               end
 
-              -- 3) server1 and server2 take requests again
+              -- 3. server1 and server2 take requests again
               do
                 local o, f = bu.client_requests(bu.SLOTS, api_host)
                 oks = oks + o
@@ -2070,12 +2258,12 @@ for _, strategy in helpers.each_strategy() do
 
               ngx.sleep(bu.CONSISTENCY_FREQ) -- wait for proxy state consistency timer
 
-              -- 1) server1 and server2 take requests
+              -- 1. server1 and server2 take requests
               local oks, fails = bu.client_requests(bu.SLOTS, api_host)
 
               assert(bu.direct_request(localhost, port2, "/timeout"))
 
-              -- 2) server1 takes all requests once server2 produces
+              -- 2. server1 takes all requests once server2 produces
               -- `nfails` failures (even though server2 will be ready
               -- to respond 200 again after `nfails`)
               do
@@ -2190,7 +2378,6 @@ for _, strategy in helpers.each_strategy() do
         proxy_listen = default_proxy_listen,
         nginx_conf = "spec/fixtures/custom_nginx.template",
         db_update_frequency = DB_UPDATE_FREQUENCY,
-        db_update_propagation = DB_UPDATE_PROPAGATION,
       }, nil, nil, fixtures))
 
     end)
@@ -2428,7 +2615,6 @@ for _, strategy in helpers.each_strategy() do
           proxy_listen = default_proxy_listen,
           nginx_conf = "spec/fixtures/custom_nginx.template",
           db_update_frequency = DB_UPDATE_FREQUENCY,
-          db_update_propagation = DB_UPDATE_PROPAGATION,
           stream_listen = "127.0.0.1:9100"
         }))
       end)
@@ -2541,8 +2727,8 @@ for _, strategy in helpers.each_strategy() do
         server2:join()
 
         -- verify
-        assert.are.equal(server1_oks, ok1)
-        assert.are.equal(server2_oks, ok2)
+        assert.near(server1_oks, ok1, server1_oks * ACCEPTED_LB_VAR) 
+        assert.near(server2_oks, ok2, server2_oks * ACCEPTED_LB_VAR) 
         assert.are.equal(0, fails)
       end)
 

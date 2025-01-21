@@ -22,6 +22,7 @@ local tonumber = tonumber
 local table_sort = table.sort
 local assert = assert
 local exiting = ngx.worker.exiting
+local get_updated_now_ms = require("kong.tools.time").get_updated_now_ms
 
 local CRIT = ngx.CRIT
 local DEBUG = ngx.DEBUG
@@ -29,14 +30,15 @@ local ERR = ngx.ERR
 local WARN = ngx.WARN
 
 local SRV_0_WEIGHT = 1      -- SRV record with weight 0 should be hit minimally, hence we replace by 1
-local EMPTY = setmetatable({},
-  {__newindex = function() error("The 'EMPTY' table is read-only") end})
+local EMPTY = require("kong.tools.table").EMPTY
 local GLOBAL_QUERY_OPTS = { workspace = null, show_ws_id = true }
 
 -- global binary heap for all balancers to share as a single update timer for
 -- renewing DNS records
 local renewal_heap = require("binaryheap").minUnique()
 local renewal_weak_cache = setmetatable({}, { __mode = "v" })
+
+local targets_by_upstream_id = {}
 
 local targets_M = {}
 
@@ -46,7 +48,7 @@ local resolve_timer_running
 local queryDns
 
 function targets_M.init()
-  dns_client = require("kong.tools.dns")(kong.configuration)    -- configure DNS client
+  dns_client = assert(package.loaded["kong.resty.dns.client"])
   if renewal_heap:size() > 0 then
     renewal_heap = require("binaryheap").minUnique()
     renewal_weak_cache = setmetatable({}, { __mode = "v" })    
@@ -126,9 +128,17 @@ end
 function targets_M.fetch_targets(upstream)
   local targets_cache_key = "balancer:targets:" .. upstream.id
 
-  return kong.core_cache:get(
-      targets_cache_key, nil,
-      load_targets_into_memory, upstream.id)
+  if targets_by_upstream_id[targets_cache_key] == nil then
+    targets_by_upstream_id[targets_cache_key] = load_targets_into_memory(upstream.id)
+  end
+
+  return targets_by_upstream_id[targets_cache_key]
+end
+
+
+function targets_M.clean_targets_cache(upstream)
+  local targets_cache_key = "balancer:targets:" .. upstream.id
+  targets_by_upstream_id[targets_cache_key] = nil
 end
 
 
@@ -157,7 +167,14 @@ function targets_M.on_target_event(operation, target)
   log(DEBUG, "target ", operation, " for upstream ", upstream_id,
     upstream_name and " (" .. upstream_name ..")" or "")
 
-  kong.core_cache:invalidate_local("balancer:targets:" .. upstream_id)
+  targets_by_upstream_id["balancer:targets:" .. upstream_id] = nil
+
+  local upstream = upstreams.get_upstream_by_id(upstream_id)
+  if not upstream then
+    log(ERR, "target ", operation, ": upstream not found for ", upstream_id,
+      upstream_name and " (" .. upstream_name ..")" or "")
+    return
+  end
 
   -- cancel DNS renewal
   if operation ~= "create" then
@@ -168,13 +185,6 @@ function targets_M.on_target_event(operation, target)
     else
       log(ERR, "could not stop DNS renewal for target removed from ", upstream_id, ": ", err)
     end
-  end
-
-  local upstream = upstreams.get_upstream_by_id(upstream_id)
-  if not upstream then
-    log(ERR, "target ", operation, ": upstream not found for ", upstream_id,
-      upstream_name and " (" .. upstream_name ..")" or "")
-    return
   end
 
 -- move this to upstreams?
@@ -517,9 +527,11 @@ function targets_M.getAddressPeer(address, cacheOnly)
     return nil, balancers.errors.ERR_ADDRESS_UNAVAILABLE
   end
 
+  local ctx = ngx.ctx
   local target = address.target
   if targetExpired(target) and not cacheOnly then
     queryDns(target, cacheOnly)
+    ctx.KONG_UPSTREAM_DNS_END_AT = get_updated_now_ms()
     if address.target ~= target then
       return nil, balancers.errors.ERR_DNS_UPDATED
     end

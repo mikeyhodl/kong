@@ -1,15 +1,17 @@
+local cjson = require("cjson.safe")
 local constants = require("kong.constants")
 local meta = require("kong.meta")
 local version = require("kong.clustering.compat.version")
-local utils = require("kong.tools.utils")
 
 local type = type
 local ipairs = ipairs
 local table_insert = table.insert
 local table_sort = table.sort
 local gsub = string.gsub
-local deep_copy = utils.deep_copy
-local split = utils.split
+local split = require("kong.tools.string").split
+local cycle_aware_deep_copy = require("kong.tools.table").cycle_aware_deep_copy
+local deflate_gzip = require("kong.tools.gzip").deflate_gzip
+local cjson_encode = cjson.encode
 
 local ngx = ngx
 local ngx_log = ngx.log
@@ -23,8 +25,11 @@ local extract_major_minor = version.extract_major_minor
 local _log_prefix = "[clustering] "
 
 local REMOVED_FIELDS = require("kong.clustering.compat.removed_fields")
+local COMPATIBILITY_CHECKERS = require("kong.clustering.compat.checkers")
 local CLUSTERING_SYNC_STATUS = constants.CLUSTERING_SYNC_STATUS
 local KONG_VERSION = meta.version
+
+local EMPTY = require("kong.tools.table").EMPTY
 
 
 local _M = {}
@@ -163,15 +168,42 @@ function _M.check_configuration_compatibility(cp, dp)
         -- CP plugin needs to match DP plugins with major version
         -- CP must have plugin with equal or newer version than that on DP
 
-        if cp_plugin.major ~= dp_plugin.major or
-          cp_plugin.minor < dp_plugin.minor then
-          local msg = "configured data plane " .. name .. " plugin version " .. dp_plugin.version ..
-                      " is different to control plane plugin version " .. cp_plugin.version
-          return nil, msg, CLUSTERING_SYNC_STATUS.PLUGIN_VERSION_INCOMPATIBLE
+        -- luacheck:ignore 542
+        if name == "opentelemetry" and dp_plugin.major == 0 and dp_plugin.minor == 1 then
+          -- The first version of the opentelemetry plugin was introduced into the Kong code base with a version
+          -- number 0.1.0 and released that way.  In subsequent releases, the version number was then not updated
+          -- to avoid the compatibility check from failing.  To work around this issue and allow us to fix the
+          -- version number of the opentelemetry plugin, we're accepting the plugin with version 0.1.0 to be
+          -- compatible
+        else
+          if cp_plugin.major ~= dp_plugin.major or
+            cp_plugin.minor < dp_plugin.minor then
+            local msg = "configured data plane " .. name .. " plugin version " .. dp_plugin.version ..
+              " is different to control plane plugin version " .. cp_plugin.version
+            return nil, msg, CLUSTERING_SYNC_STATUS.PLUGIN_VERSION_INCOMPATIBLE
+          end
         end
       end
     end
   end
+
+  if cp.conf.wasm then
+    local dp_filters = dp.filters or EMPTY
+    local missing
+    for name in pairs(cp.filters or EMPTY) do
+      if not dp_filters[name] then
+        missing = missing or {}
+        table.insert(missing, name)
+      end
+    end
+
+    if missing then
+      local msg = "data plane is missing one or more wasm filters "
+                  .. "(" .. table.concat(missing, ", ") .. ")"
+      return nil, msg, CLUSTERING_SYNC_STATUS.FILTER_SET_INCOMPATIBLE
+    end
+  end
+
 
   return true, nil, CLUSTERING_SYNC_STATUS.NORMAL
 end
@@ -232,7 +264,17 @@ local function delete_at(t, key)
 end
 
 
-local function invalidate_keys_from_config(config_plugins, keys, log_suffix)
+local function rename_field(config, name_from, name_to, has_update)
+  if config[name_from] ~= nil then
+    config[name_to] = config[name_from]
+    config[name_from] = nil
+    return true
+  end
+  return has_update
+end
+
+
+local function invalidate_keys_from_config(config_plugins, keys, log_suffix, dp_version_num)
   if not config_plugins then
     return false
   end
@@ -243,8 +285,32 @@ local function invalidate_keys_from_config(config_plugins, keys, log_suffix)
     local config = t and t["config"]
     if config then
       local name = gsub(t["name"], "-", "_")
-
       if keys[name] ~= nil then
+        -- Any dataplane older than 3.2.0
+        if dp_version_num < 3002000000 then
+          -- OSS
+          if name == "session" then
+            has_update = rename_field(config, "idling_timeout", "cookie_idletime", has_update)
+            has_update = rename_field(config, "rolling_timeout", "cookie_lifetime", has_update)
+            has_update = rename_field(config, "stale_ttl", "cookie_discard", has_update)
+            has_update = rename_field(config, "cookie_same_site", "cookie_samesite", has_update)
+            has_update = rename_field(config, "cookie_http_only", "cookie_httponly", has_update)
+            has_update = rename_field(config, "remember", "cookie_persistent", has_update)
+
+            if config["cookie_samesite"] == "Default" then
+              config["cookie_samesite"] = "Lax"
+            end
+          end
+        end
+
+        -- Any dataplane older than 3.8.0
+        if dp_version_num < 3008000000 then
+          -- OSS
+          if name == "opentelemetry" then
+            has_update = rename_field(config, "traces_endpoint", "endpoint", has_update)
+          end
+        end
+
         for _, key in ipairs(keys[name]) do
           if delete_at(config, key) then
             ngx_log(ngx_WARN, _log_prefix, name, " plugin contains configuration '", key,
@@ -309,9 +375,9 @@ do
 end
 
 
--- returns has_update, modified_config_table
-function _M.update_compatible_payload(config_table, dp_version, log_suffix)
-  local cp_version_num = version_num(meta.version)
+-- returns has_update, modified_deflated_payload, err
+function _M.update_compatible_payload(payload, dp_version, log_suffix)
+  local cp_version_num = version_num(KONG_VERSION)
   local dp_version_num = version_num(dp_version)
 
   -- if the CP and DP have the same version, avoid the payload
@@ -320,15 +386,74 @@ function _M.update_compatible_payload(config_table, dp_version, log_suffix)
     return false
   end
 
-  local fields = get_removed_fields(dp_version_num)
-  if fields then
-    config_table = deep_copy(config_table, false)
-    if invalidate_keys_from_config(config_table["plugins"], fields, log_suffix) then
-      return true, config_table
+  local has_update
+  payload = cycle_aware_deep_copy(payload, true)
+  local config_table = payload["config_table"]
+
+  for _, checker in ipairs(COMPATIBILITY_CHECKERS) do
+    local ver = checker[1]
+    local fn  = checker[2]
+    if dp_version_num < ver and fn(config_table, dp_version, log_suffix) then
+      has_update = true
     end
   end
 
-  return false
+  local fields = get_removed_fields(dp_version_num)
+  if fields then
+    if invalidate_keys_from_config(config_table["plugins"], fields, log_suffix, dp_version_num) then
+      has_update = true
+    end
+  end
+
+  if has_update then
+    local deflated_payload, err = deflate_gzip(cjson_encode(payload))
+    if deflated_payload then
+      return true, deflated_payload
+
+    else
+      return true, nil, err
+    end
+  end
+
+  return false, nil, nil
+end
+
+
+-- If mixed config is detected and a 3.6 or lower DP is attached to the CP,
+-- no config will be sent at all
+function _M.check_mixed_route_entities(payload, dp_version, flavor)
+  if flavor ~= "expressions" then
+    return true
+  end
+
+  -- CP runs with 'expressions' flavor
+
+  local dp_version_num = version_num(dp_version)
+
+  if dp_version_num >= 3007000000 then -- [[ 3.7.0.0 ]]
+    return true
+  end
+
+  local routes = payload["config_table"].routes or {}
+  local routes_n = #routes
+  local count = 0   -- expression route count
+
+  for i = 1, routes_n do
+    local r = routes[i]
+
+    -- expression should be a string
+    if r.expression and r.expression ~= ngx.null then
+      count = count + 1
+    end
+  end
+
+  if count == routes_n or   -- all are expression only routes
+     count == 0             -- all are traditional routes
+  then
+    return true
+  end
+
+  return false, dp_version .. " does not support mixed mode route"
 end
 
 

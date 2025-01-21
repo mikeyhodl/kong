@@ -1,11 +1,10 @@
 local logger       = require "kong.cmd.utils.log"
-local utils        = require "kong.tools.utils"
 local pgmoon       = require "pgmoon"
 local arrays       = require "pgmoon.arrays"
-local stringx      = require "pl.stringx"
 local semaphore    = require "ngx.semaphore"
-local kong_global = require "kong.global"
-local constants = require "kong.constants"
+local kong_global  = require "kong.global"
+local constants    = require "kong.constants"
+local db_utils     = require "kong.db.utils"
 
 
 local setmetatable = setmetatable
@@ -20,7 +19,6 @@ local floor        = math.floor
 local type         = type
 local ngx          = ngx
 local timer_every  = ngx.timer.every
-local update_time  = ngx.update_time
 local get_phase    = ngx.get_phase
 local null         = ngx.null
 local now          = ngx.now
@@ -28,12 +26,15 @@ local log          = ngx.log
 local match        = string.match
 local fmt          = string.format
 local sub          = string.sub
-local utils_toposort = utils.topological_sort
+local utils_toposort = db_utils.topological_sort
 local insert       = table.insert
+local table_merge  = require("kong.tools.table").table_merge
+local strip        = require("kong.tools.string").strip
+local now_updated  = require("kong.tools.time").get_updated_now
 
 
 local WARN                          = ngx.WARN
-local ERR                           = ngx.ERR
+local DEBUG                         = ngx.DEBUG
 local SQL_INFORMATION_SCHEMA_TABLES = [[
 SELECT table_name
   FROM information_schema.tables
@@ -51,12 +52,6 @@ local OPERATIONS = {
 }
 local ADMIN_API_PHASE = kong_global.phases.admin_api
 local CORE_ENTITIES = constants.CORE_ENTITIES
-
-
-local function now_updated()
-  update_time()
-  return now()
-end
 
 
 local function iterator(rows)
@@ -144,6 +139,7 @@ do
     local res, err = utils_toposort(table_names, get_table_name_neighbors)
 
     if res then
+      insert(res, 1, "clustering_rpc_requests")
       insert(res, 1, "cluster_events")
     end
 
@@ -194,10 +190,7 @@ local setkeepalive
 
 local function reconnect(config)
   local phase = get_phase()
-  if phase == "init" or phase == "init_worker" or ngx.IS_CLI then
-    -- Force LuaSocket usage in the CLI in order to allow for self-signed
-    -- certificates to be trusted (via opts.cafile) in the resty-cli
-    -- interpreter (no way to set lua_ssl_trusted_certificate).
+  if phase == "init" or phase == "init_worker" then
     config.socket_type = "luasocket"
 
   else
@@ -218,22 +211,22 @@ local function reconnect(config)
     return nil, err
   end
 
-  if connection.sock:getreusedtimes() == 0 then
-    if config.schema == "" then
-      local res = connection:query("SELECT CURRENT_SCHEMA AS schema")
-      if res and res[1] and res[1].schema and res[1].schema ~= null then
-        config.schema = res[1].schema
-      else
-        config.schema = "public"
-      end
+  if config.schema == "" then
+    local res = connection:query("SELECT CURRENT_SCHEMA AS schema")
+    if res and res[1] and res[1].schema and res[1].schema ~= null then
+      config.schema = res[1].schema
+    else
+      config.schema = "public"
     end
+  end
 
+  if connection.sock:getreusedtimes() == 0 then
     ok, err = connection:query(concat {
       "SET SCHEMA ",    connection:escape_literal(config.schema), ";\n",
       "SET TIME ZONE ", connection:escape_literal("UTC"), ";",
     })
     if not ok then
-      setkeepalive(connection)
+      setkeepalive(connection, config.keepalive_timeout)
       return nil, err
     end
   end
@@ -247,7 +240,7 @@ local function connect(config)
 end
 
 
-setkeepalive = function(connection)
+setkeepalive = function(connection, keepalive_timeout)
   if not connection or not connection.sock then
     return true
   end
@@ -259,7 +252,7 @@ setkeepalive = function(connection)
     end
 
   else
-    local _, err = connection:keepalive()
+    local _, err = connection:keepalive(keepalive_timeout)
     if err then
       return nil, err
     end
@@ -284,12 +277,20 @@ function _mt:get_stored_connection(operation)
   end
 end
 
+function _mt:get_keepalive_timeout(operation)
+  if self.config_ro and operation == 'read' then
+    return self.config_ro.keepalive_timeout
+  end
+
+  return self.config.keepalive_timeout
+end
+
 
 function _mt:init()
   local res, err = self:query("SHOW server_version_num;")
   local ver = tonumber(res and res[1] and res[1].server_version_num)
   if not ver then
-    return nil, "failed to retrieve PostgreSQL server_version_num: " .. err
+    return nil, "failed to retrieve PostgreSQL server_version_num: " .. (err or "")
   end
 
   local major = floor(ver / 10000)
@@ -307,8 +308,7 @@ end
 
 
 function _mt:init_worker(strategies)
-  if ngx.worker.id() == 0 then
-
+  if ngx.worker.id() == 0 and #kong.configuration.admin_listeners > 0 then
     local table_names = get_names_of_tables_with_ttl(strategies)
     local ttl_escaped = self:escape_identifier("ttl")
     local expire_at_escaped = self:escape_identifier("expire_at")
@@ -318,43 +318,64 @@ function _mt:init_worker(strategies)
       local table_name = table_names[i]
       local column_name = table_name == "cluster_events" and expire_at_escaped
                                                           or ttl_escaped
-      cleanup_statements[i] = concat {
-        "  DELETE FROM ",
-        self:escape_identifier(table_name),
-        " WHERE ",
-        column_name,
-        " < CURRENT_TIMESTAMP AT TIME ZONE 'UTC';"
-      }
+      local table_name_escaped = self:escape_identifier(table_name)
+
+      cleanup_statements[i] = fmt([[
+    WITH rows AS (
+  SELECT ctid
+    FROM %s
+   WHERE %s < TO_TIMESTAMP(%s) AT TIME ZONE 'UTC'
+ORDER BY %s LIMIT 50000 FOR UPDATE SKIP LOCKED)
+  DELETE
+    FROM %s
+   WHERE ctid IN (TABLE rows);]], table_name_escaped, column_name, "%s", column_name, table_name_escaped)
     end
 
-    local cleanup_statement = concat(cleanup_statements, "\n")
-
-    return timer_every(60, function(premature)
+    return timer_every(self.config.ttl_cleanup_interval, function(premature)
       if premature then
         return
       end
 
-      local ok, err, _, num_queries = self:query(cleanup_statement)
+      -- Fetch the end timestamp from database to avoid problems caused by the difference
+      -- between nodes and database time.
+      local cleanup_end_timestamp
+      local ok, err = self:query("SELECT EXTRACT(EPOCH FROM CURRENT_TIMESTAMP AT TIME ZONE 'UTC') AS NOW;")
       if not ok then
-        if num_queries then
-          for i = num_queries + 1, cleanup_statements_count do
-            local statement = cleanup_statements[i]
-            local ok, err = self:query(statement)
-            if not ok then
-              if err then
-                log(WARN, "unable to clean expired rows from table '",
-                          table_names[i], "' on PostgreSQL database (",
-                          err, ")")
-              else
-                log(WARN, "unable to clean expired rows from table '",
-                          table_names[i], "' on PostgreSQL database")
-              end
+        log(WARN, "unable to fetch current timestamp from PostgreSQL database (",
+                  err, ")")
+        return
+      end
+
+      cleanup_end_timestamp = ok[1]["now"]
+
+      for i, statement in ipairs(cleanup_statements) do
+        local _tracing_cleanup_start_time = now()
+
+        while true do -- batch delete looping
+          -- using the server-side timestamp in the whole loop to prevent infinite loop
+          local ok, err = self:query(fmt(statement, cleanup_end_timestamp))
+          if not ok then
+            if err then
+              log(WARN, "unable to clean expired rows from table '",
+                        table_names[i], "' on PostgreSQL database (",
+                        err, ")")
+
+            else
+              log(WARN, "unable to clean expired rows from table '",
+                        table_names[i], "' on PostgreSQL database")
             end
+            break
           end
 
-        else
-          log(ERR, "unable to clean expired rows from PostgreSQL database (", err, ")")
+          if ok.affected_rows < 50000 then -- indicates that cleanup is done
+            break
+          end
         end
+
+        local _tracing_cleanup_end_time = now()
+        local time_elapsed = tonumber(fmt("%.3f", _tracing_cleanup_end_time - _tracing_cleanup_start_time))
+        log(DEBUG, "cleaning up expired rows from table '", table_names[i],
+                   "' took ", time_elapsed, " seconds")
       end
     end)
   end
@@ -433,7 +454,8 @@ function _mt:setkeepalive()
   for operation in pairs(OPERATIONS) do
     local conn = self:get_stored_connection(operation)
     if conn then
-      local _, err = setkeepalive(conn)
+      local keepalive_timeout = self:get_keepalive_timeout(operation)
+      local _, err = setkeepalive(conn, keepalive_timeout)
 
       self:store_connection(nil, operation)
 
@@ -502,6 +524,7 @@ function _mt:query(sql, operation)
     operation = "write"
   end
 
+  local conn, is_new_conn
   local res, err, partial, num_queries
 
   local ok
@@ -510,23 +533,37 @@ function _mt:query(sql, operation)
     return nil, "error acquiring query semaphore: " .. err
   end
 
-  local conn = self:get_stored_connection(operation)
-  if conn then
-    res, err, partial, num_queries = conn:query(sql)
-
-  else
-    local connection
+  conn = self:get_stored_connection(operation)
+  if not conn then
     local config = operation == "write" and self.config or self.config_ro
 
-    connection, err = connect(config)
-    if not connection then
+    conn, err = connect(config)
+    if not conn then
       self:release_query_semaphore_resource(operation)
       return nil, err
     end
+    is_new_conn = true
+  end
 
-    res, err, partial, num_queries = connection:query(sql)
+  res, err, partial, num_queries = conn:query(sql)
 
-    setkeepalive(connection)
+  -- if err is string then either it is a SQL error
+  -- or it is a socket error, here we abort connections
+  -- that encounter errors instead of reusing them, for
+  -- safety reason
+  if err and type(err) == "string" then
+    ngx.log(ngx.DEBUG, "SQL query throw error: ", err, ", close connection")
+    local _, err = conn:disconnect()
+    if err then
+      -- We're at the end of the query - just logging if
+      -- we cannot cleanup the connection
+      ngx.log(ngx.ERR, "failed to disconnect: ", err)
+    end
+    self:store_connection(nil, operation)
+
+  elseif is_new_conn then
+    local keepalive_timeout = self:get_keepalive_timeout(operation)
+    setkeepalive(conn, keepalive_timeout)
   end
 
   self:release_query_semaphore_resource(operation)
@@ -738,7 +775,7 @@ function _mt:schema_migrations()
 end
 
 
-function _mt:schema_bootstrap(kong_config, default_locks_ttl)
+function _mt:schema_bootstrap(default_locks_ttl)
   local conn = self:get_stored_connection()
   if not conn then
     error("no connection")
@@ -824,7 +861,7 @@ function _mt:run_up_migration(name, up_sql)
     error("no connection")
   end
 
-  local sql = stringx.strip(up_sql)
+  local sql = strip(up_sql)
   if sub(sql, -1) ~= ";" then
     sql = sql .. ";"
   end
@@ -910,6 +947,7 @@ local _M = {}
 
 function _M.new(kong_config)
   local config = {
+    application_name = "kong",
     host        = kong_config.pg_host,
     port        = kong_config.pg_port,
     timeout     = kong_config.pg_timeout,
@@ -922,6 +960,13 @@ function _M.new(kong_config)
     cafile      = kong_config.lua_ssl_trusted_certificate_combined,
     sem_max     = kong_config.pg_max_concurrent_queries or 0,
     sem_timeout = (kong_config.pg_semaphore_timeout or 60000) / 1000,
+    pool_size   = kong_config.pg_pool_size,
+    backlog     = kong_config.pg_backlog,
+
+    --- not used directly by pgmoon, but used internally in connector to set the keepalive timeout
+    keepalive_timeout = kong_config.pg_keepalive_timeout,
+    --- non user-faced parameters
+    ttl_cleanup_interval = kong_config._debug_pg_ttl_cleanup_interval or 300,
   }
 
   local refs = kong_config["$refs"]
@@ -959,6 +1004,7 @@ function _M.new(kong_config)
     ngx.log(ngx.DEBUG, "PostgreSQL connector readonly connection enabled")
 
     local ro_override = {
+      application_name = "kong",
       host        = kong_config.pg_ro_host,
       port        = kong_config.pg_ro_port,
       timeout     = kong_config.pg_ro_timeout,
@@ -972,6 +1018,11 @@ function _M.new(kong_config)
       sem_max     = kong_config.pg_ro_max_concurrent_queries,
       sem_timeout = kong_config.pg_ro_semaphore_timeout and
                     (kong_config.pg_ro_semaphore_timeout / 1000) or nil,
+      pool_size   = kong_config.pg_ro_pool_size,
+      backlog     = kong_config.pg_ro_backlog,
+
+      --- not used directly by pgmoon, but used internally in connector to set the keepalive timeout
+      keepalive_timeout = kong_config.pg_ro_keepalive_timeout,
     }
 
     if refs then
@@ -985,7 +1036,7 @@ function _M.new(kong_config)
       end
     end
 
-    local config_ro = utils.table_merge(config, ro_override)
+    local config_ro = table_merge(config, ro_override)
 
     local sem
     if config_ro.sem_max > 0 then

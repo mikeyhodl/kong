@@ -19,31 +19,41 @@ local function find_in_file(filepath, pat)
   return found
 end
 
+
+for _, v in ipairs({ {"off", "off"}, {"on", "off"}, {"on", "on"}, }) do
+  local rpc, rpc_sync = v[1], v[2]
+
 for _, strategy in helpers.each_strategy() do
-  describe("CP/CP sync works with #" .. strategy .. " backend", function()
+  describe("CP/CP sync works with #" .. strategy .. " rpc_sync=" .. rpc_sync .. " backend", function()
     lazy_setup(function()
       helpers.get_db_utils(strategy, { "routes", "services" })
 
       assert(helpers.start_kong({
         prefix = "servroot",
         admin_listen = "127.0.0.1:9000",
+        admin_gui_listen = "off",
         cluster_listen = "127.0.0.1:9005",
 
         role = "control_plane",
         cluster_cert = "spec/fixtures/kong_clustering.crt",
         cluster_cert_key = "spec/fixtures/kong_clustering.key",
         database = strategy,
+        cluster_rpc = rpc,
+        cluster_rpc_sync = rpc_sync,
       }))
 
       assert(helpers.start_kong({
         prefix = "servroot2",
         admin_listen = "127.0.0.1:9001",
+        admin_gui_listen = "off",
         cluster_listen = "127.0.0.1:9006",
 
         role = "control_plane",
         cluster_cert = "spec/fixtures/kong_clustering.crt",
         cluster_cert_key = "spec/fixtures/kong_clustering.key",
         database = strategy,
+        cluster_rpc = rpc,
+        cluster_rpc_sync = rpc_sync,
       }))
 
     end)
@@ -75,4 +85,5 @@ for _, strategy in helpers.each_strategy() do
       end, 10)
     end)
   end)
-end
+end -- for _, strategy
+end -- for rpc_sync

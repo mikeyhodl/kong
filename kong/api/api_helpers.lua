@@ -1,4 +1,4 @@
-local utils = require "kong.tools.utils"
+local kong_table = require "kong.tools.table"
 local cjson = require "cjson"
 local pl_pretty = require "pl.pretty"
 local tablex = require "pl.tablex"
@@ -6,9 +6,11 @@ local app_helpers = require "lapis.application"
 local arguments = require "kong.api.arguments"
 local Errors = require "kong.db.errors"
 local hooks = require "kong.hooks"
+local decode_args = require("kong.tools.http").decode_args
 
 
 local ngx = ngx
+local header = ngx.header
 local sub = string.sub
 local find = string.find
 local type = type
@@ -93,7 +95,7 @@ function _M.normalize_nested_params(obj)
     is_array = false
     if type(v) == "table" then
       -- normalize arrays since Lapis parses ?key[1]=foo as {["1"]="foo"} instead of {"foo"}
-      if utils.is_array(v, "lapis") then
+      if kong_table.is_array(v, "lapis") then
         is_array = true
         local arr = {}
         for _, arr_v in pairs(v) do arr[#arr+1] = arr_v end
@@ -223,7 +225,8 @@ do
 
   schema_to_jsonable = function(schema)
     local fields = fields_to_jsonable(schema.fields)
-    return { fields = fields }
+    local entity_checks = fields_to_jsonable(schema.entity_checks or {})
+    return { entity_checks = entity_checks, fields = fields,  }
   end
   _M.schema_to_jsonable = schema_to_jsonable
 end
@@ -257,7 +260,9 @@ function _M.before_filter(self)
   elseif sub(content_type, 1, 16) == "application/json"
       or sub(content_type, 1, 19) == "multipart/form-data"
       or sub(content_type, 1, 33) == "application/x-www-form-urlencoded"
-      or (ACCEPTS_YAML[self.route_name] and sub(content_type, 1,  9) == "text/yaml")
+      or (ACCEPTS_YAML[self.route_name] and
+          (sub(content_type, 1,  16) == "application/yaml" or
+           sub(content_type, 1,  9)  == "text/yaml"))
   then
     return
   end
@@ -265,24 +270,61 @@ function _M.before_filter(self)
   return kong.response.exit(415)
 end
 
+function _M.cors_filter(self)
+  local allowed_origins = kong.configuration.admin_gui_origin
+
+  local function is_origin_allowed(req_origin)
+    for _, allowed_origin in ipairs(allowed_origins) do
+      if req_origin == allowed_origin then
+        return true
+      end
+    end
+    return false
+  end
+
+  local req_origin = self.req.headers["Origin"]
+
+  if allowed_origins and #allowed_origins > 0 then
+    if not is_origin_allowed(req_origin) then
+      req_origin = allowed_origins[1]
+    end
+  else
+    req_origin = req_origin or "*"
+  end
+
+  ngx.header["Access-Control-Allow-Origin"] = req_origin
+  ngx.header["Access-Control-Allow-Credentials"] = "true"
+
+  if ngx.req.get_method() == "OPTIONS" then
+    local request_allow_headers = self.req.headers["Access-Control-Request-Headers"]
+    if request_allow_headers then
+      ngx.header["Access-Control-Allow-Headers"] = request_allow_headers
+    end
+  end
+end
 
 local function parse_params(fn)
   return app_helpers.json_params(function(self, ...)
+    local content_type = self.req.headers["content-type"]
+    local is_json
+
     if NEEDS_BODY[get_method()] then
-      local content_type = self.req.headers["content-type"]
       if content_type then
         content_type = content_type:lower()
+        is_json = find(content_type, "application/json", 1, true)
 
-        if find(content_type, "application/json", 1, true) and not self.json then
+        if is_json and not self.json then
           return kong.response.exit(400, { message = "Cannot parse JSON body" })
 
         elseif find(content_type, "application/x-www-form-urlencode", 1, true) then
-          self.params = utils.decode_args(self.params)
+          self.params = decode_args(self.params)
         end
       end
     end
 
-    self.params = _M.normalize_nested_params(self.params)
+    if not is_json then
+      self.params = _M.normalize_nested_params(self.params)
+    end
 
     local res, err = fn(self, ...)
 
@@ -380,9 +422,9 @@ end
 local function options_method(methods)
   return function()
     kong.response.exit(204, nil, {
-      ["Allow"] = methods,
-      ["Access-Control-Allow-Methods"] = methods,
-      ["Access-Control-Allow-Headers"] = "Content-Type",
+      ["Allow"] = header["Access-Control-Allow-Methods"] or methods,
+      ["Access-Control-Allow-Methods"] = header["Access-Control-Allow-Methods"] or methods,
+      ["Access-Control-Allow-Headers"] = header["Access-Control-Allow-Headers"] or "Content-Type"
     })
   end
 end

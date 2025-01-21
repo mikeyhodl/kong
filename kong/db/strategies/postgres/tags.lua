@@ -1,4 +1,3 @@
-local cjson         = require "cjson"
 local cjson_safe    = require "cjson.safe"
 
 
@@ -95,7 +94,7 @@ local function page(self, size, token, options, tag)
 
   sql = fmt(sql, unpack(args))
 
-  local res, err = self.connector:query(sql)
+  local res, err = self.connector:query(sql, "read")
 
   if not res then
     return nil, self.errors:database_error(err)
@@ -118,7 +117,7 @@ local function page(self, size, token, options, tag)
         last_ordinality
       }
 
-      offset = cjson.encode(offset)
+      offset = cjson_safe.encode(offset)
       offset = encode_base64(offset, true)
 
       return rows, nil, offset

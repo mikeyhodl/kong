@@ -1,11 +1,19 @@
-local utils = require "kong.tools.utils"
+local hostname_type = require("kong.tools.ip").hostname_type
 local constants = require "kong.constants"
-local marshall = require "kong.cache.marshall"
+local buffer = require "string.buffer"
+local acl_groups
+
+
+local load_module_if_exists = require "kong.tools.module".load_module_if_exists
+if load_module_if_exists("kong.plugins.acl.groups") then
+  acl_groups = require "kong.plugins.acl.groups"
+end
 
 
 local cache_warmup = {}
 
 
+local encode = buffer.encode
 local tostring = tostring
 local ipairs = ipairs
 local math = math
@@ -17,7 +25,9 @@ local ngx = ngx
 local now = ngx.now
 local log = ngx.log
 local NOTICE  = ngx.NOTICE
+local DEBUG = ngx.DEBUG
 
+local NO_TTL_FLAG = require("kong.resty.mlcache").NO_TTL_FLAG
 
 
 local GLOBAL_QUERY_OPTS = { workspace = ngx.null, show_ws_id = true }
@@ -84,9 +94,8 @@ function cache_warmup.single_entity(dao, entity)
   else
     cache_key = "kong_core_db_cache" .. cache_key
     local ttl = max(kong.configuration.db_cache_ttl or 3600, 0)
-    local neg_ttl = max(kong.configuration.db_cache_neg_ttl or 300, 0)
-    local value = marshall(entity, ttl, neg_ttl)
-    ok, err =  ngx.shared.kong_core_db_cache:safe_set(cache_key, value)
+    local value = encode(entity)
+    ok, err =  ngx.shared.kong_core_db_cache:safe_set(cache_key, value, ttl, ttl == 0 and NO_TTL_FLAG or 0)
   end
 
   if not ok then
@@ -122,7 +131,7 @@ function cache_warmup.single_dao(dao)
     end
 
     if entity_name == "services" then
-      if utils.hostname_type(entity.host) == "name"
+      if hostname_type(entity.host) == "name"
          and hosts_set[entity.host] == nil then
         host_count = host_count + 1
         hosts_array[host_count] = entity.host
@@ -133,6 +142,14 @@ function cache_warmup.single_dao(dao)
     local ok, err = cache_warmup.single_entity(dao, entity)
     if not ok then
       return nil, err
+    end
+
+    if entity_name == "acls" and acl_groups ~= nil then
+      log(DEBUG, "warmup acl groups cache for consumer id: ", entity.consumer.id , "...")
+      local _, err = acl_groups.warmup_groups_cache(entity.consumer.id)
+      if err then
+        log(NOTICE, "warmup acl groups cache for consumer id: ", entity.consumer.id , " err: ", err)
+      end
     end
   end
 

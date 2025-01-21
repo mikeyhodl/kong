@@ -2,9 +2,10 @@
 --
 -- @module kong.node
 
-local utils = require "kong.tools.utils"
 local ffi = require "ffi"
 local private_node = require "kong.pdk.private.node"
+local uuid = require("kong.tools.uuid").uuid
+local bytes_to_str = require("kong.tools.string").bytes_to_str
 
 
 local floor = math.floor
@@ -27,6 +28,11 @@ local shms = {}
 local n_workers = ngx.worker.count()
 
 
+ffi.cdef[[
+int gethostname(char *name, size_t len);
+]]
+
+
 for shm_name, shm in pairs(shared) do
   insert(shms, {
     zone = shm,
@@ -41,7 +47,7 @@ local function convert_bytes(bytes, unit, scale)
     return floor(bytes)
   end
 
-  return utils.bytes_to_str(bytes, unit, scale)
+  return bytes_to_str(bytes, unit, scale)
 end
 
 
@@ -51,7 +57,9 @@ end
 
 
 local function new(self)
-  local _NODE = {}
+  local _NODE = {
+    hostname = nil,
+  }
 
 
   ---
@@ -68,7 +76,7 @@ local function new(self)
 
     local shm = ngx.shared.kong
 
-    local ok, err = shm:safe_add(NODE_ID_KEY, utils.uuid())
+    local ok, err = shm:safe_add(NODE_ID_KEY, uuid())
     if not ok and err ~= "exists" then
       error("failed to set 'node_id' in shm: " .. err)
     end
@@ -155,7 +163,7 @@ local function new(self)
       unit = unit or "b"
       scale = scale or 2
 
-      local pok, perr = pcall(utils.bytes_to_str, 0, unit, scale)
+      local pok, perr = pcall(bytes_to_str, 0, unit, scale)
       if not pok then
         error(perr, 2)
       end
@@ -241,36 +249,58 @@ local function new(self)
   -- @usage
   -- local hostname = kong.node.get_hostname()
   function _NODE.get_hostname()
-    local SIZE = 253 -- max number of chars for a hostname
+    if not _NODE.hostname then
+      local SIZE = 253 -- max number of chars for a hostname
 
-    local buf = ffi_new("unsigned char[?]", SIZE)
-    local res = C.gethostname(buf, SIZE)
+      local buf = ffi_new("unsigned char[?]", SIZE)
+      local res = C.gethostname(buf, SIZE)
 
-    if res == 0 then
-      local hostname = ffi_str(buf, SIZE)
-      return gsub(hostname, "%z+$", "")
+      if res ~= 0 then
+        -- Return an empty string "" instead of nil and error message,
+        -- because strerror is not thread-safe and the behavior of strerror_r
+        -- is inconsistent across different systems.
+        return ""
+      end
+
+      _NODE.hostname = gsub(ffi_str(buf, SIZE), "%z+$", "")
     end
 
-    local f = io.popen("/bin/hostname")
-    local hostname = f:read("*a") or ""
-    f:close()
-    return gsub(hostname, "\n$", "")
+    return _NODE.hostname
   end
 
 
+  -- the PDK can be even when there is no configuration (for docs/tests)
+  -- so execute below block only when running under correct context
   local prefix = self and self.configuration and self.configuration.prefix
-  if prefix and self.configuration.role == "data_plane" then
-    local id, err = private_node.load_node_id(prefix)
-    if id then
-      node_id = id
-      ngx.log(ngx.DEBUG, "restored node_id from the filesystem: ", node_id)
-
-    else
-      id = _NODE.get_id()
-      if err then
-        ngx.log(ngx.WARN, "failed to restore node_id from the filesystem: ",
-                err, ", so a new one was generated: ", id)
+  if prefix  then
+    -- precedence order:
+    -- 1. user provided node id
+    local configuration_node_id = self and self.configuration and self.configuration.node_id
+    if configuration_node_id then
+      ngx.log(ngx.WARN, "Manually specifying a `node_id` via configuration is deprecated as of 3.9 and will be removed in the 4.x.\n",
+      "We strongly recommend avoiding this practice.\n",
+      "Please note that if specified manually it must be unique across the cluster to ensure proper functionality.")
+      node_id = configuration_node_id
+    end
+    -- 2. node id (if any) on file-system
+    if not node_id then
+      if prefix and self.configuration.role == "data_plane" then
+        local id, err = private_node.load_node_id(prefix)
+        if id then
+          node_id = id
+          ngx.log(ngx.DEBUG, "restored node_id from the filesystem: ", node_id)
+        else
+          ngx.log(ngx.WARN, "failed to restore node_id from the filesystem: ",
+                  err, ", a new node_id will be generated")
+        end
       end
+    end
+    -- 3. generate a new id
+    if not node_id then
+      node_id = _NODE.get_id()
+    end
+    if node_id then
+      ngx.log(ngx.INFO, "kong node-id: ", node_id)
     end
   end
 

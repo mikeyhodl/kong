@@ -2,6 +2,7 @@
 local timestamp = require "kong.tools.timestamp"
 local policies = require "kong.plugins.rate-limiting.policies"
 local kong_meta = require "kong.meta"
+local pdk_private_rl = require "kong.pdk.private.rate_limiting"
 
 
 local kong = kong
@@ -13,9 +14,14 @@ local pairs = pairs
 local error = error
 local tostring = tostring
 local timer_at = ngx.timer.at
+local SYNC_RATE_REALTIME = -1
 
 
-local EMPTY = {}
+local pdk_rl_store_response_header = pdk_private_rl.store_response_header
+local pdk_rl_apply_response_headers = pdk_private_rl.apply_response_headers
+
+
+local EMPTY = require("kong.tools.table").EMPTY
 local EXPIRATION = require "kong.plugins.rate-limiting.expiration"
 
 
@@ -144,11 +150,9 @@ function RateLimitingHandler:access(conf)
   end
 
   if usage then
-    -- Adding headers
+    local ngx_ctx = ngx.ctx
     local reset
-    local headers
     if not conf.hide_client_headers then
-      headers = {}
       local timestamps
       local limit
       local window
@@ -177,30 +181,38 @@ function RateLimitingHandler:access(conf)
           reset = max(1, window - floor((current_timestamp - timestamps[k]) / 1000))
         end
 
-        headers[X_RATELIMIT_LIMIT[k]] = current_limit
-        headers[X_RATELIMIT_REMAINING[k]] = current_remaining
+        pdk_rl_store_response_header(ngx_ctx, X_RATELIMIT_LIMIT[k], current_limit)
+        pdk_rl_store_response_header(ngx_ctx, X_RATELIMIT_REMAINING[k], current_remaining)
       end
 
-      headers[RATELIMIT_LIMIT] = limit
-      headers[RATELIMIT_REMAINING] = remaining
-      headers[RATELIMIT_RESET] = reset
+      pdk_rl_store_response_header(ngx_ctx, RATELIMIT_LIMIT, limit)
+      pdk_rl_store_response_header(ngx_ctx, RATELIMIT_REMAINING, remaining)
+      pdk_rl_store_response_header(ngx_ctx, RATELIMIT_RESET, reset)
     end
 
     -- If limit is exceeded, terminate the request
     if stop then
-      headers = headers or {}
-      headers[RETRY_AFTER] = reset
-      return kong.response.error(conf.error_code, conf.error_message, headers)
+      if not conf.hide_client_headers then
+        pdk_rl_store_response_header(ngx_ctx, RETRY_AFTER, reset)
+        pdk_rl_apply_response_headers(ngx_ctx)
+      end
+
+      return kong.response.error(conf.error_code, conf.error_message)
     end
 
-    if headers then
-      kong.response.set_headers(headers)
+    if not conf.hide_client_headers then
+      pdk_rl_apply_response_headers(ngx_ctx)
     end
   end
 
-  local ok, err = timer_at(0, increment, conf, limits, identifier, current_timestamp, 1)
-  if not ok then
-    kong.log.err("failed to create timer: ", err)
+  if conf.sync_rate ~= SYNC_RATE_REALTIME and conf.policy == "redis" then
+    increment(false, conf, limits, identifier, current_timestamp, 1)
+
+  else
+    local ok, err = timer_at(0, increment, conf, limits, identifier, current_timestamp, 1)
+    if not ok then
+      kong.log.err("failed to create timer: ", err)
+    end
   end
 end
 

@@ -120,7 +120,9 @@ function commit_changelog() {
 function update_copyright() {
   version=$1
 
-  if ! "$scripts_folder/update-copyright"
+  PDIR=$(dirname "$scripts_folder")
+
+  if ! (docker build -t kong/update-copyright ${scripts_folder} && docker run -v ${PDIR}:/workspace --rm kong/update-copyright)
   then
     die "Could not update copyright file. Check logs for missing licenses, add hardcoded ones if needed"
   fi
@@ -197,12 +199,9 @@ function make_github_release_file() {
    versionlink=$(echo $version | tr -d .)
    cat <<EOF > release-$version.txt
 $version
-
 **Download Kong $version and run it now:**
-
 - https://konghq.com/install/
 - [Docker Image](https://hub.docker.com/_/kong/)
-
 Links:
 - [$version Changelog](https://github.com/$GITHUB_ORG/kong/blob/$version/CHANGELOG.md#$versionlink)
 EOF
@@ -214,7 +213,6 @@ function bump_docs_kong_versions() {
       local fd_in = io.open("app/_data/kong_versions.yml", "r")
       local fd_out = io.open("app/_data/kong_versions.yml.new", "w")
       local version = "'$version'"
-
       local state = "start"
       local version_line
       for line in fd_in:lines() do
@@ -260,7 +258,6 @@ function prepare_changelog() {
       local fd_in = io.open("CHANGELOG.md", "r")
       local fd_out = io.open("CHANGELOG.md.new", "w")
       local version = "'$version'"
-
       local state = "start"
       for line in fd_in:lines() do
          if state == "start" then
@@ -306,7 +303,6 @@ function prepare_changelog() {
                state = "last"
             end
          end
-
          fd_out:write(line .. "\n")
       end
       fd_in:close()
@@ -327,24 +323,17 @@ function announce() {
   cat <<EOF
 ============= USE BELOW ON KONG NATION ANNOUNCEMENT ==============
 TITLE: Kong $version available!
-
 BODY:
 We’re happy to announce **Kong $version**.  $patch_release_disclaimer
-
 :package: Download [Kong $version](https://download.konghq.com) and [upgrade your cluster](https://github.com/$GITHUB_ORG/kong/blob/master/UPGRADE.md#upgrade-to-$1$2x)!
 :spiral_notepad: More info and PR links are available at the [$version Changelog](https://github.com/$GITHUB_ORG/kong/blob/master/CHANGELOG.md#$1$2$3).
-
 :whale: The updated official Docker image is available on [Docker Hub ](https://hub.docker.com/_/kong).
-
 As always, Happy Konging! :gorilla:
 ============= USE BELOW ON KONG NATION ANNOUNCEMENT ==============
 We’re happy to announce *Kong $version*.  $patch_release_disclaimer
-
 :package: Download Kong $version: https://download.konghq.com
 :spiral_note_pad: More info and PR links are available at the $version Changelog: https://github.com/$GITHUB_ORG/kong/blob/master/CHANGELOG.md#$1$2$3
-
 :whale: the updated official docker image is available on Docker Hub: https://hub.docker.com/_/kong
-
 As always, happy Konging! :gorilla:
 ==================================================================
 EOF
@@ -685,3 +674,4 @@ then
 else
    die "Lua interpreter is not in PATH. Install any Lua or OpenResty to run this script."
 fi
+

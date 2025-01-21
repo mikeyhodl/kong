@@ -6,14 +6,14 @@ local kong = kong
 local error = error
 local decode_base64 = ngx.decode_base64
 local tostring =  tostring
-local match = string.match
+local re_find = ngx.re.find
+local re_match = ngx.re.match
 local lower = string.lower
 local upper = string.upper
-local find = string.find
 local sub = string.sub
 local fmt = string.format
 local tcp = ngx.socket.tcp
-local sha256_hex = require "kong.tools.utils".sha256_hex
+local sha256_hex = require("kong.tools.sha256").sha256_hex
 
 
 local AUTHORIZATION = "authorization"
@@ -24,15 +24,37 @@ local _M = {}
 
 
 local function retrieve_credentials(authorization_header_value, conf)
+  local lower_header_type = lower(conf.header_type)
+  local regex = "^\\s*" .. lower_header_type .. "\\s+"
+  local from, to, err = re_find(lower(authorization_header_value), regex, "jo")
+  if err then
+    kong.log.err("error while find header_type: ", lower_header_type, " in authorization header value")
+    return nil
+  end
+
+  if not from then
+    kong.log.info("header_type: ", lower_header_type, " not found in authorization header value")
+    return nil
+  end
+
   local username, password
-  if authorization_header_value then
-    local s, e = find(lower(authorization_header_value), "^%s*" ..
-                      lower(conf.header_type) .. "%s+")
-    if s == 1 then
-      local cred = sub(authorization_header_value, e + 1)
-      local decoded_cred = decode_base64(cred)
-      username, password = match(decoded_cred, "(.-):(.+)")
+  if from == 1 then
+    local cred = sub(authorization_header_value, to + 1)
+    local decoded_cred = decode_base64(cred)
+    local m, err = re_match(decoded_cred, "^(.*?):(.+)$", "jo")
+    if err then
+      kong.log.err("error while decoding credentials: ", err)
+      return nil
     end
+
+    if type(m) == "table" and #m == 2 then
+      username = m[1]
+      password = m[2]
+    else
+      kong.log.err("no valid credentials found in authorization header value")
+      return nil
+    end
+
   end
 
   return username, password
@@ -210,34 +232,42 @@ local function set_consumer(consumer, credential)
   end
 end
 
+local function unauthorized(message, authorization_scheme)
+  return {
+    status = 401,
+    message = message,
+    headers = { ["WWW-Authenticate"] = authorization_scheme }
+  }
+end
 
 local function do_authentication(conf)
   local authorization_value = kong.request.get_header(AUTHORIZATION)
   local proxy_authorization_value = kong.request.get_header(PROXY_AUTHORIZATION)
 
-  -- If both headers are missing, return 401
-  if not (authorization_value or proxy_authorization_value) then
-    local scheme = conf.header_type
-    if scheme == "ldap" then
-      -- ensure backwards compatibility (see GH PR #3656)
-      -- TODO: provide migration to capitalize older configurations
-      scheme = upper(scheme)
-    end
-
-    return false, {
-      status = 401,
-      message = "Unauthorized",
-      headers = { ["WWW-Authenticate"] = scheme .. ' realm="kong"' }
-    }
+  local scheme = conf.header_type
+  if scheme == "ldap" then
+    -- ensure backwards compatibility (see GH PR #3656)
+    -- TODO: provide migration to capitalize older configurations
+    scheme = upper(scheme)
   end
 
-  local is_authorized, credential = authenticate(conf, proxy_authorization_value)
-  if not is_authorized then
+  local www_auth_content = conf.realm and fmt('%s realm="%s"', scheme, conf.realm) or scheme
+  -- If both headers are missing, return 401
+  if not (authorization_value or proxy_authorization_value) then
+    return false, unauthorized("Unauthorized", www_auth_content)
+  end
+
+  local is_authorized, credential
+  if proxy_authorization_value then
+    is_authorized, credential = authenticate(conf, proxy_authorization_value)
+  end
+
+  if not is_authorized and authorization_value then
     is_authorized, credential = authenticate(conf, authorization_value)
   end
 
   if not is_authorized then
-    return false, {status = 401, message = "Invalid authentication credentials" }
+    return false, unauthorized("Unauthorized", www_auth_content)
   end
 
   if conf.hide_credentials then
@@ -251,30 +281,56 @@ local function do_authentication(conf)
 end
 
 
-function _M.execute(conf)
-  if conf.anonymous and kong.client.get_credential() then
-    -- we're already authenticated, and we're configured for using anonymous,
-    -- hence we're in a logical OR between auth methods and we're already done.
+local function set_anonymous_consumer(anonymous)
+  local consumer_cache_key = kong.db.consumers:cache_key(anonymous)
+  local consumer, err = kong.cache:get(consumer_cache_key, nil,
+                                        kong.client.load_consumer,
+                                        anonymous, true)
+  if err then
+    return error(err)
+  end
+
+  if not consumer then
+    local err_msg = "anonymous consumer " .. anonymous .. " is configured but doesn't exist"
+    kong.log.err(err_msg)
+    return kong.response.error(500, err_msg)
+  end
+
+  set_consumer(consumer)
+end
+
+
+--- When conf.anonymous is enabled we are in "logical OR" authentication flow.
+--- Meaning - either anonymous consumer is enabled or there are multiple auth plugins
+--- and we need to passthrough on failed authentication.
+local function logical_OR_authentication(conf)
+  if kong.client.get_credential() then
+    -- we're already authenticated and in "logical OR" between auth methods -- early exit
     return
   end
 
+  local ok, _ = do_authentication(conf)
+  if not ok then
+    set_anonymous_consumer(conf.anonymous)
+  end
+end
+
+--- When conf.anonymous is not set we are in "logical AND" authentication flow.
+--- Meaning - if this authentication fails the request should not be authorized
+--- even though other auth plugins might have successfully authorized user.
+local function logical_AND_authentication(conf)
   local ok, err = do_authentication(conf)
   if not ok then
-    if conf.anonymous then
-      -- get anonymous user
-      local consumer_cache_key = kong.db.consumers:cache_key(conf.anonymous)
-      local consumer, err      = kong.cache:get(consumer_cache_key, nil,
-                                                kong.client.load_consumer,
-                                                conf.anonymous, true)
-      if err then
-        return error(err)
-      end
+    return kong.response.error(err.status, err.message, err.headers)
+  end
+end
 
-      set_consumer(consumer)
 
-    else
-      return kong.response.error(err.status, err.message, err.headers)
-    end
+function _M.execute(conf)
+  if conf.anonymous then
+    return logical_OR_authentication(conf)
+  else
+    return logical_AND_authentication(conf)
   end
 end
 

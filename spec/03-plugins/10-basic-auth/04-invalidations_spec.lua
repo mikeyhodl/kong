@@ -45,7 +45,7 @@ for _, strategy in helpers.each_strategy() do
 
       if not route then
         route = admin_api.routes:insert {
-          hosts = { "basic-auth.com" },
+          hosts = { "basic-auth.test" },
         }
       end
 
@@ -72,16 +72,19 @@ for _, strategy in helpers.each_strategy() do
     end)
 
     it("#invalidates credentials when the Consumer is deleted", function()
-      -- populate cache
-      local res = assert(proxy_client:send {
-        method  = "GET",
-        path    = "/",
-        headers = {
-          ["Authorization"] = "Basic Ym9iOmtvbmc=",
-          ["Host"]          = "basic-auth.com"
-        }
-      })
-      assert.res_status(200, res)
+      local res
+      helpers.pwait_until(function()
+        -- populate cache
+        res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/",
+          headers = {
+            ["Authorization"] = "Basic Ym9iOmtvbmc=",
+            ["Host"]          = "basic-auth.test"
+          }
+        })
+        assert.res_status(200, res)
+      end)
 
       -- ensure cache is populated
       local cache_key = db.basicauth_credentials:cache_key("bob")
@@ -108,23 +111,26 @@ for _, strategy in helpers.each_strategy() do
         path    = "/",
         headers = {
           ["Authorization"] = "Basic Ym9iOmtvbmc=",
-          ["Host"]          = "basic-auth.com"
+          ["Host"]          = "basic-auth.test"
         }
       })
       assert.res_status(401, res)
     end)
 
     it("invalidates credentials from cache when deleted", function()
-      -- populate cache
-      local res = assert(proxy_client:send {
-        method  = "GET",
-        path    = "/",
-        headers = {
-          ["Authorization"] = "Basic Ym9iOmtvbmc=",
-          ["Host"]          = "basic-auth.com"
-        }
-      })
-      assert.res_status(200, res)
+      local res
+      helpers.pwait_until(function()
+        -- populate cache
+        res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/",
+          headers = {
+            ["Authorization"] = "Basic Ym9iOmtvbmc=",
+            ["Host"]          = "basic-auth.test"
+          }
+        })
+        assert.res_status(200, res)
+      end)
 
       -- ensure cache is populated
       local cache_key = db.basicauth_credentials:cache_key("bob")
@@ -151,23 +157,26 @@ for _, strategy in helpers.each_strategy() do
         path    = "/",
         headers = {
           ["Authorization"] = "Basic Ym9iOmtvbmc=",
-          ["Host"]          = "basic-auth.com"
+          ["Host"]          = "basic-auth.test"
         }
       })
       assert.res_status(401, res)
     end)
 
     it("invalidated credentials from cache when updated", function()
-      -- populate cache
-      local res = assert(proxy_client:send {
-        method  = "GET",
-        path    = "/",
-        headers = {
-          ["Authorization"] = "Basic Ym9iOmtvbmc=",
-          ["Host"]          = "basic-auth.com"
-        }
-      })
-      assert.res_status(200, res)
+      local res
+      helpers.pwait_until(function()
+        -- populate cache
+        res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/",
+          headers = {
+            ["Authorization"] = "Basic Ym9iOmtvbmc=",
+            ["Host"]          = "basic-auth.test"
+          }
+        })
+        assert.res_status(200, res)
+      end)
 
       -- ensure cache is populated
       local cache_key = db.basicauth_credentials:cache_key("bob")
@@ -201,7 +210,7 @@ for _, strategy in helpers.each_strategy() do
         path    = "/",
         headers = {
           ["Authorization"] = "Basic Ym9iOmtvbmc=",
-          ["Host"]          = "basic-auth.com"
+          ["Host"]          = "basic-auth.test"
         }
       })
       assert.res_status(401, res)
@@ -211,7 +220,7 @@ for _, strategy in helpers.each_strategy() do
         path    = "/",
         headers = {
           ["Authorization"] = "Basic Ym9iOmtvbmctdXBkYXRlZA==",
-          ["Host"]          = "basic-auth.com"
+          ["Host"]          = "basic-auth.test"
         }
       })
       assert.res_status(200, res)

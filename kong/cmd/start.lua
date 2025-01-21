@@ -13,11 +13,11 @@ local function is_socket(path)
   return lfs.attributes(path, "mode") == "socket"
 end
 
-local function cleanup_dangling_unix_sockets(prefix)
+local function cleanup_dangling_unix_sockets(socket_path)
   local found = {}
 
-  for child in lfs.dir(prefix) do
-    local path = prefix .. "/" .. child
+  for child in lfs.dir(socket_path) do
+    local path = socket_path .. "/" .. child
     if is_socket(path) then
       table.insert(found, path)
     end
@@ -31,7 +31,7 @@ local function cleanup_dangling_unix_sockets(prefix)
            "preparing to start Kong. This may be a sign that Kong was " ..
            "previously shut down uncleanly or is in an unknown state and " ..
            "could require further investigation.",
-           prefix)
+           socket_path)
 
   log.warn("Attempting to remove dangling sockets before starting Kong...")
 
@@ -44,24 +44,22 @@ local function cleanup_dangling_unix_sockets(prefix)
 end
 
 local function execute(args)
-  args.db_timeout = args.db_timeout * 1000
+  args.db_timeout = args.db_timeout and (args.db_timeout * 1000) or nil
   args.lock_timeout = args.lock_timeout
 
   local conf = assert(conf_loader(args.conf, {
     prefix = args.prefix
   }, { starting = true }))
 
-  conf.pg_timeout = args.db_timeout -- connect + send + read
-
-  conf.cassandra_timeout = args.db_timeout -- connect + send + read
-  conf.cassandra_schema_consensus_timeout = args.db_timeout
+  conf.pg_timeout = args.db_timeout or conf.pg_timeout -- connect + send + read
 
   assert(not kill.is_running(conf.nginx_pid),
          "Kong is already running in " .. conf.prefix)
 
-  assert(prefix_handler.prepare_prefix(conf, args.nginx_conf))
+  assert(prefix_handler.prepare_prefix(conf, args.nginx_conf, nil, nil,
+         args.nginx_conf_flags))
 
-  cleanup_dangling_unix_sockets(conf.prefix)
+  cleanup_dangling_unix_sockets(conf.socket_path)
 
   _G.kong = kong_global.new()
   kong_global.init_pdk(_G.kong, conf)
@@ -120,21 +118,23 @@ Start Kong (Nginx and other configured services) in the configured
 prefix directory.
 
 Options:
- -c,--conf        (optional string)   Configuration file.
+ -c,--conf                 (optional string)   Configuration file.
 
- -p,--prefix      (optional string)   Override prefix directory.
+ -p,--prefix               (optional string)   Override prefix directory.
 
- --nginx-conf     (optional string)   Custom Nginx configuration template.
+ --nginx-conf              (optional string)   Custom Nginx configuration template.
 
- --run-migrations (optional boolean)  Run migrations before starting.
+ --run-migrations          (optional boolean)  Run migrations before starting.
 
- --db-timeout     (default 60)        Timeout, in seconds, for all database
-                                      operations (including schema consensus for
-                                      Cassandra).
+ --db-timeout              (optional number)   Timeout, in seconds, for all database
+                                               operations.
 
- --lock-timeout   (default 60)        When --run-migrations is enabled, timeout,
-                                      in seconds, for nodes waiting on the
-                                      leader node to finish running migrations.
+ --lock-timeout            (default 60)        When --run-migrations is enabled, timeout,
+                                               in seconds, for nodes waiting on the
+                                               leader node to finish running migrations.
+
+ --nginx-conf-flags        (optional string)   Flags that can be used to control
+                                               how Nginx configuration templates are rendered
 ]]
 
 return {

@@ -1,4 +1,4 @@
-local deepcopy = require("pl.tablex").deepcopy
+local utils = require("kong.tools.utils")
 
 local gettime, sleep
 if ngx then
@@ -19,27 +19,34 @@ end
 
 describe("[DNS client cache]", function()
 
-  local client, resolver, query_func
+  local client, resolver
 
   before_each(function()
+    _G.busted_new_dns_client = false
+
     client = require("kong.resty.dns.client")
     resolver = require("resty.dns.resolver")
 
-    -- you can replace this `query_func` upvalue to spy on resolver query calls.
+    -- `resolver.query_func` is hooked to inspect resolver query calls. New values can be assigned to it.
     -- This default will just call the original resolver (hence is transparent)
-    query_func = function(self, original_query_func, name, options)
+    resolver.query_func = function(self, original_query_func, name, options)
       return original_query_func(self, name, options)
     end
 
     -- patch the resolver lib, such that any new resolver created will query
-    -- using the `query_func` upvalue defined above
+    -- using the `resolver.query_func` defined above
     local old_new = resolver.new
     resolver.new = function(...)
       local r = old_new(...)
       local original_query_func = r.query
+
+      -- remember the passed in query_func
+      -- so it won't be replaced by the next resolver.new call
+      -- and won't interfere with other tests
+      local query_func = resolver.query_func
       r.query = function(self, ...)
-        if not query_func then
-          print(debug.traceback("WARNING: query_func is not set"))
+        if not resolver.query_func then
+          print(debug.traceback("WARNING: resolver.query_func is not set"))
           dump(self, ...)
           return
         end
@@ -53,8 +60,8 @@ describe("[DNS client cache]", function()
     package.loaded["kong.resty.dns.client"] = nil
     package.loaded["resty.dns.resolver"] = nil
     client = nil
+    resolver.query_func = nil
     resolver = nil
-    query_func = nil
   end)
 
 
@@ -81,7 +88,7 @@ describe("[DNS client cache]", function()
       assert(client.init(config))
       lrucache = client.getcache()
 
-      query_func = function(self, original_query_func, qname, opts)
+      resolver.query_func = function(self, original_query_func, qname, opts)
         return mock_records[qname..":"..opts.qtype] or { errcode = 3, errstr = "name error" }
       end
     end)
@@ -189,7 +196,7 @@ describe("[DNS client cache]", function()
           ttl = 0.1,
         }}
       }
-      local mock_copy = require("pl.tablex").deepcopy(mock_records)
+      local mock_copy = utils.cycle_aware_deep_copy(mock_records)
 
       -- resolve and check whether we got the mocked record
       local result = client.resolve("myhost6")
@@ -218,7 +225,7 @@ describe("[DNS client cache]", function()
       -- the 'result3' resolve call above will also trigger a new background query
       -- (because the sleep of 0.1 equals the records ttl of 0.1)
       -- so let's yield to activate that background thread now. If not done so,
-      -- the `after_each` will clear `query_func` and an error will appear on the
+      -- the `after_each` will clear `resolver.query_func` and an error will appear on the
       -- next test after this one that will yield.
       sleep(0.1)
     end)
@@ -281,7 +288,7 @@ describe("[DNS client cache]", function()
       assert(client.init(config))
       lrucache = client.getcache()
 
-      query_func = function(self, original_query_func, qname, opts)
+      resolver.query_func = function(self, original_query_func, qname, opts)
         return mock_records[qname..":"..opts.qtype] or { errcode = 3, errstr = "name error" }
       end
     end)
@@ -305,7 +312,7 @@ describe("[DNS client cache]", function()
       assert.equal(rec1, lrucache:get(client.TYPE_A..":myhost9.domain.com"))
 
       sleep(0.15) -- make sure we surpass the ttl of 0.1 of the record, so it is now stale.
-      -- new mock records, such that we return server failures instaed of records
+      -- new mock records, such that we return server failures installed of records
       local rec2 = {
         errcode = 4,
         errstr = "server failure",
@@ -417,7 +424,7 @@ describe("[DNS client cache]", function()
         ttl = 60,
       }
       mock_records = setmetatable({
-        ["myhost9.domain.com:"..client.TYPE_CNAME] = { deepcopy(CNAME1) },  -- copy to make it different
+        ["myhost9.domain.com:"..client.TYPE_CNAME] = { utils.cycle_aware_deep_copy(CNAME1) },  -- copy to make it different
         ["myhost9.domain.com:"..client.TYPE_A] = { CNAME1, A2 },  -- not there, just a reference and target
         ["myotherhost.domain.com:"..client.TYPE_A] = { A2 },
       }, {
@@ -461,7 +468,7 @@ describe("[DNS client cache]", function()
       assert(client.init(config))
       lrucache = client.getcache()
 
-      query_func = function(self, original_query_func, qname, opts)
+      resolver.query_func = function(self, original_query_func, qname, opts)
         return mock_records[qname..":"..opts.qtype] or { errcode = 3, errstr = "name error" }
       end
     end)

@@ -1,4 +1,5 @@
 local helpers = require "spec.helpers"
+local shell = require "resty.shell"
 
 local tcp_service_port = helpers.get_available_port()
 local tcp_proxy_port = helpers.get_available_port()
@@ -199,7 +200,7 @@ describe("Plugin: prometheus (access via status API)", function()
 
     helpers.wait_until(function()
       local body = get_metrics()
-      return body:find('http_requests_total{service="mock-service",route="http-route",code="200",source="service",consumer=""} 1', nil, true)
+      return body:find('http_requests_total{service="mock-service",route="http-route",code="200",source="service",workspace="default",consumer=""} 1', nil, true)
     end)
 
     res = assert(proxy_client:send {
@@ -212,14 +213,14 @@ describe("Plugin: prometheus (access via status API)", function()
     assert.res_status(400, res)
     local body = get_metrics()
 
-    assert.matches('kong_kong_latency_ms_bucket{service="mock%-service",route="http%-route",le="%+Inf"} +%d', body)
-    assert.matches('kong_upstream_latency_ms_bucket{service="mock%-service",route="http%-route",le="%+Inf"} +%d', body)
-    assert.matches('kong_request_latency_ms_bucket{service="mock%-service",route="http%-route",le="%+Inf"} +%d', body)
+    assert.matches('kong_kong_latency_ms_bucket{service="mock%-service",route="http%-route",workspace="default",le="%+Inf"} +%d', body)
+    assert.matches('kong_upstream_latency_ms_bucket{service="mock%-service",route="http%-route",workspace="default",le="%+Inf"} +%d', body)
+    assert.matches('kong_request_latency_ms_bucket{service="mock%-service",route="http%-route",workspace="default",le="%+Inf"} +%d', body)
 
-    assert.matches('http_requests_total{service="mock-service",route="http-route",code="400",source="service",consumer=""} 1', body, nil, true)
-    assert.matches('kong_bandwidth_bytes{service="mock%-service",route="http%-route",direction="ingress",consumer=""} %d+', body)
+    assert.matches('http_requests_total{service="mock-service",route="http-route",code="400",source="service",workspace="default",consumer=""} 1', body, nil, true)
+    assert.matches('kong_bandwidth_bytes{service="mock%-service",route="http%-route",direction="ingress",workspace="default",consumer=""} %d+', body)
 
-    assert.matches('kong_bandwidth_bytes{service="mock%-service",route="http%-route",direction="egress",consumer=""} %d+', body)
+    assert.matches('kong_bandwidth_bytes{service="mock%-service",route="http%-route",direction="egress",workspace="default",consumer=""} %d+', body)
   end)
 
   it("increments the count for proxied grpc requests", function()
@@ -237,7 +238,7 @@ describe("Plugin: prometheus (access via status API)", function()
 
     helpers.wait_until(function()
       local body = get_metrics()
-      return body:find('http_requests_total{service="mock-grpc-service",route="grpc-route",code="200",source="service",consumer=""} 1', nil, true)
+      return body:find('http_requests_total{service="mock-grpc-service",route="grpc-route",code="200",source="service",workspace="default",consumer=""} 1', nil, true)
     end)
 
     ok, resp = proxy_client_grpcs({
@@ -254,13 +255,13 @@ describe("Plugin: prometheus (access via status API)", function()
 
     helpers.wait_until(function()
       local body = get_metrics()
-      return body:find('http_requests_total{service="mock-grpcs-service",route="grpcs-route",code="200",source="service",consumer=""} 1', nil, true)
+      return body:find('http_requests_total{service="mock-grpcs-service",route="grpcs-route",code="200",source="service",workspace="default",consumer=""} 1', nil, true)
     end)
   end)
 
   it("does not log error if no service was matched", function()
     -- cleanup logs
-    os.execute(":> " .. helpers.test_conf.nginx_err_logs)
+    shell.run(":> " .. helpers.test_conf.nginx_err_logs, nil, 0)
 
     local res = assert(proxy_client:send {
       method  = "POST",
@@ -274,7 +275,7 @@ describe("Plugin: prometheus (access via status API)", function()
 
   it("does not log error during a scrape", function()
     -- cleanup logs
-    os.execute(":> " .. helpers.test_conf.nginx_err_logs)
+    shell.run(":> " .. helpers.test_conf.nginx_err_logs, nil, 0)
 
     get_metrics()
 

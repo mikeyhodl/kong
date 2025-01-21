@@ -10,6 +10,7 @@ local PHASES = {
   --init            = 0x00000001,
   init_worker       = 0x00000001,
   certificate       = 0x00000002,
+  client_hello      = 0x00000008,
   --set             = 0x00000004,
   rewrite           = 0x00000010,
   access            = 0x00000020,
@@ -76,7 +77,7 @@ local function check_phase(accepted_phases)
       current_phase = PHASES.admin_api
     else
       error(fmt("no phase in ngx.ctx.KONG_PHASE, (need one of %s)",
-                table.concat(get_phases_names(accepted_phases), ", ")))
+                table.concat(get_phases_names(accepted_phases), ", ")), 3)
     end
   end
 
@@ -89,7 +90,7 @@ local function check_phase(accepted_phases)
 
   error(fmt("function cannot be called in %s phase (only in: %s)",
             current_phase_name,
-            table.concat(accepted_phases_names, ", ")))
+            table.concat(accepted_phases_names, ", ")), 3)
 end
 
 
@@ -122,6 +123,7 @@ end
 local public_phases = setmetatable({
   request = new_phase(PHASES.rewrite,
                       PHASES.access,
+                      PHASES.balancer,
                       PHASES.response,
                       PHASES.header_filter,
                       PHASES.body_filter,

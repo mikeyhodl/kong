@@ -169,12 +169,18 @@ describe("declarative config: process_auto_fields", function()
               config = {
                 http_endpoint = "https://example.com",
                 content_type = "application/json",
-                flush_timeout = 2,
                 keepalive = 60000,
                 method = "POST",
-                queue_size = 1,
-                retry_count = 10,
                 timeout = 10000,
+                queue = {
+                  initial_retry_delay = 0.01,
+                  max_batch_size = 1,
+                  max_entries = 10000,
+                  max_coalescing_delay = 1,
+                  max_retry_delay = 60,
+                  max_retry_time = 60,
+                  concurrency_limit = 1,
+                },
               }
             },
           }
@@ -221,12 +227,18 @@ describe("declarative config: process_auto_fields", function()
               config = {
                 http_endpoint = "https://example.com",
                 content_type = "application/json",
-                flush_timeout = 2,
                 keepalive = 60000,
                 method = "POST",
-                queue_size = 1,
-                retry_count = 10,
                 timeout = 10000,
+                queue = {
+                  initial_retry_delay = 0.01,
+                  max_batch_size = 1,
+                  max_entries = 10000,
+                  max_coalescing_delay = 1,
+                  max_retry_delay = 60,
+                  max_retry_time = 60,
+                  concurrency_limit = 1,
+                },
               }
             },
           }
@@ -333,12 +345,18 @@ describe("declarative config: process_auto_fields", function()
                     config = {
                       http_endpoint = "https://example.com",
                       content_type = "application/json",
-                      flush_timeout = 2,
                       keepalive = 60000,
                       method = "POST",
-                      queue_size = 1,
-                      retry_count = 10,
                       timeout = 10000,
+                      queue = {
+                        initial_retry_delay = 0.01,
+                        max_batch_size = 1,
+                        max_entries = 10000,
+                        max_coalescing_delay = 1,
+                        max_retry_delay = 60,
+                        max_retry_time = 60,
+                        concurrency_limit = 1,
+                      },
                     }
                   },
                 }
@@ -360,6 +378,7 @@ describe("declarative config: process_auto_fields", function()
                     protocols = { "grpc", "grpcs", "http", "https" },
                     config = {
                       hide_credentials = false,
+                      realm = "service",
                     }
                   },
                   {
@@ -648,12 +667,18 @@ describe("declarative config: process_auto_fields", function()
                         config = {
                           http_endpoint = "https://example.com",
                           content_type = "application/json",
-                          flush_timeout = 2,
                           keepalive = 60000,
                           method = "POST",
-                          queue_size = 1,
-                          retry_count = 10,
                           timeout = 10000,
+                          queue = {
+                            initial_retry_delay = 0.01,
+                            max_batch_size = 1,
+                            max_entries = 10000,
+                            max_coalescing_delay = 1,
+                            max_retry_delay = 60,
+                            max_retry_time = 60,
+                            concurrency_limit = 1,
+                          },
                         }
                       }
                     }
@@ -689,6 +714,7 @@ describe("declarative config: process_auto_fields", function()
                         protocols = { "grpc", "grpcs", "http", "https" },
                         config = {
                           hide_credentials = false,
+                          realm = "service",
                         }
                       },
                       {

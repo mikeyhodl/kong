@@ -1,5 +1,5 @@
 local typedefs = require "kong.db.schema.typedefs"
-
+local redis_schema = require "kong.tools.redis.schema"
 
 local ORDERED_PERIODS = { "second", "minute", "hour", "day", "month", "year" }
 
@@ -13,7 +13,7 @@ local function validate_periods_order(limit)
         local v2 = limit[upper_period]
         if type(v2) == "number" and v2 < v1 then
           return nil, string.format("the limit for %s(%.1f) cannot be lower than the limit for %s(%.1f)",
-                                    upper_period, v2, lower_period, v1)
+            upper_period, v2, lower_period, v1)
         end
       end
     end
@@ -26,7 +26,7 @@ end
 local function is_dbless()
   local _, database, role = pcall(function()
     return kong.configuration.database,
-           kong.configuration.role
+        kong.configuration.role
   end)
 
   return database == "off" or role == "control_plane"
@@ -36,6 +36,8 @@ end
 local policy
 if is_dbless() then
   policy = {
+    description =
+    "The rate-limiting policies to use for retrieving and incrementing the limits.",
     type = "string",
     default = "local",
     one_of = {
@@ -43,9 +45,10 @@ if is_dbless() then
       "redis",
     },
   }
-
 else
   policy = {
+    description =
+    "The rate-limiting policies to use for retrieving and incrementing the limits.",
     type = "string",
     default = "local",
     one_of = {
@@ -56,33 +59,61 @@ else
   }
 end
 
-
 return {
   name = "response-ratelimiting",
   fields = {
     { protocols = typedefs.protocols_http },
-    { config = {
+    {
+      config = {
         type = "record",
         fields = {
-          { header_name = { type = "string", default = "x-kong-limit" }, },
-          { limit_by = { type = "string",
-                         default = "consumer",
-                         one_of = { "consumer", "credential", "ip" },
-          }, },
+          {
+            header_name = {
+              description = "The name of the response header used to increment the counters.",
+              type = "string",
+              default = "x-kong-limit"
+            },
+          },
+          {
+            limit_by = {
+              description =
+              "The entity that will be used when aggregating the limits: `consumer`, `credential`, `ip`. If the `consumer` or the `credential` cannot be determined, the system will always fallback to `ip`.",
+              type = "string",
+              default = "consumer",
+              one_of = { "consumer", "credential", "ip" },
+            },
+          },
           { policy = policy },
-          { fault_tolerant = { type = "boolean", required = true, default = true }, },
-          { redis_host = typedefs.host },
-          { redis_port = typedefs.port({ default = 6379 }), },
-          { redis_password = { type = "string", len_min = 0, referenceable = true }, },
-          { redis_username = { type = "string", referenceable = true }, },
-          { redis_ssl = { type = "boolean", required = true, default = false, }, },
-          { redis_ssl_verify = { type = "boolean", required = true, default = false }, },
-          { redis_server_name = typedefs.sni },
-          { redis_timeout = { type = "number", default = 2000 }, },
-          { redis_database = { type = "number", default = 0 }, },
-          { block_on_first_violation = { type = "boolean", required = true, default = false }, },
-          { hide_client_headers = { type = "boolean", required = true, default = false }, },
-          { limits = {
+          {
+            fault_tolerant = {
+              description =
+              "A boolean value that determines if the requests should be proxied even if Kong has troubles connecting a third-party datastore. If `true`, requests will be proxied anyway, effectively disabling the rate-limiting function until the datastore is working again. If `false`, then the clients will see `500` errors.",
+              type = "boolean",
+              required = true,
+              default = true
+            },
+          },
+          { redis = redis_schema.config_schema },
+          {
+            block_on_first_violation = {
+              description =
+              "A boolean value that determines if the requests should be blocked as soon as one limit is being exceeded. This will block requests that are supposed to consume other limits too.",
+              type = "boolean",
+              required = true,
+              default = false
+            },
+          },
+          {
+            hide_client_headers = {
+              description = "Optionally hide informative response headers.",
+              type = "boolean",
+              required = true,
+              default = false
+            },
+          },
+          {
+            limits = {
+              description = "A map that defines rate limits for the plugin.",
               type = "map",
               required = true,
               len_min = 1,
@@ -106,21 +137,115 @@ return {
             },
           },
         },
+        shorthand_fields = {
+          -- TODO: deprecated forms, to be removed in Kong 4.0
+          { redis_host = {
+            type = "string",
+            deprecation = {
+              replaced_with = { { path = { 'redis', 'host' } } },
+              message = "response-ratelimiting: config.redis_host is deprecated, please use config.redis.host instead",
+              removal_in_version = "4.0", },
+            func = function(value)
+              return { redis = { host = value } }
+            end
+          } },
+          { redis_port = {
+            type = "integer",
+            deprecation = {
+              replaced_with = { { path = {'redis', 'port'} } },
+              message = "response-ratelimiting: config.redis_port is deprecated, please use config.redis.port instead",
+              removal_in_version = "4.0", },
+            func = function(value)
+              return { redis = { port = value } }
+            end
+          } },
+          { redis_password = {
+            type = "string",
+            len_min = 0,
+            deprecation = {
+              replaced_with = { { path = {'redis', 'password'} } },
+              message = "response-ratelimiting: config.redis_password is deprecated, please use config.redis.password instead",
+              removal_in_version = "4.0", },
+            func = function(value)
+              return { redis = { password = value } }
+            end
+          } },
+          { redis_username = {
+            type = "string",
+            deprecation = {
+              replaced_with = { { path = {'redis', 'username'} } },
+              message = "response-ratelimiting: config.redis_username is deprecated, please use config.redis.username instead",
+              removal_in_version = "4.0", },
+            func = function(value)
+              return { redis = { username = value } }
+            end
+          } },
+          { redis_ssl = {
+            type = "boolean",
+            deprecation = {
+              replaced_with = { { path = {'redis', 'ssl'} } },
+              message = "response-ratelimiting: config.redis_ssl is deprecated, please use config.redis.ssl instead",
+              removal_in_version = "4.0", },
+            func = function(value)
+              return { redis = { ssl = value } }
+            end
+          } },
+          { redis_ssl_verify = {
+            type = "boolean",
+            deprecation = {
+              replaced_with = { { path = {'redis', 'ssl_verify'} } },
+              message = "response-ratelimiting: config.redis_ssl_verify is deprecated, please use config.redis.ssl_verify instead",
+              removal_in_version = "4.0", },
+            func = function(value)
+              return { redis = { ssl_verify = value } }
+            end
+          } },
+          { redis_server_name = {
+            type = "string",
+            deprecation = {
+              replaced_with = { { path = {'redis', 'server_name'} } },
+              message = "response-ratelimiting: config.redis_server_name is deprecated, please use config.redis.server_name instead",
+              removal_in_version = "4.0", },
+            func = function(value)
+              return { redis = { server_name = value } }
+            end
+          } },
+          { redis_timeout = {
+            type = "integer",
+            deprecation = {
+              replaced_with = { { path = {'redis', 'timeout'} } },
+              message = "response-ratelimiting: config.redis_timeout is deprecated, please use config.redis.timeout instead",
+              removal_in_version = "4.0", },
+            func = function(value)
+              return { redis = { timeout = value } }
+            end
+          } },
+          { redis_database = {
+            type = "integer",
+            deprecation = {
+              replaced_with = { { path = {'redis', 'database'} } },
+              message = "response-ratelimiting: config.redis_database is deprecated, please use config.redis.database instead",
+              removal_in_version = "4.0", },
+            func = function(value)
+              return { redis = { database = value } }
+            end
+          } },
+        },
       },
     },
   },
   entity_checks = {
     { conditional = {
       if_field = "config.policy", if_match = { eq = "redis" },
-      then_field = "config.redis_host", then_match = { required = true },
+      then_field = "config.redis.host", then_match = { required = true },
     } },
     { conditional = {
       if_field = "config.policy", if_match = { eq = "redis" },
-      then_field = "config.redis_port", then_match = { required = true },
+      then_field = "config.redis.port", then_match = { required = true },
     } },
     { conditional = {
       if_field = "config.policy", if_match = { eq = "redis" },
-      then_field = "config.redis_timeout", then_match = { required = true },
+      then_field = "config.redis.timeout", then_match = { required = true },
     } },
   },
 }

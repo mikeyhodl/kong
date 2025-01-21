@@ -1,6 +1,7 @@
 local helpers         = require "spec.helpers"
-local utils           = require "kong.tools.utils"
+local uuid            = require "kong.tools.uuid"
 local schema_def = require "kong.plugins.oauth2.schema"
+local DAO_MAX_TTL = require("kong.constants").DATABASE.DAO_MAX_TTL
 local v = require("spec.helpers").validate_plugin_config_schema
 
 local fmt = string.format
@@ -72,6 +73,14 @@ for _, strategy in helpers.each_strategy() do
       assert.is_falsy(errors)
       assert.equal(1209600, t2.config.refresh_token_ttl)
     end)
+    it("sets refresh_token_ttl to too large a value", function()
+      local t = {enable_authorization_code = true, mandatory_scope = false, refresh_token_ttl = 252979200, }
+      local t2, errors = v(t, schema_def)
+      assert.is_nil(t2)
+      assert.same(errors, { config = {
+        refresh_token_ttl = "value should be between 0 and " .. DAO_MAX_TTL,
+      }})
+    end)
     it("defaults to non-persistent refresh tokens", function()
       local t = {enable_authorization_code = true, mandatory_scope = false}
       local t2, errors = v(t, schema_def)
@@ -109,7 +118,7 @@ for _, strategy in helpers.each_strategy() do
 
         local ok, err_t = oauth2_tokens_schema:validate_insert({
           credential = { id = "foo" },
-          service = { id = utils.uuid() },
+          service = { id = uuid.uuid() },
           expires_in = 1,
         })
         assert.falsy(ok)
@@ -120,8 +129,8 @@ for _, strategy in helpers.each_strategy() do
 
 
         local ok, err_t = oauth2_tokens_schema:validate_insert({
-          credential = { id = utils.uuid() },
-          service = { id = utils.uuid() },
+          credential = { id = uuid.uuid() },
+          service = { id = uuid.uuid() },
           expires_in = 1,
           token_type = "bearer",
         })
@@ -143,7 +152,7 @@ for _, strategy in helpers.each_strategy() do
 
         local ok, err_t = oauth2_authorization_codes_schema:validate_insert({
           credential = { id = "foo" },
-          service = { id = utils.uuid() },
+          service = { id = uuid.uuid() },
         })
         assert.falsy(ok)
         assert.same({
@@ -151,8 +160,8 @@ for _, strategy in helpers.each_strategy() do
         }, err_t)
 
         local ok, err_t = oauth2_authorization_codes_schema:validate_insert({
-          credential = { id = utils.uuid() },
-          service = { id = utils.uuid() },
+          credential = { id = uuid.uuid() },
+          service = { id = uuid.uuid() },
         })
 
         assert.truthy(ok)
@@ -180,31 +189,31 @@ for _, strategy in helpers.each_strategy() do
           service = { id = service.id },
         })
 
-        token, err = db.oauth2_tokens:select({ id = token.id })
+        token, err = db.oauth2_tokens:select(token)
         assert.falsy(err)
         assert.truthy(token)
 
-        code, err = db.oauth2_authorization_codes:select({ id = code.id })
+        code, err = db.oauth2_authorization_codes:select(code)
         assert.falsy(err)
         assert.truthy(code)
 
-        ok, err, err_t = db.services:delete({ id = service.id })
+        ok, err, err_t = db.services:delete(service)
         assert.truthy(ok)
         assert.is_falsy(err_t)
         assert.is_falsy(err)
 
         -- no more service
-        service, err = db.services:select({ id = service.id })
+        service, err = db.services:select(service)
         assert.falsy(err)
         assert.falsy(service)
 
         -- no more token
-        token, err = db.oauth2_tokens:select({ id = token.id })
+        token, err = db.oauth2_tokens:select(token)
         assert.falsy(err)
         assert.falsy(token)
 
         -- no more code
-        code, err = db.oauth2_authorization_codes:select({ id = code.id })
+        code, err = db.oauth2_authorization_codes:select(code)
         assert.falsy(err)
         assert.falsy(code)
       end)

@@ -1,7 +1,10 @@
 local helpers = require "spec.helpers"
 local utils = require "pl.utils"
-local stringx = require "pl.stringx"
 local http = require "resty.http"
+local constants = require "kong.constants"
+
+
+local strip = require("kong.tools.string").strip
 
 
 local function count_server_blocks(filename)
@@ -16,11 +19,11 @@ local function get_listeners(filename)
   local result = {}
   for block in file:gmatch("[%\n%s]+server%s+(%b{})") do
     local server_name = block:match("[%\n%s]server_name%s(.-);")
-    server_name = server_name and stringx.strip(server_name) or "stream"
+    server_name = server_name and strip(server_name) or "stream"
     local server = result[server_name] or {}
     result[server_name] = server
     for listen in block:gmatch("[%\n%s]listen%s(.-);") do
-      listen = stringx.strip(listen)
+      listen = strip(listen)
       table.insert(server, listen)
       server[listen] = #server
     end
@@ -42,6 +45,7 @@ describe("Proxy interface listeners", function()
     assert(helpers.start_kong({
       proxy_listen = "off",
       admin_listen = "0.0.0.0:9001",
+      admin_gui_listen = "off",
     }))
     assert.equals(2, count_server_blocks(helpers.test_conf.nginx_kong_conf))
     assert.is_nil(get_listeners(helpers.test_conf.nginx_kong_conf).kong)
@@ -51,6 +55,7 @@ describe("Proxy interface listeners", function()
     assert(helpers.start_kong({
       proxy_listen = "127.0.0.1:9001, 127.0.0.1:9002",
       admin_listen = "0.0.0.0:9000",
+      admin_gui_listen = "off",
     }))
 
     assert.equals(3, count_server_blocks(helpers.test_conf.nginx_kong_conf))
@@ -98,10 +103,10 @@ describe("#stream proxy interface listeners", function()
       stream_listen = "127.0.0.1:9011, 127.0.0.1:9012",
     }))
 
-    local stream_events_sock_path = "unix:" .. helpers.test_conf.prefix .. "/stream_worker_events.sock"
+    local stream_events_sock_path = "unix:" .. helpers.test_conf.socket_path .. "/" .. constants.SOCKETS.STREAM_WORKER_EVENTS
 
     if helpers.test_conf.database == "off" then
-      local stream_config_sock_path = "unix:" .. helpers.test_conf.prefix .. "/stream_config.sock"
+      local stream_config_sock_path = "unix:" .. helpers.test_conf.socket_path .. "/" .. constants.SOCKETS.STREAM_CONFIG
 
       assert.equals(3, count_server_blocks(helpers.test_conf.nginx_kong_stream_conf))
       assert.same({
@@ -136,9 +141,24 @@ describe("#stream proxy interface listeners", function()
   end)
 end)
 
+
+local function reload_router(flavor)
+  helpers = require("spec.internal.module").reload_helpers(flavor)
+end
+
+
+-- TODO: remove it when we confirm it is not needed
+local function gen_route(flavor, r)
+  return r
+end
+
+
+for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions" }) do
 for _, strategy in helpers.each_strategy() do
   if strategy ~= "off" then
-    describe("[stream]", function()
+    describe("[stream" .. ", flavor = " .. flavor .. "]", function()
+      reload_router(flavor)
+
       local MESSAGE = "echo, ping, pong. echo, ping, pong. echo, ping, pong.\n"
       lazy_setup(function()
         local bp = helpers.get_db_utils(strategy, {
@@ -153,7 +173,7 @@ for _, strategy in helpers.each_strategy() do
           protocol = "tcp",
         })
 
-        assert(bp.routes:insert {
+        assert(bp.routes:insert(gen_route(flavor, {
           destinations = {
             { port = 19000 },
           },
@@ -161,9 +181,75 @@ for _, strategy in helpers.each_strategy() do
             "tcp",
           },
           service = service,
-        })
+        })))
+
+        assert(bp.routes:insert(gen_route(flavor, {
+          protocols = { "tcp" },
+          service   = service,
+          destinations = {
+            { ip = "0.0.0.0", port = 19004 },
+            { ip = "0.0.0.0", port = 19005 },
+            { ip = "0.0.0.0", port = 19006 },
+            { ip = "0.0.0.0", port = 19007 },
+            { ip = "0.0.0.0" },
+            { port = 19004 },
+          }
+        })))
+
+        assert(bp.routes:insert(gen_route(flavor, {
+          protocols = { "tcp" },
+          service   = service,
+          destinations = {
+            { ip = "0.0.0.0", port = 19004 },
+            { ip = "0.0.0.0", port = 19005 },
+            { ip = "0.0.0.0", port = 19006 },
+            { ip = "0.0.0.0", port = 19007 },
+            { ip = "0.0.0.0" },
+            { port = 19004 },
+          }
+        })))
+
+        assert(bp.routes:insert(gen_route(flavor, {
+          protocols = { "tcp" },
+          service   = service,
+          destinations = {
+            { ip = "0.0.0.0", port = 19004 },
+            { ip = "0.0.0.0", port = 19005 },
+            { ip = "0.0.0.0", port = 19006 },
+            { ip = "0.0.0.0", port = 19007 },
+            { ip = "0.0.0.0" },
+            { port = 19004 },
+          }
+        })))
+
+        assert(bp.routes:insert(gen_route(flavor, {
+          protocols = { "tcp" },
+          service   = service,
+          destinations = {
+            { ip = "0.0.0.0", port = 19004 },
+            { ip = "0.0.0.0", port = 19005 },
+            { ip = "0.0.0.0", port = 19006 },
+            { ip = "0.0.0.0", port = 19007 },
+            { ip = "0.0.0.0" },
+            { port = 19004 },
+          }
+        })))
+
+        assert(bp.routes:insert(gen_route(flavor, {
+          protocols = { "tcp" },
+          service   = service,
+          destinations = {
+            { ip = "0.0.0.0", port = 19004 },
+            { ip = "0.0.0.0", port = 19005 },
+            { ip = "0.0.0.0", port = 19006 },
+            { ip = "0.0.0.0", port = 19007 },
+            { ip = "0.0.0.0" },
+            { port = 19004 },
+          }
+        })))
 
         assert(helpers.start_kong({
+          router_flavor = flavor,
           database      = strategy,
           stream_listen = helpers.get_proxy_ip(false) .. ":19000, " ..
                           helpers.get_proxy_ip(false) .. ":18000, " ..
@@ -210,6 +296,11 @@ for _, strategy in helpers.each_strategy() do
         end
         assert(tcp_client:close())
       end)
+
+      it("destinations has more than 3 items", function()
+        assert.logfile().has.no.line("invalid order function for sorting", true)
+      end)
     end)
   end
 end
+end   -- for flavor

@@ -348,14 +348,23 @@ for _, strategy in helpers.each_strategy() do
         })
         assert.res_status(200, res)
 
-        -- Check that cache is populated
-        local cache_key = db.oauth2_tokens:cache_key(token.access_token)
-        local res = assert(admin_client:send {
-          method  = "GET",
-          path    = "/cache/" .. cache_key,
-          headers = {}
-        })
-        assert.res_status(200, res)
+        local cache_key
+        helpers.wait_until(function()
+          -- Check that cache is populated
+          cache_key = db.oauth2_tokens:cache_key(token.access_token)
+          local res = assert(admin_client:send {
+            method  = "GET",
+            path    = "/cache/" .. cache_key,
+            headers = {}
+          })
+
+          -- Discard body in case we need to retry. Otherwise the connection will mess up.
+          res:read_body()
+          if res.status ~= 200 then
+            assert.logfile().has.no.line("[error]", true)
+          end
+          return 200 == res.status
+        end, 5)
 
         local res = db.oauth2_tokens:select_by_access_token(token.access_token)
         local token_id = res.id
@@ -397,6 +406,8 @@ for _, strategy in helpers.each_strategy() do
         })
         local token = cjson.decode(assert.res_status(200, res))
         assert.is_table(token)
+
+        helpers.wait_for_all_config_update()
 
         -- The token should work
         local res = assert(proxy_ssl_client:send {

@@ -6,6 +6,8 @@ local cjson = require "cjson"
 local pkey = require("resty.openssl.pkey")
 local x509 = require("resty.openssl.x509")
 
+local cycle_aware_deep_copy = require("kong.tools.table").cycle_aware_deep_copy
+
 local client
 
 local function new_cert_key_pair(expire)
@@ -90,11 +92,174 @@ for _, strategy in ipairs(strategies) do
   end)
 end
 
+for _, strategy in ipairs(strategies) do
+  local account_name, account_key
+  local c, config, db
+
+  local KEY_ID = "123"
+  local KEY_SET_NAME = "key_set_foo"
+
+  local pem_pub, pem_priv = helpers.generate_keys("PEM")
+
+  lazy_setup(function()
+    client = require("kong.plugins.acme.client")
+    account_name = client._account_name(proper_config)
+  end)
+
+  describe("Plugin: acme (client.create_account) [#" .. strategy .. "]", function()
+    describe("create with preconfigured account_key with key_set", function()
+      lazy_setup(function()
+        account_key = {key_id = KEY_ID, key_set = KEY_SET_NAME}
+        config = cycle_aware_deep_copy(proper_config)
+        config.account_key = account_key
+        c = client.new(config)
+
+        _, db = helpers.get_db_utils(strategy ~= "off" and strategy or nil, {"keys", "key_sets"})
+
+        local ks, err = assert(db.key_sets:insert({name = KEY_SET_NAME}))
+        assert.is_nil(err)
+
+        local k, err = db.keys:insert({
+          name = "Test PEM",
+          pem = {
+            private_key = pem_priv,
+            public_key = pem_pub
+          },
+          set = ks,
+          kid = KEY_ID
+        })
+        assert(k)
+        assert.is_nil(err)
+      end)
+
+      lazy_teardown(function()
+        c.storage:delete(account_name)
+      end)
+
+      -- The first call should result in the account key being persisted.
+      it("persists account", function()
+        local err = client._create_account(config)
+        assert.is_nil(err)
+
+        local account, err = c.storage:get(account_name)
+        assert.is_nil(err)
+        assert.not_nil(account)
+
+        local account_data = cjson.decode(account)
+        assert.equal(account_data.key, pem_priv)
+      end)
+
+      -- The second call should be a nop because the key is found in the db.
+      -- Validate that the second call does not result in the key being changed.
+      it("skips persisting existing account", function()
+        local err = client._create_account(config)
+        assert.is_nil(err)
+
+        local account, err = c.storage:get(account_name)
+        assert.is_nil(err)
+        assert.not_nil(account)
+
+        local account_data = cjson.decode(account)
+        assert.equal(account_data.key, pem_priv)
+      end)
+    end)
+
+    describe("create with preconfigured account_key without key_set", function()
+      lazy_setup(function()
+        account_key = {key_id = KEY_ID}
+        config = cycle_aware_deep_copy(proper_config)
+        config.account_key = account_key
+        c = client.new(config)
+
+        _, db = helpers.get_db_utils(strategy ~= "off" and strategy or nil, {"keys", "key_sets"})
+
+        local k, err = db.keys:insert({
+          name = "Test PEM",
+          pem = {
+            private_key = pem_priv,
+            public_key = pem_pub
+          },
+          kid = KEY_ID
+        })
+        assert(k)
+        assert.is_nil(err)
+      end)
+
+      lazy_teardown(function()
+        c.storage:delete(account_name)
+      end)
+
+      -- The first call should result in the account key being persisted.
+      it("persists account", function()
+        local err = client._create_account(config)
+        assert.is_nil(err)
+
+        local account, err = c.storage:get(account_name)
+        assert.is_nil(err)
+        assert.not_nil(account)
+
+        local account_data = cjson.decode(account)
+        assert.equal(account_data.key, pem_priv)
+      end)
+    end)
+
+    describe("create with generated account_key", function()
+      local i = 1
+      local account_keys = {}
+
+      lazy_setup(function()
+        config = cycle_aware_deep_copy(proper_config)
+        c = client.new(config)
+
+        account_keys[1] = util.create_pkey()
+        account_keys[2] = util.create_pkey()
+
+        util.create_pkey = function(size, type)
+          local key = account_keys[i]
+          i = i + 1
+          return key
+        end
+      end)
+
+      lazy_teardown(function()
+        c.storage:delete(account_name)
+      end)
+
+      -- The first call should result in a key being generated and the account
+      -- should then be persisted.
+      it("persists account", function()
+        local err = client._create_account(config)
+        assert.is_nil(err)
+
+        local account, err = c.storage:get(account_name)
+        assert.is_nil(err)
+        assert.not_nil(account)
+
+        local account_data = cjson.decode(account)
+        assert.equal(account_data.key, account_keys[1])
+      end)
+
+      -- The second call should be a nop because the key is found in the db.
+      it("skip persisting existing account", function()
+        local err = client._create_account(config)
+        assert.is_nil(err)
+
+        local account, err = c.storage:get(account_name)
+        assert.is_nil(err)
+        assert.not_nil(account)
+
+        local account_data = cjson.decode(account)
+        assert.equal(account_data.key, account_keys[1])
+      end)
+    end)
+  end)
+end
+
 for _, strategy in helpers.each_strategy() do
   describe("Plugin: acme (client.save) [#" .. strategy .. "]", function()
     local bp, db
     local cert, sni
-    local host = "test1.com"
+    local host = "test1.test"
 
     lazy_setup(function()
       bp, db = helpers.get_db_utils(strategy, {
@@ -120,7 +285,7 @@ for _, strategy in helpers.each_strategy() do
     describe("creates new cert", function()
       local key, crt = new_cert_key_pair()
       local new_sni, new_cert, err
-      local new_host = "test2.com"
+      local new_host = "test2.test"
 
       it("returns no error", function()
         err = client._save_dao(new_host, key, crt)
@@ -134,7 +299,7 @@ for _, strategy in helpers.each_strategy() do
       end)
 
       it("create new certificate", function()
-        new_cert, err = db.certificates:select({ id = new_sni.certificate.id })
+        new_cert, err = db.certificates:select(new_sni.certificate)
         assert.is_nil(err)
         assert.same(new_cert.key, key)
         assert.same(new_cert.cert, crt)
@@ -159,14 +324,14 @@ for _, strategy in helpers.each_strategy() do
       end)
 
       it("creates new certificate", function()
-        new_cert, err = db.certificates:select({ id = new_sni.certificate.id })
+        new_cert, err = db.certificates:select(new_sni.certificate)
         assert.is_nil(err)
         assert.same(new_cert.key, key)
         assert.same(new_cert.cert, crt)
       end)
 
       it("deletes old certificate", function()
-        new_cert, err = db.certificates:select({ id = cert.id })
+        new_cert, err = db.certificates:select(cert)
         assert.is_nil(err)
         assert.is_nil(new_cert)
       end)
@@ -178,8 +343,8 @@ for _, strategy in ipairs({"off"}) do
   describe("Plugin: acme (client.renew) [#" .. strategy .. "]", function()
     local bp
     local cert
-    local host = "test1.com"
-    local host_not_expired = "test2.com"
+    local host = "test1.test"
+    local host_not_expired = "test2.test"
     -- make it due for renewal
     local key, crt = new_cert_key_pair(ngx.time() - 23333)
     -- make it not due for renewal
@@ -286,6 +451,18 @@ for _, strategy in ipairs({"off"}) do
         local renew, err = client._check_expire(certkey.cert, 30 * 86400)
         assert.is_nil(err)
         assert.is_falsy(renew)
+      end)
+
+      it("calling handler.renew with a false argument should be successful", function()
+        local handler = require("kong.plugins.acme.handler")
+        handler:configure({{domains = {"example.com"}}})
+
+        local original = client.renew_certificate
+        client.renew_certificate = function (config)
+          print("mock renew_certificate")
+        end
+        handler.renew(false)
+        client.renew_certificate = original
       end)
     end)
 

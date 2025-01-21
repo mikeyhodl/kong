@@ -10,7 +10,7 @@ If you are planning on developing on Kong, you'll need a development
 installation. The `master` branch holds the latest unreleased source code.
 
 You can read more about writing your own plugins in the [Plugin Development
-Guide](https://docs.konghq.com/latest/plugin-development/), or browse an
+Guide](https://docs.konghq.com/gateway/latest/plugin-development/), or browse an
 online version of Kong's source code documentation in the [Plugin Development
 Kit (PDK) Reference](https://docs.konghq.com/latest/pdk/).
 
@@ -25,18 +25,13 @@ code, other repos are also under active development:
 
 - [Kubernetes Ingress Controller for Kong](https://github.com/Kong/kubernetes-ingress-controller):
   Use Kong for Kubernetes Ingress.
+- [Binary packages](https://docs.konghq.com/gateway/latest/install/)
 - [Kong Docker](https://github.com/Kong/docker-kong): A Dockerfile for
   running Kong in Docker.
 - [Kong Packages](https://github.com/Kong/kong/releases): Pre-built packages
   for Debian, Red Hat, and OS X distributions (shipped with each release).
-- [Kong Gojira](https://github.com/Kong/gojira): A tool for
-  testing/developing multiple versions of Kong using containers.
-- [Kong Vagrant](https://github.com/Kong/kong-vagrant): A Vagrantfile for
-  provisioning a development-ready environment for Kong.
 - [Kong Homebrew](https://github.com/Kong/homebrew-kong): Homebrew Formula
   for Kong.
-- [Kong CloudFormation](https://github.com/Kong/kong-dist-cloudformation):
-  Kong in a 1-click deployment for AWS EC2.
 - [Kong AWS AMI](https://aws.amazon.com/marketplace/pp/B06WP4TNKL): Kong AMI on
   the AWS Marketplace.
 - [Kong on Microsoft Azure](https://github.com/Kong/kong-dist-azure): Run Kong
@@ -50,24 +45,10 @@ code, other repos are also under active development:
 
 You can find every supported distribution on the [official installation page](https://konghq.com/install/#kong-community).
 
-#### Docker
-
-You can use Docker / docker-compose and a mounted volume to develop Kong by
-following the instructions on [Kong/kong-build-tools](https://github.com/Kong/kong-build-tools#developing-kong).
-
-#### Kong Gojira
-
-[Gojira](https://github.com/Kong/gojira) is a CLI that uses docker-compose
-internally to make the necessary setup of containers to get all
-dependencies needed to run a particular branch of Kong locally, as well
-as easily switching across versions, configurations and dependencies. It
-has support for running Kong in Hybrid (CP/DP) mode, testing migrations,
-running a Kong cluster, among other [features](https://github.com/Kong/gojira/blob/master/docs/manual.md).
-
 #### Kong Pongo
 
-[Pongo](https://github.com/Kong/kong-pongo) is another CLI like Gojira,
-but specific for plugin development. It is docker-compose based and will
+[Pongo](https://github.com/Kong/kong-pongo) is a CLI tool that are
+specific for plugin development. It is docker-compose based and will
 create local test environments including all dependencies. Core features
 are running tests, integrated linter, config initialization, CI support,
 and custom dependencies.
@@ -81,12 +62,10 @@ starting point. It contains the proper file structures, configuration files,
 and CI setup to get up and running quickly. This repository seamlessly
 integrates with [Pongo](https://github.com/Kong/kong-pongo).
 
-#### Vagrant
+## Build and Install from source
 
-You can use a Vagrant box running Kong and Postgres that you can find at
-[Kong/kong-vagrant](https://github.com/Kong/kong-vagrant).
-
-#### Source Install
+This is the hard way to build a development environment, and also a good start
+for beginners to understand how everything fits together.
 
 Kong is mostly an OpenResty application made of Lua source files, but also
 requires some additional third-party dependencies, some of which are compiled
@@ -101,20 +80,145 @@ git clone https://github.com/Kong/kong
 cd kong
 # You might want to switch to the development branch. See CONTRIBUTING.md
 git checkout master
+
 ```
 
-Before continuing you should go through [this section](#dependencies-build-from-source) to set up dependencies.
+Then we will install the dependencies:
 
-Then you can install the Lua source:
+Ubuntu/Debian:
 
 ```shell
-# go back to where the kong source locates after dependencies are set up
-cd ../../kong
+sudo apt update \
+&& sudo apt install -y \
+    automake \
+    build-essential \
+    curl \
+    file \
+    git \
+    libyaml-dev \
+    libprotobuf-dev \
+    m4 \
+    perl \
+    pkg-config \
+    procps \
+    unzip \
+    valgrind \
+    zlib1g-dev
 
-sudo luarocks make
 ```
 
+Fedora/RHEL:
+
+```shell
+dnf install \
+    automake \
+    gcc \
+    gcc-c++ \
+    git \
+    libyaml-devel \
+    make \
+    patch \
+    perl \
+    perl-IPC-Cmd \
+    protobuf-devel \
+    unzip \
+    valgrind \
+    valgrind-devel \
+    zlib-devel
+```
+
+macOS
+
+```shell
+# Install Xcode from App Store (Command Line Tools is not supported)
+
+# Install HomeBrew
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+# Build dependencies
+brew install libyaml
+```
+
+Now, you have to authenticate with GitHub to download some essential repos
+using either one of the following ways:
+* Download [`gh cli`](https://cli.github.com/) and run `gh auth login` once.
+* Use a [Personal Access Token](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/creating-a-personal-access-token). This token does not need to have any other permission than `Public Repositories (read-only)`, and set it as `GITHUB_TOKEN` environment variable.
+* Use [git credential helper](https://git-scm.com/docs/gitcredentials).
+
+Then you have to make the Rust build system also authenticate with GitHub,
+there is nothing you need to do if you were authenticated using `gh` or `git credential helper`,
+otherwise, you can set the[`CARGO_NET_GIT_FETCH_WITH_CLI`](https://doc.rust-lang.org/cargo/reference/config.html)
+environment variable to `true`.
+
+```shell
+export CARGO_NET_GIT_FETCH_WITH_CLI=true
+```
+
+An alternative is to edit the `~/.cargo/config` file and add the following lines:
+
+```toml
+[net]
+git-fetch-with-cli = true
+```
+
+You also have to make sure the `git` CLI is using the proper protocol to fetch the dependencies
+if you are authenticated with
+[Personal Access Token](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/creating-a-personal-access-token).
+
+```shell
+# If you are using the HTTPS protocol to clone the repository
+# YOU ONLY NEED TO DO THIS ONLY ONCE FOR THIS DIRECTORY
+git config --local url."https://${GITHUB_TOKEN}@github.com/".insteadOf 'git@github.com:'
+git config --local url."https://${GITHUB_TOKEN}@github.com".insteadOf 'https://github.com'
+
+
+# If you are using the SSH protocol to clone the repository
+# YOU ONLY NEED TO DO THIS ONLY ONCE FOR THIS DIRECTORY
+git config --local url.'git@github.com:'.insteadOf 'https://github.com'
+git config --local url.'ssh://git@github.com/'.insteadOf 'https://github.com/'
+```
+
+Finally, we start the build process:
+
+```
+# Build the virtual environment for developing Kong
+make build-venv
+```
+
+[The build guide](https://github.com/Kong/kong/blob/master/build/README.md) contains a troubleshooting section if
+you face any problems. It also describes the build process in detail, if you want to development on the build
+system itself.
+
+### Start Kong
+
+Now you can start Kong:
+
+```shell
+# Activate the venv by adding some environment variables and populate helper functions
+# into your current shell session, following functions are exported:
+# `start_services`, `stop_services` and `deactivate`
+# For Zsh/Bash:
+. bazel-bin/build/kong-dev-venv.sh
+# For Fish Shell:
+. bazel-bin/build/kong-dev-venv.fish
+
+# Use the pre-defined docker-compose file to bring up databases etc
+start_services
+
+# Start Kong!
+kong start
+
+# Stop Kong
+kong stop
+
+# Cleanup
+deactivate
+```
+
+### Install Development Dependencies
+
 #### Running for development
+
+By default, the development environment adds current directory to Lua files search path.
 
 Modifying the [`lua_package_path`](https://github.com/openresty/lua-nginx-module#lua_package_path)
 and [`lua_package_cpath`](https://github.com/openresty/lua-nginx-module#lua_package_cpath)
@@ -123,13 +227,16 @@ might be in your system.
 
 #### Tests
 
-Install the development dependencies ([busted], [luacheck]) with:
+Install the development dependencies ([busted](https://lunarmodules.github.io/busted/),
+[luacheck](https://github.com/mpeterv/luacheck)) with:
 
 ```shell
 make dev
 ```
 
-Kong relies on three test suites using the [busted] testing library:
+If Rust/Cargo doesn't work, try setting `export KONG_TEST_USER_CARGO_DISABLED=1` first.
+
+Kong relies on three test suites using the [busted](https://lunarmodules.github.io/busted/) testing library:
 
 * Unit tests
 * Integration tests, which require Postgres and Cassandra to be up and running
@@ -170,7 +277,8 @@ Consult the [run_tests.sh](.ci/run_tests.sh) script for more advanced example
 usage of the test suites and the Makefile.
 
 Finally, a very useful tool in Lua development (as with many other dynamic
-languages) is performing static linting of your code. You can use [luacheck]
+languages) is performing static linting of your code. You can use
+[luacheck](https://github.com/mpeterv/luacheck)
 \(installed with `make dev`\) for this:
 
 ```
@@ -197,11 +305,11 @@ are located in the [spec/05-migration/](spec/05-migration/) directory
 and must be named after the migration they test such that the
 migration `kong/**/*.lua` has a test in
 `spec/05-migration/**/*_spec.lua`.  The presence of a test is enforced
-by the [upgrade testing](scripts/test-upgrade-path.sh) shell script
+by the [upgrade testing](scripts/upgrade-tests/test-upgrade-path.sh) shell script
 which is [automatically run](.github/workflows/upgrade-tests.yml)
 through a GitHub Action.
 
-The [upgrade testing](scripts/test-upgrade-path.sh) shell script works
+The [upgrade testing](scripts/upgrade-tests/test-upgrade-path.sh) shell script works
 as follows:
 
  * A new Kong Gateway installation is brought up using
@@ -222,13 +330,14 @@ as follows:
  * NEW: The `new_after_finish` phase of all applicable migration tests
    is run.
 
-Upgrade tests are run using [busted].  To support the specific testing
+Upgrade tests are run using [busted](https://github.com/lunarmodules/busted).
+To support the specific testing
 method of upgrade testing, a number of helper functions are defined in
 the [spec/upgrade_helpers.lua](spec/upgrade_helpers.lua) module.
 Migration tests use functions from this module to define test cases
 and associate them with phases of the upgrade testing process.
 Consequently, they are named `setup`, `old_after_up`, `new_after_up`
-and `new_after_finish`.  Additonally, the function `all_phases` can be
+and `new_after_finish`.  Additionally, the function `all_phases` can be
 used to run a certain test in the three phases `old_after_up`,
 `new_after_up` and `new_after_finish`.  These functions replace the
 use of busted's `it` function and accept a descriptive string and a
@@ -255,59 +364,49 @@ When developing, you can use the `Makefile` for doing the following operations:
 | `test-plugins`     | Run the plugins test suite                             |
 | `test-all`         | Run all unit + integration + plugins tests at once     |
 
-These are the steps we follow at Kong to set up a development environment.
+### Setup Hybrid Mode Development Environment
 
-## Dev on Docker
+You can follow the steps given below to setup a hybrid mode environment.
 
-[Gojira](https://github.com/Kong/gojira) is a multi-purpose tool to ease the
-development and testing of Kong by using Docker containers.  It's built on
-the top of Docker and Docker Compose, and separates multiple Kong development
-environments into different Docker Compose stacks.  It also auto-manages the
-network configuration between Kong and PostgreSQL (if required) by configuring
-the containers' environment variables.
+1. Activate the venv
 
-It's fully compatible with all platforms (even Apple Silicon).
-You can set up your development environment with Gojira in a couple of seconds
-(depending on your network speed). 
+   ```bash
+   # . bazel-bin/build/kong-dev-venv.sh
+   ```
 
-See below links to install the dependencies: 
+2. Following [Deploy Kong Gateway in Hybrid Mode: Generate certificate/key pair](https://docs.konghq.com/gateway/latest/production/deployment-topologies/hybrid-mode/setup/#generate-a-certificatekey-pair) to generate a certificate/key pair.
 
-- [Install Docker or Docker Desktop](https://docs.docker.com/get-docker/)
-- [Install Docker Compose](https://docs.docker.com/compose/install/)
+3. Create CP and DP configuration files, such as `kong-cp.conf` and `kong-dp.conf`.
 
-Install Gojira (see [full instructions](https://github.com/Kong/gojira#installation)):
+4. Following [Deploy Kong Gateway in Hybrid Mode: CP Configuration](https://docs.konghq.com/gateway/latest/production/deployment-topologies/hybrid-mode/setup/#set-up-the-control-plane) to configure CP using `kong.conf`.
 
-```bash
-git clone git@github.com:Kong/gojira.git
-mkdir -p ~/.local/bin
-ln -s $(realpath gojira/gojira.sh) ~/.local/bin/gojira
-```
+5. Following [Deploy Kong Gateway in Hybrid Mode: DP Configuration](https://docs.konghq.com/gateway/latest/production/deployment-topologies/hybrid-mode/setup/#install-and-start-data-planes) to configure DP using `kong.conf`.
 
-Add `export PATH=$PATH:~/.local/bin` to your `.bashrc` or `.zshrc` file.
+6. Unset environment variable `KONG_PREFIX` to ensure configuration directive `prefix` in configuration file is enabled.
 
-Clone the Kong project to your development folder.
+7. Modify or add the directive `prefix` to `kong-cp.conf` and `kong-dp.conf`
+to be `prefix=servroot-cp` and `prefix=servroot-dp`,
+or other names you want, but make sure they are different.
 
-```bash
-git clone git@github.com:Kong/kong.git
-cd kong
-```
+8. Use the pre-defined docker-compose file to bring up databases, etc.
 
-Within the `kong` folder run the following Gojira commands to start a development
-version of the Kong Gateway using PostgreSQL:
+   ```bash
+   # start_services
+   ```
 
-```bash
-gojira up -pp 8000:8000 -pp 8001:8001
-gojira run make dev
-gojira run kong migrations bootstrap
-gojira run kong start
-```
+9. If it is the first time to start Kong, you have to execute the following command to CP node.
 
-Verify the Admin API is now available by navigating to `http://localhost:8001` on your host machine browser.
+   ```bash
+   # kong migrations bootstrap -c kong-cp.conf
+   ```
 
-Tips: 
+10. Start CP and DP. `kong start -c kong-cp.conf` and `kong start -c kong-dp.conf`.
 
-- Attach to shell by running `gojira shell` within `kong` folder.
-- Learn about [usage patterns](https://github.com/Kong/gojira/blob/master/docs/manual.md#usage-patterns) of Gojira.
+11. To stop CP and DP, you can execute `kong stop -p servroot-cp` and
+`kong stop -p servroot-dp` in this example.
+Names `servroot-cp` and `servroot-dp` are set in configuration file in step 7.
+
+
 
 ## Dev on Linux (Host/VM)
 
@@ -321,9 +420,9 @@ If you have a Linux development environment (either virtual or bare metal), the 
 
 ### Virtual Machine (Optional)
 
-Final deployments are typically on a Linux machine or container,so even if all components are multiplatform,
-it's easier to use it for development too.  If you use macOS or Windows machines, setting up a virtual machine
-is easy enough now.  Most of us use the freely available VirtualBox without any trouble.
+Final deployments are typically on a Linux machine or container, so even if all components are multiplatform,
+it's easier to use it for development too. If you use macOS or Windows machines, setting up a virtual machine
+is easy enough now. Most of us use the freely available VirtualBox without any trouble.
 
 If you use Linux for your desktop, you can skip this section.
 
@@ -365,158 +464,117 @@ Just keep hitting Enter until the key is generated. You do not need a password f
 
 Now try `ssh dev` on your host, you should be able to get into the guest directly.
 
-### Dependencies (Build from source)
-
-This is the hard way to build a development environment, and also a good start for beginners to understand how everything fits together.
-
-#### Prerequisites
-
-These are the needed tools and libraries that aren't installed out of the box on Ubuntu and Fedora, respectively.  Just run one of these, either as root or `sudo`.
-
-Ubuntu/Debian:
-
-```shell
-sudo apt update \
-&& sudo apt install -y \
-    automake \
-    build-essential \
-    curl \
-    docker \
-    docker-compose \
-    git \
-    libpcre3 \
-    libyaml-dev \
-    m4 \
-    openssl \
-    perl \
-    procps \
-    unzip \
-    zlib1g-dev \
-    valgrind
-```
-
-Fedora:
-
-```shell
-dnf install \
-    automake \
-    docker \
-    docker-compose \
-    gcc \
-    gcc-c++ \
-    git \
-    libyaml-devel \
-    make \
-    patch \
-    pcre-devel \
-    unzip \
-    zlib-devel \
-    valgrind
-```
-
-#### OpenResty
-
-We have a build script from [Kong/kong-ngx-build](https://github.com/Kong/kong-build-tools/tree/master/openresty-build-tools) that makes it easy to pull and compile specific versions of the needed components of the OpenResty system.
-
-To run the script we need to find out what versions of them the current build of Kong requires, and use that as arguments. <span class="x x-first x-last">Their </span>exact versions can be found on the [`.requirements`](https://github.com/Kong/kong/blob/master/.requirements) file.
-
-You can manually fill in the versions, or follow the steps below.
-
-```shell
-# if you are not in the directory 
-# cd kong
-
-export RESTY_VERSION=$(grep -oP 'RESTY_VERSION=\K.*' .requirements)
-export RESTY_OPENSSL_VERSION=$(grep -oP 'RESTY_OPENSSL_VERSION=\K.*' .requirements)
-export RESTY_LUAROCKS_VERSION=$(grep -oP 'RESTY_LUAROCKS_VERSION=\K.*' .requirements)
-export RESTY_PCRE_VERSION=$(grep -oP 'RESTY_PCRE_VERSION=\K.*' .requirements)
-```
-
-These commands don't have to be performed as root, since all compilation is done within a subdirectory, and installs everything in the target specified by the `-p` argument (here the `build` directory).
-
-```shell
-# Somewhere you're able or prefer to build
-export BUILDROOT=$(realpath ~/kong-dep)
-mkdir ${BUILDROOT} -p
-
-# clone the repository
-cd ..
-git clone https://github.com/kong/kong-build-tools
-
-cd kong-build-tools/openresty-build-tools
-
-# You might want to add also --debug
-./kong-ngx-build -p ${BUILDROOT} \
-  --openresty ${RESTY_VERSION} \
-  --openssl ${RESTY_OPENSSL_VERSION} \
-  --luarocks ${RESTY_LUAROCKS_VERSION} \
-  --pcre ${RESTY_PCRE_VERSION}
-```
-
-After this task, we'd like to have the next steps use the built packages and for LuaRocks to install new packages inside this `build` directory.  For that, it's important to set the `$PATH` variable accordingly:
-
-```shell
-# Add those paths for later use
-export OPENSSL_DIR=${BUILDROOT}/openssl
-export CRYPTO_DIR=${BUILDROOT}/openssl
-export PATH=${BUILDROOT}/luarocks/bin:${BUILDROOT}/openresty/bin:${PATH}
-eval $(luarocks path)
-```
-
-The `$OPENSSL_DIR` variable is needed when compiling Kong, to make sure it uses the correct version of OpenSSL.
-
-You can add these lines to your `.profile` or `.bashrc` file.  Otherwise, you could find yourself wondering where is everything!.
-
-```shell
-# If you want to set it permanently
-echo export OPENSSL_DIR=${BUILDROOT}/openssl >> ~/.profile
-echo export PATH=${BUILDROOT}/luarocks/bin:${BUILDROOT}/openresty/bin:\${PATH} >> ~/.profile
-echo eval "\$(luarocks path)" >> ~/.profile
-```
-### Databases
-
-The easiest way to handle these as a single group is via docker-compose.  It's also recommended to set your user as a [docker manager](https://docs.docker.com/install/linux/linux-postinstall/#manage-docker-as-a-non-root-user) to simplify the next steps.
-
-Make sure the docker daemon is enabled and running: `sudo systemctl enable docker` and `sudo systemctl start docker`. Verify that `docker ps` shows no errors.
-
-On a Fedora VM, you might have to disable SELinux:
-
-```
-sudo vim /etc/selinux/config        # change the line to SELINUX=disabled
-sudo setenforce 0
-```
-
-Now pull the compose script from the repository and fire it up:
-
-```
-git clone https://github.com/thibaultcha/kong-tests-compose.git
-cd kong-tests-compose
-docker-compose up
-```
-
-Verify the three new containers are up and running with `docker ps` on a separate terminal.
-
-
-### Install Kong
-
-```
-git clone https://github.com/Kong/kong.git
-cd kong
-git checkout master
-make dev
-```
-
-Now run unit tests with `make test` and integration test with `make test-integration`.
-
-Hack on!
-
 ## Dev on VSCode Container / GitHub Codespaces
 
-The `devcontainer.json` file in Kong's project tells VS Code 
+The `devcontainer.json` file in Kong's project tells VS Code
 how to access (or create) a development container with a well-defined tool and runtime stack.
 
 - See [How to create a GitHub codespace](https://docs.github.com/en/codespaces/developing-in-codespaces/creating-a-codespace#creating-a-codespace).
 - See [How to create a VSCode development container](https://code.visualstudio.com/docs/remote/containers#_quick-start-try-a-development-container).
+
+## Debugging Kong Gateway with EmmyLua and IntelliJ IDEA/VSCode
+
+[EmmyLua](https://emmylua.github.io/) is a plugin for IntelliJ IDEA and VSCode that provides Lua language
+support.  It comes with debugger support that makes it possible to set breakpoints in Lua code
+and inspect variables.  Kong Gateway can be debugged using EmmyLua by following these steps:
+
+### Install the IDE
+
+#### IntelliJ IDEA
+
+Download and install IntelliJ IDEA from [here](https://www.jetbrains.com/idea/download/).  Note
+that IntelliJ is a commercial product and requires a paid license after the trial period.
+
+#### VSCode
+
+Download and install MS Visual Studio Code from [here](https://code.visualstudio.com/download).
+
+### Install EmmyLua
+
+#### IntelliJ IDEA
+
+Go to the `Settings`->`Plugins`->`Marketplace` and search for `EmmyLua`.
+Install the plugin.
+
+#### VSCode
+
+Go to the `Settings`->`Extensions` and search for `EmmyLua`.
+Install the plugin (publisher is `Tangzx`).
+
+### Download and install the EmmyLua debugging server
+
+The [EmmyLuaDebugger](https://github.com/EmmyLua/EmmyLuaDebugger) is a standalone C++ program
+that runs on the same machine as Kong Gateway and that mediates between the IDE's
+debugger and the Lua code running in Kong Gateway.  It can be downloaded from
+[GitHub](https://github.com/EmmyLua/EmmyLuaDebugger/releases).  The release
+ZIP file contains a single shared library named emmy_core.so (Linux) or emmy_core.dylib (macOS).
+Place this file in a directory that is convenient for you and remember the path.
+
+Depending on your Linux version, you may need to compile
+[EmmyLuaDebugger](https://github.com/EmmyLua/EmmyLuaDebugger) on your
+own system as the release binaries published on GitHub assume a pretty
+recent version of GLIBC to be present.
+
+### Start Kong Gateway with the EmmyLua debugger
+
+To enable the EmmyLua debugger, the `KONG_EMMY_DEBUGGER` environment variable must be set to
+the absolute path of the debugger shared library file when Kong Gateway is started.  It is
+also advisable to start Kong Gateway with only one worker process, as debugging multiple worker
+processes requires special care.  For example:
+
+```shell
+KONG_EMMY_DEBUGGER=/path/to/emmy_core.so KONG_NGINX_WORKER_PROCESSES=1 kong start
+```
+
+### Create debugger configuration
+
+#### IntelliJ IDEA
+
+Go to `Run`->`Edit Configurations` and click the `+` button to add a new
+configuration.  Select `Emmy Debugger(NEW)` as the configuration type.  Enter a descriptive
+name for the configuration, e.g. "Kong Gateway Debug".  Click `OK` to save the configuration.
+
+#### VSCode
+
+Go to `Run`->`Add Configuration` and choose `EmmyLua New Debugger`. Enter a descriptive name
+for the configuration, e.g. "Kong Gateway Debug". Save `launch.json`.
+
+### Start the EmmyLua debugger
+
+To connect the EmmyLua debugger to Kong Gateway, click the `Run`->`Debug` menu item in IntelliJ
+(`Run`->`Start Debugging` in VSCode) and select the configuration that you've just created.  You
+will notice that the restart and stop buttons on the top of your IDE will change to solid green
+and red colors.  You can now set breakpoints in your Lua code and start debugging.  Try setting
+a breakpoint in the global `access` function that is defined `runloop/handler.lua` and send
+a proxy request to the Gateway.  The debugger should stop at the breakpoint and you can
+inspect the variables in the request context.
+
+### Debugging `busted` tests
+
+To debug `busted` tests, you can set the `BUSTED_EMMY_DEBUGGER` environment variable to the path
+to the EmmyLua debugger shared library.  When debugging is enabled, `busted` will always wait for
+the IDE to connect during startup.
+
+### Debugging environment variables
+
+The following environment variables can be set to control the behavior of the EmmyLua debugger
+integration:
+
+- `KONG_EMMY_DEBUGGER`: The path to the EmmyLua debugger shared library.
+- `KONG_EMMY_DEBUGGER_HOST`: The IP address that the EmmyLua debugger will listen on.  The default
+  is `localhost`.
+- `KONG_EMMY_DEBUGGER_PORT`: The port that the EmmyLua debugger will listen on.  The default is
+  `9966`.
+- `KONG_EMMY_DEBUGGER_WAIT`: If set, Kong Gateway will wait for the debugger to connect
+  before starting continuing to start.
+- `KONG_EMMY_DEBUGGER_SOURCE_PATH`: The path to the source code that the EmmyLua debugger will
+  use to resolve source code locations.  The default is the current working directory.
+- `KONG_EMMY_DEBUGGER_MULTI_WORKER`: If set, a debugger will be started for each worker process, using
+  incrementing port numbers starting at `KONG_EMMY_DEBUGGER_PORT`.  The default is to start
+  only one debugger for worker zero.
+
+To control debugger behavior while running `busted` tests, a similar set of environment variables
+prefixed with `BUSTED_` instead of `KONG_` can be used.
 
 ## What's next
 

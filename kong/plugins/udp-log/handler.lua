@@ -9,9 +9,6 @@ local timer_at = ngx.timer.at
 local udp = ngx.socket.udp
 
 
-local sandbox_opts = { env = { kong = kong, ngx = ngx } }
-
-
 local function log(premature, conf, str)
   if premature then
     return
@@ -23,6 +20,7 @@ local function log(premature, conf, str)
   local ok, err = sock:setpeername(conf.host, conf.port)
   if not ok then
     kong.log.err("could not connect to ", conf.host, ":", conf.port, ": ", err)
+    sock:close()
     return
   end
 
@@ -51,7 +49,7 @@ function UdpLogHandler:log(conf)
   if conf.custom_fields_by_lua then
     local set_serialize_value = kong.log.set_serialize_value
     for key, expression in pairs(conf.custom_fields_by_lua) do
-      set_serialize_value(key, sandbox(expression, sandbox_opts)())
+      set_serialize_value(key, sandbox(expression)())
     end
   end
 

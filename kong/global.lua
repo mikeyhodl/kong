@@ -1,10 +1,12 @@
 -- TODO: get rid of 'kong.meta'; this module is king
 local meta = require "kong.meta"
 local PDK = require "kong.pdk"
+local process = require "ngx.process"
 local phase_checker = require "kong.pdk.private.phases"
 local kong_cache = require "kong.cache"
 local kong_cluster_events = require "kong.cluster_events"
 local private_node = require "kong.pdk.private.node"
+local constants = require "kong.constants"
 
 local ngx = ngx
 local type = type
@@ -67,7 +69,7 @@ end
 
 
 local _GLOBAL = {
-  phases = phase_checker.phases,
+  phases                 = phase_checker.phases,
 }
 
 
@@ -167,49 +169,50 @@ function _GLOBAL.init_pdk(self, kong_config)
 end
 
 
-function _GLOBAL.init_worker_events()
+function _GLOBAL.init_worker_events(kong_config)
   -- Note: worker_events will not work correctly if required at the top of the file.
   --       It must be required right here, inside the init function
   local worker_events
   local opts
 
-  local configuration = kong.configuration
+  local socket_path = kong_config.socket_path
+  local sock = ngx.config.subsystem == "stream" and
+               constants.SOCKETS.STREAM_WORKER_EVENTS or
+               constants.SOCKETS.WORKER_EVENTS
 
-  if configuration and configuration.legacy_worker_events then
+  local listening = "unix:" .. socket_path .. "/" .. sock
 
-    opts = {
-      shm = "kong_process_events", -- defined by "lua_shared_dict"
-      timeout = 5,            -- life time of event data in shm
-      interval = 1,           -- poll interval (seconds)
+  local max_payload_len = kong_config.worker_events_max_payload
 
-      wait_interval = 0.010,  -- wait before retry fetching event data
-      wait_max = 0.5,         -- max wait time before discarding event
-    }
-
-    worker_events = require "resty.worker.events"
-
-  else
-    -- `kong.configuration.prefix` is already normalized to an absolute path,
-    -- but `ngx.config.prefix()` is not
-    local prefix = configuration
-                   and configuration.prefix
-                   or require("pl.path").abspath(ngx.config.prefix())
-
-    local sock = ngx.config.subsystem == "stream"
-                 and "stream_worker_events.sock"
-                 or "worker_events.sock"
-
-    local listening = "unix:" .. prefix .. "/" .. sock
-
-    opts = {
-      unique_timeout = 5,     -- life time of unique event data in lrucache
-      broker_id = 0,          -- broker server runs in nginx worker #0
-      listening = listening,  -- unix socket for broker listening
-      max_queue_len = 1024 * 50,  -- max queue len for events buffering
-    }
-
-    worker_events = require "resty.events.compat"
+  if max_payload_len and max_payload_len > 65535 then   -- default is 64KB
+    ngx.log(ngx.WARN,
+            "Increasing 'worker_events_max_payload' value has potential " ..
+            "negative impact on Kong's response latency and memory usage")
   end
+
+  local enable_privileged_agent = false
+  if kong_config.dedicated_config_processing and
+     kong_config.role == "data_plane" and
+     not kong.sync  -- for rpc sync there is no privileged_agent
+  then
+    enable_privileged_agent = true
+  end
+
+  -- for debug and test
+  ngx.log(ngx.DEBUG,
+          "lua-resty-events enable_privileged_agent is ",
+          enable_privileged_agent)
+
+  opts = {
+    unique_timeout = 5,     -- life time of unique event data in lrucache
+    broker_id = 0,          -- broker server runs in nginx worker #0
+    listening = listening,  -- unix socket for broker listening
+    max_queue_len = 1024 * 50,  -- max queue len for events buffering
+    max_payload_len = max_payload_len,  -- max payload size in bytes
+    enable_privileged_agent = enable_privileged_agent,
+  }
+
+  worker_events = require "resty.events.compat"
 
   local ok, err = worker_events.configure(opts)
   if not ok then
@@ -230,6 +233,17 @@ function _GLOBAL.init_cluster_events(kong_config, db)
 end
 
 
+local function get_lru_size(kong_config)
+  if (process.type() == "privileged agent")
+  or (kong_config.role == "control_plane")
+  or (kong_config.role == "traditional" and #kong_config.proxy_listeners  == 0
+                                        and #kong_config.stream_listeners == 0)
+  then
+    return 1000
+  end
+end
+
+
 function _GLOBAL.init_cache(kong_config, cluster_events, worker_events)
   local db_cache_ttl = kong_config.db_cache_ttl
   local db_cache_neg_ttl = kong_config.db_cache_neg_ttl
@@ -241,17 +255,19 @@ function _GLOBAL.init_cache(kong_config, cluster_events, worker_events)
     db_cache_neg_ttl = 0
    end
 
-  return kong_cache.new {
-    shm_name        = "kong_db_cache",
-    cluster_events  = cluster_events,
-    worker_events   = worker_events,
-    ttl             = db_cache_ttl,
-    neg_ttl         = db_cache_neg_ttl or db_cache_ttl,
-    resurrect_ttl   = kong_config.resurrect_ttl,
-    page            = page,
-    cache_pages     = cache_pages,
-    resty_lock_opts = LOCK_OPTS,
-  }
+  return kong_cache.new({
+    shm_name             = "kong_db_cache",
+    cluster_events       = cluster_events,
+    worker_events        = worker_events,
+    ttl                  = db_cache_ttl,
+    neg_ttl              = db_cache_neg_ttl or db_cache_ttl,
+    resurrect_ttl        = kong_config.resurrect_ttl,
+    page                 = page,
+    cache_pages          = cache_pages,
+    resty_lock_opts      = LOCK_OPTS,
+    lru_size             = get_lru_size(kong_config),
+    invalidation_channel = "invalidations",
+  })
 end
 
 
@@ -266,7 +282,7 @@ function _GLOBAL.init_core_cache(kong_config, cluster_events, worker_events)
     db_cache_neg_ttl = 0
   end
 
-  return kong_cache.new {
+  return kong_cache.new({
     shm_name        = "kong_core_db_cache",
     cluster_events  = cluster_events,
     worker_events   = worker_events,
@@ -276,7 +292,13 @@ function _GLOBAL.init_core_cache(kong_config, cluster_events, worker_events)
     page            = page,
     cache_pages     = cache_pages,
     resty_lock_opts = LOCK_OPTS,
-  }
+    lru_size        = get_lru_size(kong_config),
+  })
+end
+
+
+function _GLOBAL.init_timing()
+  return require("kong.timing")
 end
 
 

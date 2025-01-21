@@ -1,10 +1,3 @@
--- This software is copyright Kong Inc. and its licensors.
--- Use of the software is subject to the agreement between your organization
--- and Kong Inc. If there is no such agreement, use is governed by and
--- subject to the terms of the Kong Master Software License Agreement found
--- at https://konghq.com/enterprisesoftwarelicense/.
--- [ END OF LICENSE 0867164ffc95e54f04670b5169c09574bdbd9bba ]
-
 local typedefs = require "kong.db.schema.typedefs"
 local Schema = require "kong.db.schema"
 local cjson = require "cjson.safe"
@@ -25,6 +18,7 @@ return {
     {
       set = {
         type      = "foreign",
+        description = "The id of the key-set with which to associate the key.",
         required  = false,
         reference = "key_sets",
         on_delete = "cascade",
@@ -33,6 +27,7 @@ return {
     {
       name = {
         type     = "string",
+        description = "The name to associate with the given keys.",
         required = false,
         unique   = true,
       },
@@ -40,6 +35,7 @@ return {
     {
       kid = {
         type     = "string",
+        description = "A unique identifier for a key.",
         required = true,
         unique   = false,
       },
@@ -48,6 +44,7 @@ return {
       jwk = {
         -- type string but validate against typedefs.jwk
         type = "string",
+        description = "A JSON Web Key represented as a string.",
         referenceable = true,
         encrypted = true
       }
@@ -104,7 +101,7 @@ return {
           -- running customer_validator
           local ok, val_err = typedefs.jwk.custom_validator(entity.jwk)
           if not ok or val_err then
-            return nil, "could not load JWK"
+            return nil, val_err or "could not load JWK"
           end
           -- FIXME: this does not execute the `custom_validator` part.
           --        how to do that without loading that manually as seen above

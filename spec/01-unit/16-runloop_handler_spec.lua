@@ -29,7 +29,7 @@ local function setup_it_block()
         warn = function() end,
       },
       response = {
-        exit = function() end,
+        error = function() end,
       },
       worker_events = {
         register = function() end,
@@ -80,6 +80,8 @@ local function setup_it_block()
       { "kong.concurrency", {} },
 
       { "kong.runloop.handler", {} },
+
+      { "kong.runloop.events", {} },
 
     }
 
@@ -179,12 +181,13 @@ describe("runloop handler", function()
       kong.configuration.role = "control_plane"
 
       local handler = require "kong.runloop.handler"
+      local events  = require "kong.runloop.events"
 
       local register_balancer_events_spy = spy.new(function() end)
 
       handler._set_router(mock_router)
 
-      handler._register_balancer_events(register_balancer_events_spy)
+      events._register_balancer_events(register_balancer_events_spy)
 
       handler.init_worker.before()
 
@@ -197,12 +200,13 @@ describe("runloop handler", function()
       kong.configuration.role = "data_plane"
 
       local handler = require "kong.runloop.handler"
+      local events  = require "kong.runloop.events"
 
       local register_balancer_events_spy = spy.new(function() end)
 
       handler._set_router(mock_router)
 
-      handler._register_balancer_events(register_balancer_events_spy)
+      events._register_balancer_events(register_balancer_events_spy)
 
       handler.init_worker.before()
 

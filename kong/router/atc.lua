@@ -2,15 +2,12 @@ local _M = {}
 local _MT = { __index = _M, }
 
 
-local schema = require("resty.router.schema")
-local router = require("resty.router.router")
-local context = require("resty.router.context")
 local lrucache = require("resty.lrucache")
-local server_name = require("ngx.ssl").server_name
 local tb_new = require("table.new")
-local tb_clear = require("table.clear")
 local utils = require("kong.router.utils")
-local yield = require("kong.tools.utils").yield
+local transform = require("kong.router.transform")
+local rat = require("kong.tools.request_aware_table")
+local yield = require("kong.tools.yield").yield
 
 
 local type = type
@@ -18,11 +15,8 @@ local assert = assert
 local setmetatable = setmetatable
 local pairs = pairs
 local ipairs = ipairs
-
-
+local next = next
 local max = math.max
-local tb_concat = table.concat
-local tb_sort = table.sort
 
 
 local ngx           = ngx
@@ -30,94 +24,112 @@ local header        = ngx.header
 local var           = ngx.var
 local ngx_log       = ngx.log
 local get_phase     = ngx.get_phase
-local get_method    = ngx.req.get_method
-local get_headers   = ngx.req.get_headers
-local ngx_WARN      = ngx.WARN
 local ngx_ERR       = ngx.ERR
 
 
-local sanitize_uri_postfix = utils.sanitize_uri_postfix
 local check_select_params  = utils.check_select_params
-local strip_uri_args       = utils.strip_uri_args
 local get_service_info     = utils.get_service_info
-local add_debug_headers    = utils.add_debug_headers
-local get_upstream_uri_v0  = utils.get_upstream_uri_v0
 local route_match_stat     = utils.route_match_stat
+local split_host_port      = transform.split_host_port
+local split_routes_and_services_by_path = transform.split_routes_and_services_by_path
 
 
-local MAX_REQ_HEADERS  = 100
 local DEFAULT_MATCH_LRUCACHE_SIZE = utils.DEFAULT_MATCH_LRUCACHE_SIZE
 
 
-local LOGICAL_OR  = " || "
-local LOGICAL_AND = " && "
+local is_http = ngx.config.subsystem == "http"
 
 
--- reuse table objects
-local gen_values_t = tb_new(10, 0)
+local get_header
+if is_http then
+  get_header = require("kong.tools.http").get_header
+end
 
 
-local CACHED_SCHEMA
+local get_atc_context
+local get_atc_router
+local get_atc_fields
 do
-  local str_fields = {"net.protocol", "tls.sni",
-                      "http.method", "http.host",
-                      "http.path", "http.raw_path",
-                      "http.headers.*",
+  local schema = require("resty.router.schema")
+  local context = require("resty.router.context")
+  local router = require("resty.router.router")
+  local fields = require("kong.router.fields")
+
+  local function generate_schema(fields)
+    local s = schema.new()
+
+    for t, f in pairs(fields) do
+      for _, v in ipairs(f) do
+        assert(s:add_field(v, t))
+      end
+    end
+
+    return s
+  end
+
+  -- used by validation
+  local HTTP_SCHEMA   = generate_schema(fields.HTTP_FIELDS)
+  local STREAM_SCHEMA = generate_schema(fields.STREAM_FIELDS)
+
+  -- used by running router
+  local CACHED_SCHEMA = is_http and HTTP_SCHEMA or STREAM_SCHEMA
+
+  get_atc_context = function()
+    return context.new(CACHED_SCHEMA)
+  end
+
+  get_atc_router = function(routes_n)
+    return router.new(CACHED_SCHEMA, routes_n)
+  end
+
+  get_atc_fields = function(inst)
+    return fields.new(inst:get_fields())
+  end
+
+  local protocol_to_schema = {
+    http  = HTTP_SCHEMA,
+    https = HTTP_SCHEMA,
+    grpc  = HTTP_SCHEMA,
+    grpcs = HTTP_SCHEMA,
+
+    tcp   = STREAM_SCHEMA,
+    udp   = STREAM_SCHEMA,
+    tls   = STREAM_SCHEMA,
+
+    tls_passthrough = STREAM_SCHEMA,
   }
 
-  local int_fields = {"net.port",
-  }
-
-  CACHED_SCHEMA = schema.new()
-
-  for _, v in ipairs(str_fields) do
-    assert(CACHED_SCHEMA:add_field(v, "String"))
+  -- for db schema validation
+  function _M.schema(protocols)
+    return assert(protocol_to_schema[protocols[1]])
   end
 
-  for _, v in ipairs(int_fields) do
-    assert(CACHED_SCHEMA:add_field(v, "Int"))
+  -- for unit testing
+  function _M._set_ngx(mock_ngx)
+    if type(mock_ngx) ~= "table" then
+      return
+    end
+
+    if mock_ngx.header then
+      header = mock_ngx.header
+    end
+
+    if mock_ngx.var then
+      var = mock_ngx.var
+    end
+
+    if mock_ngx.log then
+      ngx_log = mock_ngx.log
+    end
+
+    get_header = function(key)
+      local mock_headers = mock_ngx.headers or {}
+      local mock_var = mock_ngx.var or {}
+      return mock_headers[key] or mock_var["http_" .. key]
+    end
+
+    fields._set_ngx(mock_ngx)
   end
-end
-
-
-local is_empty_field
-do
-  local null    = ngx.null
-  local isempty = require("table.isempty")
-
-  is_empty_field = function(f)
-    return f == nil or f == null or isempty(f)
-  end
-end
-
-
-local function escape_str(str)
-  return "\"" .. str:gsub([[\]], [[\\]]):gsub([["]], [[\"]]) .. "\""
-end
-
-
-local function gen_for_field(name, op, vals, val_transform)
-  if is_empty_field(vals) then
-    return nil
-  end
-
-  tb_clear(gen_values_t)
-
-  local values_n = 0
-  local values   = gen_values_t
-
-  for _, p in ipairs(vals) do
-    values_n = values_n + 1
-    local op = (type(op) == "string") and op or op(p)
-    values[values_n] = name .. " " .. op .. " " ..
-                       escape_str(val_transform and val_transform(op, p) or p)
-  end
-
-  if values_n > 0 then
-    return "(" .. tb_concat(values, LOGICAL_OR) .. ")"
-  end
-
-  return nil
 end
 
 
@@ -144,27 +156,13 @@ local function add_atc_matcher(inst, route, route_id,
 end
 
 
-local function is_http_headers_field(field)
-  return field:sub(1, 13) == "http.headers."
-end
-
-
-local function has_header_matching_field(fields)
-  for _, field in ipairs(fields) do
-    if is_http_headers_field(field) then
-      return true
-    end
-  end
-
-  return false
-end
-
-
 local function new_from_scratch(routes, get_exp_and_priority)
   local phase = get_phase()
-  local inst = router.new(CACHED_SCHEMA)
 
-  local routes_n   = #routes
+  local routes_n = #routes
+
+  local inst = get_atc_router(routes_n)
+
   local routes_t   = tb_new(0, routes_n)
   local services_t = tb_new(0, routes_n)
 
@@ -196,16 +194,12 @@ local function new_from_scratch(routes, get_exp_and_priority)
     yield(true, phase)
   end
 
-  local fields = inst:get_fields()
-  local match_headers = has_header_matching_field(fields)
-
   return setmetatable({
-      schema = CACHED_SCHEMA,
+      context = get_atc_context(),
+      fields = get_atc_fields(inst),
       router = inst,
       routes = routes_t,
       services = services_t,
-      fields = fields,
-      match_headers = match_headers,
       updated_at = new_updated_at,
       rebuilding = false,
     }, _MT)
@@ -234,6 +228,7 @@ local function new_from_previous(routes, get_exp_and_priority, old_router)
     local route_id = route.id
 
     if not route_id then
+      old_router.rebuilding = false
       return nil, "could not categorize route"
     end
 
@@ -287,10 +282,7 @@ local function new_from_previous(routes, get_exp_and_priority, old_router)
     yield(true, phase)
   end
 
-  local fields = inst:get_fields()
-
-  old_router.fields = fields
-  old_router.match_headers = has_header_matching_field(fields)
+  old_router.fields = get_atc_fields(inst)
   old_router.updated_at = new_updated_at
   old_router.rebuilding = false
 
@@ -299,8 +291,13 @@ end
 
 
 function _M.new(routes, cache, cache_neg, old_router, get_exp_and_priority)
+  -- routes argument is a table with [route] and [service]
   if type(routes) ~= "table" then
     return error("expected arg #1 routes to be a table")
+  end
+
+  if is_http then
+    routes = split_routes_and_services_by_path(routes)
   end
 
   local router, err
@@ -323,97 +320,64 @@ function _M.new(routes, cache, cache_neg, old_router, get_exp_and_priority)
 end
 
 
--- split port in host, ignore form '[...]'
--- example.com:123 => example.com, 123
--- example.*:123 => example.*, 123
-local split_host_port
-do
-  local tonumber = tonumber
-  local DEFAULT_HOSTS_LRUCACHE_SIZE = DEFAULT_MATCH_LRUCACHE_SIZE
+local CACHE_PARAMS
 
-  local memo_hp = lrucache.new(DEFAULT_HOSTS_LRUCACHE_SIZE)
 
-  split_host_port = function(key)
-    if not key then
-      return nil, nil
-    end
+if is_http then
 
-    local m = memo_hp:get(key)
 
-    if m then
-      return m[1], m[2]
-    end
+local sanitize_uri_postfix = utils.sanitize_uri_postfix
+local strip_uri_args       = utils.strip_uri_args
+local add_debug_headers    = utils.add_debug_headers
+local get_upstream_uri_v0  = utils.get_upstream_uri_v0
 
-    local p = key:find(":", nil, true)
-    if not p then
-      memo_hp:set(key, { key, nil })
-      return key, nil
-    end
 
-    local port = tonumber(key:sub(p + 1))
+local function set_upstream_uri(req_uri, match_t)
+  local matched_route = match_t.route
 
-    if not port then
-      memo_hp:set(key, { key, nil })
-      return key, nil
-    end
+  local request_prefix = match_t.prefix or "/"
+  local request_postfix = sanitize_uri_postfix(req_uri:sub(#request_prefix + 1))
 
-    local host = key:sub(1, p - 1)
+  local upstream_base = match_t.upstream_url_t.path or "/"
 
-    memo_hp:set(key, { host, port })
-
-    return host, port
-  end
+  match_t.upstream_uri = get_upstream_uri_v0(matched_route, request_postfix,
+                                             req_uri, upstream_base)
 end
 
 
-function _M:select(req_method, req_uri, req_host, req_scheme,
-                   src_ip, src_port,
-                   dst_ip, dst_port,
-                   sni, req_headers)
+-- captures has the form { [0] = full_path, [1] = capture1, [2] = capture2, ..., ["named1"] = named1, ... }
+-- and captures[0] will be the full matched path
+-- this function tests if there are captures other than the full path
+-- by checking if there are 2 or more than 2 keys
+local function has_capture(captures)
+  if not captures then
+    return false
+  end
+  local next_i = next(captures)
+  return next_i and next(captures, next_i) ~= nil
+end
 
-  check_select_params(req_method, req_uri, req_host, req_scheme,
-                      src_ip, src_port,
-                      dst_ip, dst_port,
-                      sni, req_headers)
 
-  local c = context.new(self.schema)
+function _M:matching(params)
+  local req_uri = params.uri
+  local req_host = params.host
+
+  check_select_params(params.method, req_uri, req_host, params.scheme,
+                      params.src_ip, params.src_port,
+                      params.dst_ip, params.dst_port,
+                      params.sni, params.headers, params.queries)
 
   local host, port = split_host_port(req_host)
 
-  for _, field in ipairs(self.fields) do
-    if field == "http.method" then
-      assert(c:add_value("http.method", req_method))
+  params.host = host
+  params.port = port
 
-    elseif field == "http.path" then
-      assert(c:add_value("http.path", req_uri))
+  self.context:reset()
 
-    elseif field == "http.host" then
-      assert(c:add_value("http.host", host))
+  local c, err = self.fields:fill_atc_context(self.context, params)
 
-    elseif field == "net.port" then
-     assert(c:add_value("net.port", port))
-
-    elseif field == "net.protocol" then
-      assert(c:add_value("net.protocol", req_scheme))
-
-    elseif field == "tls.sni" then
-      assert(c:add_value("tls.sni", sni))
-
-    elseif req_headers and is_http_headers_field(field) then
-      local h = field:sub(14)
-      local v = req_headers[h]
-
-      if v then
-        if type(v) == "string" then
-          assert(c:add_value(field, v:lower()))
-
-        else
-          for _, v in ipairs(v) do
-            assert(c:add_value(field, v:lower()))
-          end
-        end
-      end
-    end
+  if not c then
+    return nil, err
   end
 
   local matched = self.router:execute(c)
@@ -424,103 +388,80 @@ function _M:select(req_method, req_uri, req_host, req_scheme,
   local uuid, matched_path, captures = c:get_result("http.path")
 
   local service = self.services[uuid]
-  local matched_route = self.routes[uuid]
+  local matched_route = self.routes[uuid].original_route or self.routes[uuid]
 
   local service_protocol, _,  --service_type
         service_host, service_port,
         service_hostname_type, service_path = get_service_info(service)
 
   local request_prefix = matched_route.strip_path and matched_path or nil
-  local request_postfix = request_prefix and req_uri:sub(#matched_path + 1) or req_uri:sub(2, -1)
-  request_postfix = sanitize_uri_postfix(request_postfix) or ""
-  local upstream_base = service_path or "/"
-
-  local upstream_uri = get_upstream_uri_v0(matched_route, request_postfix, req_uri,
-                                           upstream_base)
 
   return {
     route           = matched_route,
     service         = service,
     prefix          = request_prefix,
     matches = {
-      uri_captures = (captures and captures[1]) and captures or nil,
+      uri_captures = has_capture(captures) and captures or nil,
     },
     upstream_url_t = {
       type = service_hostname_type,
       host = service_host,
       port = service_port,
+      path = service_path,
     },
     upstream_scheme = service_protocol,
-    upstream_uri    = upstream_uri,
     upstream_host   = matched_route.preserve_host and req_host or nil,
   }
 end
 
 
-local get_headers_key
-do
-  local headers_t = tb_new(8, 0)
+-- only for unit-testing
+function _M:select(req_method, req_uri, req_host, req_scheme,
+                   src_ip, src_port,
+                   dst_ip, dst_port,
+                   sni, req_headers, req_queries)
 
-  get_headers_key = function(headers)
-    tb_clear(headers_t)
+  local params = {
+    method  = req_method,
+    uri     = req_uri,
+    host    = req_host,
+    scheme  = req_scheme,
+    sni     = sni,
+    headers = req_headers,
+    queries = req_queries,
 
-    local headers_count = 0
+    src_ip   = src_ip,
+    src_port = src_port,
+    dst_ip   = dst_ip,
+    dst_port = dst_port,
+  }
 
-    for name, value in pairs(headers) do
-      local name = name:gsub("-", "_"):lower()
-
-      if type(value) == "table" then
-        for i, v in ipairs(value) do
-          value[i] = v:lower()
-        end
-        tb_sort(value)
-        value = tb_concat(value, ", ")
-
-      else
-        value = value:lower()
-      end
-
-      headers_t[headers_count + 1] = "|"
-      headers_t[headers_count + 2] = name
-      headers_t[headers_count + 3] = "="
-      headers_t[headers_count + 4] = value
-
-      headers_count = headers_count + 4
-    end
-
-    return tb_concat(headers_t, nil, 1, headers_count)
-  end
+  return self:matching(params)
 end
 
 
 function _M:exec(ctx)
-  local req_method = get_method()
+  local fields = self.fields
+
   local req_uri = ctx and ctx.request_uri or var.request_uri
-  local req_host = var.http_host
-  local sni = server_name()
-
-  local headers, headers_key
-  if self.match_headers then
-    local err
-    headers, err = get_headers(MAX_REQ_HEADERS)
-    if err == "truncated" then
-      ngx_log(ngx_WARN, "retrieved ", MAX_REQ_HEADERS, " headers for evaluation ",
-                        "(max) but request had more; other headers will be ignored")
-    end
-
-    headers["host"] = nil
-
-    headers_key = get_headers_key(headers)
-  end
+  local req_host = get_header("host", ctx)
 
   req_uri = strip_uri_args(req_uri)
 
-  -- cache lookup
+  -- cache key calculation
 
-  local cache_key = (req_method or "") .. "|" ..
-                    (req_uri    or "") .. "|" ..
-                    (req_host   or "") .. "|" ..
-                    (sni        or "") .. (headers_key or "")
+  if not CACHE_PARAMS then
+    CACHE_PARAMS = rat.new()
+  end
+
+  CACHE_PARAMS:clear()
+
+  CACHE_PARAMS.uri  = req_uri
+  CACHE_PARAMS.host = req_host
+
+  local cache_key = fields:get_cache_key(CACHE_PARAMS)
+
+  -- cache lookup
 
   local match_t = self.cache:get(cache_key)
   if not match_t then
@@ -529,12 +470,16 @@ function _M:exec(ctx)
       return nil
     end
 
-    local req_scheme = ctx and ctx.scheme or var.scheme
+    CACHE_PARAMS.scheme = ctx and ctx.scheme or var.scheme
 
-    match_t = self:select(req_method, req_uri, req_host, req_scheme,
-                          nil, nil, nil, nil,
-                          sni, headers)
+    local err
+    match_t, err = self:matching(CACHE_PARAMS)
     if not match_t then
+      if err then
+        ngx_log(ngx_ERR, "router returned an error: ", err,
+                         ", 404 Not Found will be returned for the current request")
+      end
+
       self.cache_neg:set(cache_key, true)
       return nil
     end
@@ -543,55 +488,149 @@ function _M:exec(ctx)
 
   else
     route_match_stat(ctx, "pos")
+
+    -- preserve_host header logic, modify cache result
+    if match_t.route.preserve_host then
+      match_t.upstream_host = req_host
+    end
   end
 
   -- found a match
 
+  -- update upstream_uri in cache result
+  set_upstream_uri(req_uri, match_t)
+
   -- debug HTTP request header logic
-  add_debug_headers(var, header, match_t)
+  add_debug_headers(ctx, header, match_t)
 
   return match_t
 end
 
 
-function _M._set_ngx(mock_ngx)
-  if type(mock_ngx) ~= "table" then
-    return
+else  -- is stream subsystem
+
+
+function _M:matching(params)
+  local sni = params.sni
+
+  check_select_params(nil, nil, nil, params.scheme,
+                      params.src_ip, params.src_port,
+                      params.dst_ip, params.dst_port,
+                      sni)
+
+  self.context:reset()
+
+  local c, err = self.fields:fill_atc_context(self.context, params)
+  if not c then
+    return nil, err
   end
 
-  if mock_ngx.header then
-    header = mock_ngx.header
+  local matched = self.router:execute(c)
+  if not matched then
+    return nil
   end
 
-  if mock_ngx.var then
-    var = mock_ngx.var
-  end
+  local uuid = c:get_result()
 
-  if mock_ngx.log then
-    ngx_log = mock_ngx.log
-  end
+  local service = self.services[uuid]
+  local matched_route = self.routes[uuid]
 
-  if type(mock_ngx.req) == "table" then
-    if mock_ngx.req.get_method then
-      get_method = mock_ngx.req.get_method
-    end
+  local service_protocol, _,  --service_type
+        service_host, service_port,
+        service_hostname_type = get_service_info(service)
 
-    if mock_ngx.req.get_headers then
-      get_headers = mock_ngx.req.get_headers
-    end
-  end
+  return {
+    route          = matched_route,
+    service        = service,
+    upstream_url_t = {
+      type = service_hostname_type,
+      host = service_host,
+      port = service_port,
+    },
+    upstream_scheme = service_protocol,
+    upstream_host  = matched_route.preserve_host and sni or nil,
+  }
 end
 
 
-_M.schema          = CACHED_SCHEMA
+-- only for unit-testing
+function _M:select(_, _, _, scheme,
+                   src_ip, src_port,
+                   dst_ip, dst_port,
+                   sni)
 
-_M.LOGICAL_OR      = LOGICAL_OR
-_M.LOGICAL_AND     = LOGICAL_AND
+  local params = {
+    scheme    = scheme,
+    src_ip    = src_ip,
+    src_port  = src_port,
+    dst_ip    = dst_ip,
+    dst_port  = dst_port,
+    sni       = sni,
+  }
 
-_M.escape_str      = escape_str
-_M.is_empty_field  = is_empty_field
-_M.gen_for_field   = gen_for_field
-_M.split_host_port = split_host_port
+  return self:matching(params)
+end
+
+
+function _M:exec(ctx)
+  local fields = self.fields
+
+  -- cache key calculation
+
+  if not CACHE_PARAMS then
+    CACHE_PARAMS = rat.new()
+  end
+
+  CACHE_PARAMS:clear()
+
+  local cache_key = fields:get_cache_key(CACHE_PARAMS, ctx)
+
+  -- cache lookup
+
+  local match_t = self.cache:get(cache_key)
+  if not match_t then
+    if self.cache_neg:get(cache_key) then
+      route_match_stat(ctx, "neg")
+      return nil
+    end
+
+    local scheme
+    if var.protocol == "UDP" then
+      scheme = "udp"
+
+    else
+      scheme = CACHE_PARAMS.sni and "tls" or "tcp"
+    end
+
+    CACHE_PARAMS.scheme = scheme
+
+    local err
+    match_t, err = self:matching(CACHE_PARAMS)
+    if not match_t then
+      if err then
+        ngx_log(ngx_ERR, "router returned an error: ", err)
+      end
+
+      self.cache_neg:set(cache_key, true)
+      return nil
+    end
+
+    self.cache:set(cache_key, match_t)
+
+  else
+    route_match_stat(ctx, "pos")
+
+    -- preserve_host logic, modify cache result
+    if match_t.route.preserve_host then
+      match_t.upstream_host = fields:get_value("tls.sni", CACHE_PARAMS)
+    end
+  end
+
+  return match_t
+end
+
+
+end   -- if is_http
 
 
 return _M

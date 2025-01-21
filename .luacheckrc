@@ -25,9 +25,12 @@ ignore = {
 exclude_files = {
     "spec/fixtures/invalid-module.lua",
     "spec-old-api/fixtures/invalid-module.lua",
+    "bazel-bin",
+    "bazel-out",
+    "bazel-kong",
 }
 
-files["kong/tools/kong-lua-sandbox.lua"] = {
+files["kong/tools/sandbox/kong.lua"] = {
      read_globals = {
         "_ENV",
         "table.pack",

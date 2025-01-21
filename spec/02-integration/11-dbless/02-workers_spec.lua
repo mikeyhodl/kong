@@ -29,11 +29,11 @@ describe("Workers initialization #off", function()
   lazy_teardown(function()
     admin_client:close()
     proxy_client:close()
-    helpers.stop_kong(nil, true)
+    helpers.stop_kong()
   end)
 
   it("restarts worker correctly without issues on the init_worker phase when config includes 1000+ plugins", function()
-    local buffer = {"_format_version: '1.1'", "services:"}
+    local buffer = {"_format_version: '3.0'", "services:"}
     for i = 1, 1001 do
       buffer[#buffer + 1] = fmt(SERVICE_YML, i, i, i, i)
     end

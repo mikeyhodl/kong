@@ -6,10 +6,11 @@
 -- @module kong.request
 
 
-local cjson = require "cjson.safe".new()
+local cjson = require "kong.tools.cjson"
 local multipart = require "multipart"
 local phase_checker = require "kong.pdk.private.phases"
 local normalize = require("kong.tools.uri").normalize
+local yield = require("kong.tools.yield").yield
 
 
 local ngx = ngx
@@ -20,15 +21,29 @@ local find = string.find
 local lower = string.lower
 local type = type
 local error = error
+local pairs = pairs
 local tonumber = tonumber
+local setmetatable = setmetatable
+
+
 local check_phase = phase_checker.check
 local check_not_phase = phase_checker.check_not
 
 
+local read_body = req.read_body
+local start_time = req.start_time
+local get_method = req.get_method
+local get_headers = req.get_headers
+local get_uri_args = req.get_uri_args
+local http_version = req.http_version
+local get_post_args = req.get_post_args
+local get_body_data = req.get_body_data
+local get_body_file = req.get_body_file
+local decode_args = ngx.decode_args
+
+
 local PHASES = phase_checker.phases
 
-
-cjson.decode_array_with_array_mt(true)
 
 
 local function new(self)
@@ -37,13 +52,10 @@ local function new(self)
   local HOST_PORTS             = self.configuration.host_ports or {}
 
   local MIN_HEADERS            = 1
-  local MAX_HEADERS_DEFAULT    = 100
   local MAX_HEADERS            = 1000
   local MIN_QUERY_ARGS         = 1
-  local MAX_QUERY_ARGS_DEFAULT = 100
   local MAX_QUERY_ARGS         = 1000
   local MIN_POST_ARGS          = 1
-  local MAX_POST_ARGS_DEFAULT  = 100
   local MAX_POST_ARGS          = 1000
 
   local MIN_PORT               = 1
@@ -60,6 +72,16 @@ local function new(self)
   local X_FORWARDED_PORT       = "X-Forwarded-Port"
   local X_FORWARDED_PATH       = "X-Forwarded-Path"
   local X_FORWARDED_PREFIX     = "X-Forwarded-Prefix"
+
+  local is_trusted_ip do
+    local is_trusted = self.ip.is_trusted
+    local get_ip = self.client.get_ip
+    is_trusted_ip = function()
+      return is_trusted(get_ip())
+    end
+  end
+
+  local http_get_header = require("kong.tools.http").get_header
 
 
   ---
@@ -112,7 +134,7 @@ local function new(self)
   function _REQUEST.get_port()
     check_not_phase(PHASES.init_worker)
 
-    return tonumber(var.server_port)
+    return tonumber(var.server_port, 10)
   end
 
 
@@ -139,7 +161,7 @@ local function new(self)
   function _REQUEST.get_forwarded_scheme()
     check_phase(PHASES.request)
 
-    if self.ip.is_trusted(self.client.get_ip()) then
+    if is_trusted_ip() then
       local scheme = _REQUEST.get_header(X_FORWARDED_PROTO)
       if scheme then
         return lower(scheme)
@@ -174,7 +196,7 @@ local function new(self)
   function _REQUEST.get_forwarded_host()
     check_phase(PHASES.request)
 
-    if self.ip.is_trusted(self.client.get_ip()) then
+    if is_trusted_ip() then
       local host = _REQUEST.get_header(X_FORWARDED_HOST)
       if host then
         local s = find(host, "@", 1, true)
@@ -221,8 +243,8 @@ local function new(self)
   function _REQUEST.get_forwarded_port()
     check_phase(PHASES.request)
 
-    if self.ip.is_trusted(self.client.get_ip()) then
-      local port = tonumber(_REQUEST.get_header(X_FORWARDED_PORT))
+    if is_trusted_ip() then
+      local port = tonumber(_REQUEST.get_header(X_FORWARDED_PORT), 10)
       if port and port >= MIN_PORT and port <= MAX_PORT then
         return port
       end
@@ -236,8 +258,7 @@ local function new(self)
 
         s = find(host, ":", 1, true)
         if s then
-          port = tonumber(sub(host, s + 1))
-
+          port = tonumber(sub(host, s + 1), 10)
           if port and port >= MIN_PORT and port <= MAX_PORT then
             return port
           end
@@ -277,7 +298,7 @@ local function new(self)
   function _REQUEST.get_forwarded_path()
     check_phase(PHASES.request)
 
-    if self.ip.is_trusted(self.client.get_ip()) then
+    if is_trusted_ip() then
       local path = _REQUEST.get_header(X_FORWARDED_PATH)
       if path then
         return path
@@ -320,7 +341,7 @@ local function new(self)
     check_phase(PHASES.request)
 
     local prefix
-    if self.ip.is_trusted(self.client.get_ip()) then
+    if is_trusted_ip() then
       prefix = _REQUEST.get_header(X_FORWARDED_PREFIX)
       if prefix then
         return prefix
@@ -344,7 +365,7 @@ local function new(self)
   function _REQUEST.get_http_version()
     check_phase(PHASES.request)
 
-    return req.http_version()
+    return http_version()
   end
 
 
@@ -368,7 +389,7 @@ local function new(self)
       end
     end
 
-    return req.get_method()
+    return get_method()
   end
 
 
@@ -506,9 +527,10 @@ local function new(self)
   -- arguments, and `?foo=&bar=` translates to two string arguments containing
   -- empty strings.
   --
-  -- By default, this function returns up to **100** arguments. The optional
-  -- `max_args` argument can be specified to customize this limit, but must be
-  -- greater than **1** and not greater than **1000**.
+  -- By default, this function returns up to **100** arguments (or what has been
+  -- configured using `lua_max_uri_args`). The optional `max_args` argument can be
+  -- specified to customize this limit, but must be greater than **1** and not
+  -- greater than **1000**.
   --
   -- @function kong.request.get_query
   -- @phases rewrite, access, header_filter, response, body_filter, log, admin_api
@@ -530,10 +552,7 @@ local function new(self)
   function _REQUEST.get_query(max_args)
     check_phase(PHASES.request)
 
-    if max_args == nil then
-      max_args = MAX_QUERY_ARGS_DEFAULT
-
-    else
+    if max_args ~= nil then
       if type(max_args) ~= "number" then
         error("max_args must be a number", 2)
       end
@@ -547,7 +566,8 @@ local function new(self)
       end
     end
 
-    if ngx.ctx.KONG_UNEXPECTED and _REQUEST.get_http_version() < 2 then
+    local ctx = ngx.ctx
+    if ctx.KONG_UNEXPECTED and _REQUEST.get_http_version() < 2 then
       local req_line = var.request
       local qidx = find(req_line, "?", 1, true)
       if not qidx then
@@ -560,10 +580,15 @@ local function new(self)
         return {}
       end
 
-      return ngx.decode_args(sub(req_line, qidx + 1, eidx - 1), max_args)
+      return decode_args(sub(req_line, qidx + 1, eidx - 1), max_args)
     end
 
-    return req.get_uri_args(max_args)
+    local uri_args, err = get_uri_args(max_args, ctx.uri_args)
+    if uri_args then
+      ctx.uri_args = uri_args
+    end
+
+    return uri_args, err
   end
 
 
@@ -601,10 +626,7 @@ local function new(self)
       error("header name must be a string", 2)
     end
 
-    -- Do not localize ngx.re.gsub! It will crash because ngx.re is monkey patched.
-    local header_value = var["http_" .. ngx.re.gsub(name, "-", "_", "jo")]
-
-    return header_value
+    return http_get_header(name)
   end
 
 
@@ -616,9 +638,10 @@ local function new(self)
   -- written as underscores (`_`); that is, the header `X-Custom-Header` can
   -- also be retrieved as `x_custom_header`.
   --
-  -- By default, this function returns up to **100** headers. The optional
-  -- `max_headers` argument can be specified to customize this limit, but must
-  -- be greater than **1** and not greater than **1000**.
+  -- By default, this function returns up to **100** headers (or what has been
+  -- configured using `lua_max_req_headers`). The optional `max_headers` argument
+  -- can be specified to customize this limit, but must be greater than **1** and
+  -- not greater than **1000**.
   --
   -- @function kong.request.get_headers
   -- @phases rewrite, access, header_filter, response, body_filter, log, admin_api
@@ -642,20 +665,18 @@ local function new(self)
     check_phase(PHASES.request)
 
     if max_headers == nil then
-      return req.get_headers(MAX_HEADERS_DEFAULT)
+      return get_headers()
     end
 
     if type(max_headers) ~= "number" then
       error("max_headers must be a number", 2)
-
     elseif max_headers < MIN_HEADERS then
       error("max_headers must be >= " .. MIN_HEADERS, 2)
-
     elseif max_headers > MAX_HEADERS then
       error("max_headers must be <= " .. MAX_HEADERS, 2)
     end
 
-    return req.get_headers(max_headers)
+    return get_headers(max_headers)
   end
 
 
@@ -673,28 +694,71 @@ local function new(self)
   --
   -- If the size of the body is greater than the Nginx buffer size (set by
   -- `client_body_buffer_size`), this function fails and returns an error
-  -- message explaining this limitation.
+  -- message explaining this limitation, unless `max_allowed_file_size`
+  -- is set and equal to 0 or larger than the body size buffered to disk.
+  -- Use of `max_allowed_file_size` requires Kong to read data from filesystem
+  -- and has performance implications.
   --
   -- @function kong.request.get_raw_body
   -- @phases rewrite, access, response, admin_api
-  -- @treturn string The plain request body.
+  -- @max_allowed_file_size[opt] number the max allowed file size to be read from,
+  -- 0 means unlimited, but the size of this body will still be limited
+  -- by Nginx's client_max_body_size.
+  -- @treturn string|nil The plain request body or nil if it does not fit into
+  -- the NGINX temporary buffer.
+  -- @treturn nil|string An error message.
   -- @usage
   -- -- Given a body with payload "Hello, Earth!":
   --
   -- kong.request.get_raw_body():gsub("Earth", "Mars") -- "Hello, Mars!"
-  function _REQUEST.get_raw_body()
+  function _REQUEST.get_raw_body(max_allowed_file_size)
     check_phase(before_content)
 
-    req.read_body()
+    read_body()
 
-    local body = req.get_body_data()
+    local body = get_body_data()
     if not body then
-      if req.get_body_file() then
-        return nil, "request body did not fit into client body buffer, consider raising 'client_body_buffer_size'"
-
-      else
+      local body_file = get_body_file()
+      if not body_file then
         return ""
       end
+
+      if not max_allowed_file_size or max_allowed_file_size < 0 then
+        return nil, "request body did not fit into client body buffer, consider raising 'client_body_buffer_size'"
+      end
+
+      local file, err = io.open(body_file, "r")
+      if not file then
+        return nil, "failed to open cached request body '" .. body_file .. "': " .. err
+      end
+
+      local size = file:seek("end") or 0
+      if max_allowed_file_size > 0 and size > max_allowed_file_size then
+        return nil, ("request body file too big: %d > %d"):format(size, max_allowed_file_size)
+      end
+
+      -- go to beginning
+      file:seek("set")
+      local chunk = {}
+      local chunk_idx = 1
+
+      while true do
+        local data, err = file:read(1048576) -- read in chunks of 1mb
+        if not data then
+          if err then
+            return nil, "failed to read cached request body '" .. body_file .. "': " .. err
+          end
+          break
+        end
+        chunk[chunk_idx] = data
+        chunk_idx = chunk_idx + 1
+
+        yield() -- yield to prevent starvation while doing blocking IO-reads
+      end
+
+      file:close()
+
+      return table.concat(chunk, "")
     end
 
     return body
@@ -734,7 +798,8 @@ local function new(self)
   --   body could not be parsed.
   --
   -- The optional argument `max_args` can be used to set a limit on the number
-  -- of form arguments parsed for `application/x-www-form-urlencoded` payloads.
+  -- of form arguments parsed for `application/x-www-form-urlencoded` payloads,
+  -- which is by default **100** (or what has been configured using `lua_max_post_args`).
   --
   -- The third return value is string containing the mimetype used to parsed
   -- the body (as per the `mimetype` argument), allowing the caller to identify
@@ -744,6 +809,7 @@ local function new(self)
   -- @phases rewrite, access, response, admin_api
   -- @tparam[opt] string mimetype The MIME type.
   -- @tparam[opt] number max_args Sets a limit on the maximum number of parsed
+  -- @tparam[opt] number max_allowed_file_size the max allowed file size to be read from
   -- arguments.
   -- @treturn table|nil A table representation of the body.
   -- @treturn string|nil An error message.
@@ -752,7 +818,7 @@ local function new(self)
   -- local body, err, mimetype = kong.request.get_body()
   -- body.name -- "John Doe"
   -- body.age  -- "42"
-  function _REQUEST.get_body(mimetype, max_args)
+  function _REQUEST.get_body(mimetype, max_args, max_allowed_file_size)
     check_phase(before_content)
 
     local content_type = mimetype or _REQUEST.get_header(CONTENT_TYPE)
@@ -783,8 +849,18 @@ local function new(self)
 
       -- TODO: should we also compare content_length to client_body_buffer_size here?
 
-      req.read_body()
-      local pargs, err = req.get_post_args(max_args or MAX_POST_ARGS_DEFAULT)
+      read_body()
+
+      local pargs, err
+
+      -- For some APIs, especially those using Lua C API (perhaps FFI too),
+      -- there is a difference in passing nil and not passing anything.
+      if max_args ~= nil then
+        pargs, err = get_post_args(max_args)
+      else
+        pargs, err = get_post_args()
+      end
+
       if not pargs then
         return nil, err, CONTENT_TYPE_POST
       end
@@ -792,12 +868,12 @@ local function new(self)
       return pargs, nil, CONTENT_TYPE_POST
 
     elseif find(content_type_lower, CONTENT_TYPE_JSON, 1, true) == 1 then
-      local body, err = _REQUEST.get_raw_body()
+      local body, err = _REQUEST.get_raw_body(max_allowed_file_size)
       if not body then
         return nil, err, CONTENT_TYPE_JSON
       end
 
-      local json = cjson.decode(body)
+      local json = cjson.decode_with_array_mt(body)
       if type(json) ~= "table" then
         return nil, "invalid json body", CONTENT_TYPE_JSON
       end
@@ -805,7 +881,7 @@ local function new(self)
       return json, nil, CONTENT_TYPE_JSON
 
     elseif find(content_type_lower, CONTENT_TYPE_FORM_DATA, 1, true) == 1 then
-      local body, err = _REQUEST.get_raw_body()
+      local body, err = _REQUEST.get_raw_body(max_allowed_file_size)
       if not body then
         return nil, err, CONTENT_TYPE_FORM_DATA
       end
@@ -838,7 +914,7 @@ local function new(self)
   function _REQUEST.get_start_time()
     check_phase(PHASES.request)
 
-    return ngx.ctx.KONG_PROCESSING_START or (req.start_time() * 1000)
+    return ngx.ctx.KONG_PROCESSING_START or (start_time() * 1000)
   end
 
   local EMPTY = {}
@@ -850,17 +926,17 @@ local function new(self)
       local typ = type(k)
       if typ == "number" then
         unnamed_captures[k] = v
-  
+
       elseif typ == "string" then
         named_captures[k] = v
-  
+
       else
         kong.log.err("unknown capture key type: ", typ)
       end
     end
-  
+
     return {
-      unnamed = unnamed_captures,
+      unnamed = setmetatable(unnamed_captures, cjson.array_mt),
       named = named_captures,
     }
   end
