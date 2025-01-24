@@ -5,8 +5,10 @@ local meta = require "kong.meta"
 local pl_path = require "pl.path"
 local version = require "version"
 local pl_utils = require "pl.utils"
-local pl_stringx = require "pl.stringx"
 local process_secrets = require "kong.cmd.utils.process_secrets"
+
+
+local strip = require("kong.tools.string").strip
 
 
 local fmt = string.format
@@ -26,9 +28,9 @@ ffi.cdef([[
 
 local nginx_bin_name = "nginx"
 local nginx_search_paths = {
+  "",
   "/usr/local/openresty/nginx/sbin",
   "/opt/openresty/nginx/sbin",
-  ""
 }
 
 
@@ -82,13 +84,25 @@ local function set_process_secrets_env(kong_conf)
     return nil, err
   end
 
-  return C.setenv("KONG_PROCESS_SECRETS", secrets, 1) == 0
+  local ok_sub_http
+  if kong_conf.role == "control_plane" or #kong_conf.proxy_listeners > 0
+    or #kong_conf.admin_listeners > 0 or #kong_conf.status_listeners > 0 then
+      ok_sub_http = C.setenv("KONG_PROCESS_SECRETS_HTTP", secrets, 1) == 0
+  end
+
+  local ok_sub_stream
+  if #kong_conf.stream_listeners > 0 then
+    ok_sub_stream = C.setenv("KONG_PROCESS_SECRETS_STREAM", secrets, 1) == 0
+  end
+
+  return ok_sub_http or ok_sub_stream
 end
 
 
 local function unset_process_secrets_env(has_process_secrets)
   if has_process_secrets then
-    C.unsetenv("KONG_PROCESS_SECRETS")
+    C.unsetenv("KONG_PROCESS_SECRETS_HTTP")
+    C.unsetenv("KONG_PROCESS_SECRETS_STREAM")
   end
 end
 
@@ -115,7 +129,7 @@ function _M.find_nginx_bin(kong_conf)
         log.debug("finding executable absolute path from $PATH...")
         local ok, code, stdout, stderr = pl_utils.executeex("command -v nginx")
         if ok and code == 0 then
-          path_to_check = pl_stringx.strip(stdout)
+          path_to_check = strip(stdout)
 
         else
           log.error("could not find executable absolute path: %s", stderr)

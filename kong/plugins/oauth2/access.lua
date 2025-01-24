@@ -1,25 +1,26 @@
 local url = require "socket.url"
-local utils = require "kong.tools.utils"
 local constants = require "kong.constants"
-local sha256 = require "resty.sha256"
 local timestamp = require "kong.tools.timestamp"
 local secret = require "kong.plugins.oauth2.secret"
 
 
+local sha256_base64url = require "kong.tools.sha256".sha256_base64url
+
+local fmt = string.format
 local kong = kong
 local type = type
 local next = next
 local table = table
 local error = error
-local split = utils.split
-local strip = utils.strip
+local split = require("kong.tools.string").split
+local strip = require("kong.tools.string").strip
 local string_find = string.find
 local string_gsub = string.gsub
 local string_byte = string.byte
-local check_https = utils.check_https
-local encode_args = utils.encode_args
-local random_string = utils.random_string
-local table_contains = utils.table_contains
+local check_https = require("kong.tools.http").check_https
+local encode_args = require("kong.tools.http").encode_args
+local random_string = require("kong.tools.rand").random_string
+local table_contains = require("kong.tools.table").table_contains
 
 
 local ngx_decode_args = ngx.decode_args
@@ -31,7 +32,7 @@ local ngx_encode_base64 = ngx.encode_base64
 local _M = {}
 
 
-local EMPTY = {}
+local EMPTY = require("kong.tools.table").EMPTY
 local SLASH = string_byte("/")
 local RESPONSE_TYPE = "response_type"
 local STATE = "state"
@@ -107,9 +108,7 @@ local function generate_token(conf, service, credential, authenticated_userid,
   local refresh_token
   local token, err
   if existing_token and conf.reuse_refresh_token then
-    token, err = kong.db.oauth2_tokens:update({
-      id = existing_token.id
-    }, {
+    token, err = kong.db.oauth2_tokens:update(existing_token, {
       access_token = random_string(),
       expires_in = token_expiration,
       created_at = timestamp.get_utc() / 1000
@@ -365,7 +364,8 @@ local function authorize(conf)
             authenticated_userid = parameters[AUTHENTICATED_USERID],
             scope = scopes,
             challenge = challenge,
-            challenge_method = challenge_method
+            challenge_method = challenge_method,
+            plugin = { id  = kong.plugin.get_id() },
           }, {
             ttl = 300
           })
@@ -437,7 +437,8 @@ local function retrieve_client_credentials(parameters, conf)
     from_authorization_header = true
 
     local iterator, iter_err = ngx_re_gmatch(authorization_header,
-                                             "\\s*[Bb]asic\\s*(.+)")
+                                             "\\s*[Bb]asic\\s*(.+)",
+                                             "jo")
     if not iterator then
       kong.log.err(iter_err)
       return
@@ -486,11 +487,7 @@ local function validate_pkce_verifier(parameters, auth_code)
     }
   end
 
-  local s256 = sha256:new()
-  s256:update(verifier)
-  local digest = s256:final()
-
-  local challenge = base64url_encode(digest)
+  local challenge = sha256_base64url(verifier)
 
   if not challenge
   or not auth_code.challenge
@@ -643,6 +640,17 @@ local function issue_token(conf)
           end
         end
 
+        if not response_params[ERROR] and conf.global_credentials then
+          -- verify only if plugin is present to avoid existing codes being fails
+          if auth_code.plugin and
+             (kong.plugin.get_id() ~= auth_code.plugin.id) then
+            response_params = {
+              [ERROR] = "invalid_request",
+              error_description = "Invalid " .. CODE
+            }
+          end
+        end
+
         if not response_params[ERROR] then
           if not auth_code or (service_id and service_id ~= auth_code.service.id)
           then
@@ -664,7 +672,7 @@ local function issue_token(conf)
               auth_code.scope, state)
 
             -- Delete authorization code so it cannot be reused
-            kong.db.oauth2_authorization_codes:delete({ id = auth_code.id })
+            kong.db.oauth2_authorization_codes:delete(auth_code)
           end
         end
 
@@ -745,22 +753,35 @@ local function issue_token(conf)
             error_description = "Invalid " .. REFRESH_TOKEN
           }
 
-        else
-          -- Check that the token belongs to the client application
-          if token.credential.id ~= client.id then
+        -- Check that the token belongs to the client application
+        elseif token.credential.id ~= client.id then
             response_params = {
               [ERROR] = "invalid_client",
               error_description = "Invalid client authentication"
             }
 
-          else
+        else
+          -- Check scopes
+          if token.scope then
+            for scope in token.scope:gmatch("%S+") do
+              if not table_contains(conf.scopes, scope) then
+                response_params = {
+                  [ERROR] = "invalid_scope",
+                  error_description = "Scope mismatch",
+                }
+                break
+              end
+            end
+          end
+
+          if not response_params[ERROR] then
             response_params = generate_token(conf, kong.router.get_service(),
                                              client,
                                              token.authenticated_userid,
                                              token.scope, state, false, token)
             -- Delete old token if refresh token not persisted
             if not conf.reuse_refresh_token then
-              kong.db.oauth2_tokens:delete({ id = token.id })
+              kong.db.oauth2_tokens:delete(token)
             end
           end
         end
@@ -785,47 +806,37 @@ local function issue_token(conf)
 end
 
 
-local function load_token(conf, service, access_token)
-  local credentials, err =
-    kong.db.oauth2_tokens:select_by_access_token(access_token)
+local function load_token(access_token)
+  return kong.db.oauth2_tokens:select_by_access_token(access_token)
+end
 
+
+local function retrieve_token(conf, access_token, realm)
+  local token_cache_key = kong.db.oauth2_tokens:cache_key(access_token)
+  local token, err = kong.cache:get(token_cache_key, nil, load_token, access_token)
   if err then
-    return nil, err
+    return error(err)
   end
-
-  if not credentials then
+  if not token then
     return
   end
 
   if not conf.global_credentials then
-    if not credentials.service then
+    if not token.service then
       return kong.response.exit(401, {
         [ERROR] = "invalid_token",
         error_description = "The access token is global, but the current " ..
-                            "plugin is configured without 'global_credentials'",
+          "plugin is configured without 'global_credentials'",
+      },
+      {
+        ["WWW-Authenticate"] = 'Bearer' .. realm .. ' error=' ..
+                                '"invalid_token" error_description=' ..
+                                '"The access token is invalid or has expired"'
       })
     end
 
-    if credentials.service.id ~= service.id then
-      credentials = nil
-    end
-  end
-
-  return credentials
-end
-
-
-local function retrieve_token(conf, access_token)
-  local token, err
-
-  if access_token then
-    local token_cache_key = kong.db.oauth2_tokens:cache_key(access_token)
-    token, err = kong.cache:get(token_cache_key, nil,
-                                load_token, conf,
-                                kong.router.get_service(),
-                                access_token)
-    if err then
-      return error(err)
+    if token.service.id ~= kong.router.get_service().id then
+      return nil
     end
   end
 
@@ -884,7 +895,7 @@ end
 
 
 local function load_oauth2_credential_into_memory(credential_id)
-  local result, err = kong.db.oauth2_credentials:select { id = credential_id }
+  local result, err = kong.db.oauth2_credentials:select({ id = credential_id })
   if err then
     return nil, err
   end
@@ -945,6 +956,7 @@ end
 
 local function do_authentication(conf)
   local access_token = parse_access_token(conf);
+  local realm = conf.realm and fmt(' realm="%s"', conf.realm) or ''
   if not access_token or access_token == "" then
     return nil, {
       status = 401,
@@ -953,12 +965,12 @@ local function do_authentication(conf)
         error_description = "The access token is missing"
       },
       headers = {
-        ["WWW-Authenticate"] = 'Bearer realm="service"'
+        ["WWW-Authenticate"] = 'Bearer' .. realm
       }
     }
   end
 
-  local token = retrieve_token(conf, access_token)
+  local token = retrieve_token(conf, access_token, realm)
   if not token then
     return nil, {
       status = 401,
@@ -967,7 +979,7 @@ local function do_authentication(conf)
         error_description = "The access token is invalid or has expired"
       },
       headers = {
-        ["WWW-Authenticate"] = 'Bearer realm="service" error=' ..
+        ["WWW-Authenticate"] = 'Bearer' .. realm .. ' error=' ..
                                '"invalid_token" error_description=' ..
                                '"The access token is invalid or has expired"'
       }
@@ -985,7 +997,7 @@ local function do_authentication(conf)
         error_description = "The access token is invalid or has expired"
       },
       headers = {
-        ["WWW-Authenticate"] = 'Bearer realm="service" error=' ..
+        ["WWW-Authenticate"] = 'Bearer' .. realm .. ' error=' ..
                                '"invalid_token" error_description=' ..
                                '"The access token is invalid or has expired"'
       }
@@ -1003,7 +1015,7 @@ local function do_authentication(conf)
           error_description = "The access token is invalid or has expired"
         },
         headers = {
-          ["WWW-Authenticate"] = 'Bearer realm="service" error=' ..
+          ["WWW-Authenticate"] = 'Bearer' .. realm .. ' error=' ..
                                  '"invalid_token" error_description=' ..
                                  '"The access token is invalid or has expired"'
         }
@@ -1037,7 +1049,7 @@ local function do_authentication(conf)
   return true
 end
 
-local function invalid_oauth2_method(endpoint_name)
+local function invalid_oauth2_method(endpoint_name, realm)
   return {
      status = 405,
      message = {
@@ -1047,7 +1059,7 @@ local function invalid_oauth2_method(endpoint_name)
        " is invalid for the " .. endpoint_name .. " endpoint"
      },
      headers = {
-       ["WWW-Authenticate"] = 'Bearer realm="service" error=' ..
+       ["WWW-Authenticate"] = 'Bearer' .. realm .. ' error=' ..
                               '"invalid_method" error_description=' ..
                               '"The HTTP method ' .. kong.request.get_method()
                               .. ' is invalid for the ' ..
@@ -1056,13 +1068,60 @@ local function invalid_oauth2_method(endpoint_name)
    }
 end
 
+local function set_anonymous_consumer(anonymous)
+  local consumer_cache_key = kong.db.consumers:cache_key(anonymous)
+  local consumer, err = kong.cache:get(consumer_cache_key, nil,
+                                        kong.client.load_consumer,
+                                        anonymous, true)
+  if err then
+    return error(err)
+  end
+
+  if not consumer then
+    local err_msg = "anonymous consumer " .. anonymous .. " is configured but doesn't exist"
+    kong.log.err(err_msg)
+    return kong.response.error(500, err_msg)
+  end
+
+  set_consumer(consumer)
+end
+
+--- When conf.anonymous is enabled we are in "logical OR" authentication flow.
+--- Meaning - either anonymous consumer is enabled or there are multiple auth plugins
+--- and we need to passthrough on failed authentication.
+local function logical_OR_authentication(conf)
+  if kong.client.get_credential() then
+    -- we're already authenticated and in "logical OR" between auth methods -- early exit
+    local clear_header = kong.service.request.clear_header
+    clear_header("X-Authenticated-Scope")
+    clear_header("X-Authenticated-UserId")
+    return
+  end
+
+  local ok, _ = do_authentication(conf)
+  if not ok then
+    set_anonymous_consumer(conf.anonymous)
+  end
+end
+
+--- When conf.anonymous is not set we are in "logical AND" authentication flow.
+--- Meaning - if this authentication fails the request should not be authorized
+--- even though other auth plugins might have successfully authorized user.
+local function logical_AND_authentication(conf)
+  local ok, err = do_authentication(conf)
+  if not ok then
+    return kong.response.exit(err.status, err.message, err.headers)
+  end
+end
+
 function _M.execute(conf)
   local path = kong.request.get_path()
   local has_end_slash = string_byte(path, -1) == SLASH
 
+  local realm = conf.realm and fmt(' realm="%s"', conf.realm) or ''
   if string_find(path, "/oauth2/token", has_end_slash and -14 or -13, true) then
     if kong.request.get_method() ~= "POST" then
-      local err = invalid_oauth2_method("token")
+      local err = invalid_oauth2_method("token", realm)
       return kong.response.exit(err.status, err.message, err.headers)
     end
 
@@ -1071,40 +1130,17 @@ function _M.execute(conf)
 
   if string_find(path, "/oauth2/authorize", has_end_slash and -18 or -17, true) then
     if kong.request.get_method() ~= "POST" then
-      local err = invalid_oauth2_method("authorization")
+      local err = invalid_oauth2_method("authorization", realm)
       return kong.response.exit(err.status, err.message, err.headers)
     end
 
     return authorize(conf)
   end
 
-  if conf.anonymous and kong.client.get_credential() then
-    -- we're already authenticated, and we're configured for using anonymous,
-    -- hence we're in a logical OR between auth methods and we're already done.
-    local clear_header = kong.service.request.clear_header
-    clear_header("X-Authenticated-Scope")
-    clear_header("X-Authenticated-UserId")
-    return
-  end
-
-
-  local ok, err = do_authentication(conf)
-  if not ok then
-    if conf.anonymous then
-      -- get anonymous user
-      local consumer_cache_key = kong.db.consumers:cache_key(conf.anonymous)
-      local consumer, err      = kong.cache:get(consumer_cache_key, nil,
-                                                kong.client.load_consumer,
-                                                conf.anonymous, true)
-      if err then
-        return error(err)
-      end
-
-      set_consumer(consumer)
-
-    else
-      return kong.response.exit(err.status, err.message, err.headers)
-    end
+  if conf.anonymous then
+    return logical_OR_authentication(conf)
+  else
+    return logical_AND_authentication(conf)
   end
 end
 

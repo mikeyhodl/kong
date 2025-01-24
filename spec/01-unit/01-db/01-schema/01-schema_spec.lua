@@ -1,21 +1,7 @@
 local Schema = require "kong.db.schema"
 local cjson  = require "cjson"
 local helpers = require "spec.helpers"
-
-
-local luacov_ok = pcall(require, "luacov")
-if luacov_ok then
-  local busted_it = it
-  -- luacheck: globals it
-  it = function(desc, fn)
-    busted_it(desc, function()
-      local luacov = require("luacov")
-      luacov.init()
-      fn()
-      luacov.save_stats()
-    end)
-  end
-end
+local table_copy = require "kong.tools.table".deep_copy
 
 
 local SchemaKind = {
@@ -115,14 +101,14 @@ describe("schema", function()
     it("validates a range with 'between'", function()
       local Test = Schema.new({
         fields = {
-          { a_number = { type = "number", between = { 10, 20 } } }
+          { a_number = { type = "number", between = { 9.5, 20.5 } } }
         }
       })
       assert.truthy(Test:validate({ a_number = 15 }))
       assert.truthy(Test:validate({ a_number = 10 }))
       assert.truthy(Test:validate({ a_number = 20 }))
-      assert.falsy(Test:validate({ a_number = 9 }))
-      assert.falsy(Test:validate({ a_number = 21 }))
+      assert.falsy(Test:validate({ a_number = 9.4 }))
+      assert.falsy(Test:validate({ a_number = 20.9 }))
       assert.falsy(Test:validate({ a_number = "wat" }))
     end)
 
@@ -330,6 +316,8 @@ describe("schema", function()
           "fail" },
         { { type = "function" },
           "fail" },
+        { { type = "json", json_schema = { inline = { type = "string" }, } },
+          123 },
       }
 
       local covered_check = {}
@@ -873,6 +861,30 @@ describe("schema", function()
       assert.falsy(Test:validate({ f = { r = { a = 2, b = "foo" }}}))
     end)
 
+    it("validates shorthands type check with nested records", function()
+      local Test = Schema.new({
+        fields = {
+          { r = {
+              type = "record",
+              fields = {
+                { a = { type = "string" } },
+                { b = { type = "number" } } },
+              shorthand_fields = {
+                {
+                  username = {
+                    type = "string",
+                    func = function(value)
+                      return {
+                        b = value
+                      }
+                    end,
+                  }}}}}}})
+      local input =  { r = { username = 123 }}
+      local ok, err = Test:process_auto_fields(input)
+      assert.falsy(ok)
+      assert.same({ username = "expected a string" }, err)
+    end)
+
     it("validates an integer", function()
       local Test = Schema.new({
         fields = {
@@ -1395,6 +1407,26 @@ describe("schema", function()
 
     describe("entity_checkers", function()
 
+      describe("at_least_one_of", function()
+        local Test = Schema.new({
+          fields = {
+            { a = { type = "number" }, },
+            { b = { type = "string" }, },
+            { c = { type = "string" }, },
+          },
+          entity_checks = {
+            { at_least_one_of = {"d"} },
+          }
+        })
+
+        it("runs check on invalid fields", function()
+          local ok, errs = Test:validate_insert({ a = 1 })
+          assert.is_nil(ok)
+          assert.same({
+            "at least one of these fields must be non-empty: 'd'"
+          }, errs["@entity"])
+        end)
+      end)
       describe("conditional_at_least_one_of", function()
         local Test = Schema.new({
           fields = {
@@ -2676,6 +2708,82 @@ describe("schema", function()
       assert.falsy(err)
     end)
 
+    it("run an entity check with flag 'run_with_missing_fields'", function()
+      local Test = Schema.new({
+        fields = {
+          { aaa = { type = "string", len_min = 4 } },
+          { bbb = { type = "string", len_min = 8 } },
+          { ccc = { type = "number", between = { 0, 10 } } },
+        },
+        entity_checks = {
+          { custom_entity_check = {
+            run_with_missing_fields = true,
+            field_sources = { "aaa", "bbb", "ccc" },
+            fn = function(entity)
+              if entity.aaa and entity.aaa ~= "abcd" then
+                return nil, "oh no"
+              end
+
+              if entity.bbb == "12345678" and entity.ccc == 2 then
+                return true
+              end
+              return nil, "oh no"
+            end,
+          } }
+        }
+      })
+
+      -- missing field 'aaa'
+      local ok, err = Test:validate_update({
+        bbb = "foo",
+        ccc = 42
+      })
+      assert.falsy(ok)
+      assert.is_nil(err["aaa"])
+      assert.match("length must be at least 8", err["bbb"])
+      assert.match("value should be between 0 and 10", err["ccc"])
+      assert.falsy(err["@entity"])
+
+      -- has field 'aaa'
+      local ok, err = Test:validate_update({
+        aaa = "xxx",
+        bbb = "foo",
+        ccc = 42
+      })
+      assert.falsy(ok)
+      assert.match("length must be at least 4", err["aaa"])
+      assert.match("length must be at least 8", err["bbb"])
+      assert.match("value should be between 0 and 10", err["ccc"])
+      assert.falsy(err["@entity"])
+
+      -- field 'aaa' has wrong value
+      local ok, err = Test:validate_update({
+        aaa = "xxxxxxxx",
+        bbb = "12345678",
+        ccc = 2
+      })
+      assert.falsy(ok)
+      assert.truthy(err["@entity"])
+      assert.match("oh no", err["@entity"][1])
+
+      -- missing field 'aaa', others are right
+      local ok, err = Test:validate_update({
+        bbb = "12345678",
+        ccc = 2
+      })
+      assert.truthy(ok)
+      assert.falsy(err)
+
+      -- all fields are right
+      local ok, err = Test:validate_update({
+        aaa = "abcd",
+        bbb = "12345678",
+        ccc = 2
+      })
+      assert.truthy(ok)
+      assert.falsy(err)
+    end)
+
     it("supports entity checks on nested fields", function()
       local Test = Schema.new({
         fields = {
@@ -2794,6 +2902,7 @@ describe("schema", function()
           { g = { type = "record", fields = {} }, },
           { h = { type = "map", keys = {}, values = {} }, },
           { i = { type = "function" }, },
+          { j = { type = "json", json_schema = { inline = { type = "string" }, } }, },
         }
       })
       check_all_types_covered(Test.fields)
@@ -2808,6 +2917,7 @@ describe("schema", function()
       assert.same(ngx.null, data.g)
       assert.same(ngx.null, data.h)
       assert.same(ngx.null, data.i)
+      assert.same(ngx.null, data.j)
     end)
 
     it("produces nil for empty string fields with selects", function()
@@ -2913,6 +3023,7 @@ describe("schema", function()
           { g = { type = "record", fields = {} }, },
           { h = { type = "map", keys = {}, values = {} }, },
           { i = { type = "function" }, },
+          { j = { type = "json", json_schema = { inline = { type = "string" }, } }, },
         }
       })
       check_all_types_covered(Test.fields)
@@ -2942,6 +3053,7 @@ describe("schema", function()
           { my_record = { type = "record", fields = { { my_field = { type = "integer" } } } } },
           { my_map = { type = "map", keys = {}, values = {} }, },
           { my_function = { type = "function" }, },
+          { my_json = { type = "json", json_schema = { inline = { type = "string" }, } }, },
         }
       })
       check_all_types_covered(Test.fields)
@@ -2955,6 +3067,7 @@ describe("schema", function()
         my_record = "hello",
         my_map = "hello",
         my_function = "hello",
+        my_json = 123,
       }
       local data, err = Test:process_auto_fields(bad_value)
       assert.is_nil(err)
@@ -3007,7 +3120,11 @@ describe("schema", function()
                     }
                 } }
               }
-          } }
+          } },
+          { j = {
+              type = "json",
+              json_schema = { inline = { type = "string" }, },
+          } },
         }
       })
       check_all_types_covered(Test.fields)
@@ -3534,6 +3651,7 @@ describe("schema", function()
     describe("#referenceable fields", function()
       lazy_setup(function()
         _G.kong = {
+          log   = require "kong.pdk.log".new(),
           vault = require "kong.pdk.vault".new(),
         }
       end)
@@ -3543,6 +3661,108 @@ describe("schema", function()
         package.loaded["kong.db.schema"] = nil
         Schema = require "kong.db.schema"
       end)
+
+      it("dereference string type field", function()
+        helpers.setenv("TEST_SECRET_FOO", "foo")
+        helpers.setenv("TEST_SECRET_BAR", "bar")
+        finally(function()
+          helpers.unsetenv("TEST_SECRET_FOO")
+          helpers.unsetenv("TEST_SECRET_BAR")
+        end)
+
+        local Test = Schema.new({
+          fields = {
+            {
+              secret = {
+                type = "string",
+                referenceable = true,
+              },
+            },
+          },
+        })
+
+        local data = Test:process_auto_fields({
+          secret = "{vault://env/test_secret_foo}",
+        }, "select")
+
+        assert.same({
+          secret = "{vault://env/test_secret_foo}",
+        }, data["$refs"])
+
+        assert.equal("foo", data.secret)
+
+        local data = Test:process_auto_fields({
+          secret = "{vault://env/test_not_found}",
+        }, "select")
+
+        assert.same({
+          secret = "{vault://env/test_not_found}",
+        }, data["$refs"])
+
+        assert.equal("", data.secret)
+
+        local data = Test:process_auto_fields({
+          secret = "{vault://env/test_secret_bar}",
+        }, "select")
+
+        assert.same({
+          secret = "{vault://env/test_secret_bar}",
+        }, data["$refs"])
+
+        assert.equal("bar", data.secret)
+      end)
+
+      it("dereference string type field (len_min=0)", function()
+        helpers.setenv("TEST_SECRET_FOO", "foo")
+        helpers.setenv("TEST_SECRET_BAR", "bar")
+        finally(function()
+          helpers.unsetenv("TEST_SECRET_FOO")
+          helpers.unsetenv("TEST_SECRET_BAR")
+        end)
+
+        local Test = Schema.new({
+          fields = {
+            {
+              secret = {
+                type = "string",
+                len_min = 0,
+                referenceable = true,
+              },
+            },
+          },
+        })
+
+        local data = Test:process_auto_fields({
+          secret = "{vault://env/test_secret_foo}",
+        }, "select")
+
+        assert.same({
+          secret = "{vault://env/test_secret_foo}",
+        }, data["$refs"])
+
+        assert.equal("foo", data.secret)
+
+        local data = Test:process_auto_fields({
+          secret = "{vault://env/test_not_found}",
+        }, "select")
+
+        assert.same({
+          secret = "{vault://env/test_not_found}",
+        }, data["$refs"])
+
+        assert.equal("", data.secret)
+
+        local data = Test:process_auto_fields({
+          secret = "{vault://env/test_secret_bar}",
+        }, "select")
+
+        assert.same({
+          secret = "{vault://env/test_secret_bar}",
+        }, data["$refs"])
+
+        assert.equal("bar", data.secret)
+      end)
+
 
       it("dereference array type field", function()
         helpers.setenv("TEST_SECRET_FOO", "foo")
@@ -3554,31 +3774,84 @@ describe("schema", function()
 
         local Test = Schema.new({
           fields = {
-            { secrets = {
-              type = "array",
-              elements = {
-                type = "string",
-                referenceable = true,
+            {
+              secrets = {
+                type = "array",
+                elements = {
+                  type = "string",
+                  referenceable = true,
+                },
               },
-            } },
+            },
           },
         })
 
         local data = Test:process_auto_fields({
           secrets = {
+            nil,
             "{vault://env/test_secret_foo}",
+            "{vault://env/test_not_found}",
+            "not a ref",
             "{vault://env/test_secret_bar}",
           },
         }, "select")
 
         assert.same({
           secrets = {
+            nil,
             "{vault://env/test_secret_foo}",
+            "{vault://env/test_not_found}",
+            nil,
             "{vault://env/test_secret_bar}",
           },
         }, data["$refs"])
 
-        assert.same({"foo", "bar"}, data.secrets)
+        assert.same({ nil, "foo", "", "not a ref", "bar" }, data.secrets)
+      end)
+
+      it("dereference set type field", function()
+        helpers.setenv("TEST_SECRET_FOO", "foo")
+        helpers.setenv("TEST_SECRET_BAR", "bar")
+        finally(function()
+          helpers.unsetenv("TEST_SECRET_FOO")
+          helpers.unsetenv("TEST_SECRET_BAR")
+        end)
+
+        local Test = Schema.new({
+          fields = {
+            {
+              secrets = {
+                type = "set",
+                elements = {
+                  type = "string",
+                  referenceable = true,
+                },
+              },
+            },
+          },
+        })
+
+        local data = Test:process_auto_fields({
+          secrets = {
+            nil,
+            "{vault://env/test_secret_foo}",
+            "{vault://env/test_not_found}",
+            "not a ref",
+            "{vault://env/test_secret_bar}",
+          },
+        }, "select")
+
+        assert.same({
+          secrets = {
+            nil,
+            "{vault://env/test_secret_foo}",
+            "{vault://env/test_not_found}",
+            nil,
+            "{vault://env/test_secret_bar}",
+          },
+        }, data["$refs"])
+
+        assert.same({ nil, "foo", "", "not a ref", "bar" }, data.secrets)
       end)
 
       it("dereference map type field", function()
@@ -3591,35 +3864,42 @@ describe("schema", function()
 
         local Test = Schema.new({
           fields = {
-            { secret = {
-              type = "map",
-              keys = "string",
-              values = {
-                type = "string",
-                referenceable = true,
+            {
+              secrets = {
+                type = "map",
+                keys = "string",
+                values = {
+                  type = "string",
+                  referenceable = true,
+                },
               },
-            } },
+            },
           },
         })
 
         local data = Test:process_auto_fields({
-          secret = {
+          secrets = {
+            not_a_ref = "not_a_ref",
             foo = "{vault://env/test_secret_foo}",
+            not_found = "{vault://env/test_not_found}",
             bar = "{vault://env/test_secret_bar}",
           },
         }, "select")
 
         assert.same({
-          secret = {
+          secrets = {
             foo = "{vault://env/test_secret_foo}",
+            not_found = "{vault://env/test_not_found}",
             bar = "{vault://env/test_secret_bar}",
           },
         }, data["$refs"])
 
         assert.same({
+          not_a_ref = "not_a_ref",
           foo = "foo",
+          not_found = "",
           bar = "bar",
-        }, data.secret)
+        }, data.secrets)
       end)
     end)
   end)
@@ -3849,6 +4129,375 @@ describe("schema", function()
       local input = { username = "test1" }
       local output, _ = TestSchema:process_auto_fields(input)
       assert.same({ name = "test1" }, output)
+    end)
+
+    it("takes precedence", function()
+      local TestSchema = Schema.new({
+        name = "test",
+        fields = {
+          { field_A = { type = "string" } },
+          { field_B = {
+            type = "record",
+              fields = {
+                { x = { type = "string" } }
+              },
+          }},
+        },
+        shorthand_fields = {
+          {
+            shorthand_A = {
+              type = "string",
+              func = function(value)
+                return {
+                  field_A = value
+                }
+              end,
+            },
+          },
+          {
+            shorthand_B = {
+              type = "string",
+              func = function(value)
+                return {
+                  field_B = {
+                    x = value,
+                  },
+                }
+              end,
+            },
+          },
+        },
+      })
+
+      local input = { shorthand_A = "test1", field_A = "ignored",
+                      shorthand_B = "test2", field_B = { x = "ignored" } }
+      local output, _ = TestSchema:process_auto_fields(input)
+      assert.same({ field_A = "test1", field_B = { x = "test2" } }, output)
+
+      -- shorthand value takes precedence if the destination field is null
+      local input = { shorthand_A = "overwritten-1", field_A = ngx.null,
+                      shorthand_B = "overwritten-2", field_B = { x = ngx.null }}
+      local output, _ = TestSchema:process_auto_fields(input)
+      assert.same({ field_A = "overwritten-1", field_B = { x = "overwritten-2" }  }, output)
+    end)
+
+    describe("with simple 'table_path' reverse mapping", function()
+      local TestSchema = Schema.new({
+        name = "test",
+        fields = {
+          { new_A = { type = "string" } },
+          { new_B = {
+            type = "record",
+            fields = {
+              { x = { type = "string" } }
+            },
+          }},
+          { new_C = { type = "string", default = "abc", required = true }},
+          { new_D_1 = { type = "string" }},
+          { new_D_2 = { type = "string" }},
+        },
+        shorthand_fields = {
+          {
+            old_A = {
+              type = "string",
+              func = function(value)
+                return {
+                  new_A = value
+                }
+              end,
+              deprecation = {
+                replaced_with = { { path = { "new_A" } } },
+                message = "old_A is deprecated, please use new_A instead",
+                removal_in_version = "4.0",
+              },
+            },
+          },
+          {
+            old_B = {
+              type = "string",
+              func = function(value)
+                return {
+                  new_B = {
+                    x = value,
+                  },
+                }
+              end,
+              deprecation = {
+                replaced_with = { { path = { "new_B", "x" } } },
+                message = "old_B is deprecated, please use new_B.x instead",
+                removal_in_version = "4.0",
+              },
+            },
+          },
+          {
+            old_C = {
+              type = "string",
+              func = function(value)
+                return {
+                  new_C = value
+                }
+              end,
+              deprecation = {
+                replaced_with = { { path = { "new_C" } } },
+                message = "old_C is deprecated, please use new_C instead",
+                removal_in_version = "4.0",
+              }
+            }
+          },
+          {
+            old_D = {
+              type = "string",
+              func = function(value)
+                return { new_D_1 = value, new_D_2 = value }
+              end,
+              deprecation = {
+                replaced_with = { { path = { "new_D_1" } }, { path = { "new_D_2" } } },
+                message = "old_D is deprecated, please use new_D_1 and new_D_2 instead",
+                removal_in_version = "4.0",
+              }
+            }
+          }
+        },
+      })
+
+      it("notifes of error if values mismatch with replaced field", function()
+        local input = { old_A = "not-test-1", new_A = "test-1",
+                        old_B = "not-test-2", new_B = { x = "test-2" },
+                        old_C = "abc", new_C = "not-abc",  -- "abc" is the default value
+                        old_D = "test-4", new_D_1 = "test-4", new_D_2 = "not-test-4", }
+        local output, err = TestSchema:process_auto_fields(input)
+        assert.same({
+            old_A = 'both deprecated and new field are used but their values mismatch: old_A = not-test-1 vs new_A = test-1',
+            old_B = 'both deprecated and new field are used but their values mismatch: old_B = not-test-2 vs new_B.x = test-2' ,
+            old_C = 'both deprecated and new field are used but their values mismatch: old_C = abc vs new_C = not-abc',
+            old_D = 'both deprecated and new field are used but their values mismatch: old_D = test-4 vs new_D_2 = not-test-4' },
+          err
+        )
+        assert.falsy(output)
+      end)
+
+      it("accepts config if both new field and deprecated field defined and their values match", function()
+        local input = { old_A = "test-1", new_A = "test-1",
+                        old_B = "test-2", new_B = { x = "test-2" },
+                        -- "C" field is using default
+                        old_D = "test-4", new_D_1 = "test-4", new_D_2 = "test-4", }
+        local output, err = TestSchema:process_auto_fields(input)
+        assert.is_nil(err)
+        assert.same({ new_A = "test-1", new_B = { x = "test-2" }, new_C = "abc", new_D_1 = "test-4", new_D_2 = "test-4" }, output)
+
+
+        local input = { old_A = "test-1", new_A = "test-1",
+                        old_B = "test-2", new_B = { x = "test-2" },
+                        old_C = "test-3", -- no new field C specified but it has a default which should be ignored
+                                          new_D_1 = "test-4-1", new_D_2 = "test-4-2", }
+        local output, err = TestSchema:process_auto_fields(input)
+        assert.is_nil(err)
+        assert.same({ new_A = "test-1", new_B = { x = "test-2" }, new_C = "test-3", new_D_1 = "test-4-1", new_D_2 = "test-4-2" }, output)
+
+        -- when new values are null it's still accepted
+        local input = { old_A = "test-1", new_A = ngx.null,
+                        old_B = "test-2", new_B = { x = ngx.null },
+                        old_C = "test-3", new_C = ngx.null,
+                        old_D = "test-4", new_D_1 = ngx.null, new_D_2 = ngx.null, }
+        local output, err = TestSchema:process_auto_fields(input)
+        assert.is_nil(err)
+        assert.same({new_A = "test-1", new_B = { x = "test-2" }, new_C = "test-3", new_D_1 = "test-4", new_D_2 = "test-4" }, output)
+
+        -- when old values are null it's still accepted
+        local input = { old_A = ngx.null, new_A = "test-1",
+                        old_B = ngx.null, new_B = { x = "test-2" },
+                        old_C = ngx.null, new_C = "test-3",
+                        old_D = ngx.null, new_D_1 = "test-4-1", new_D_2 = "test-4-2", }
+        local output, err = TestSchema:process_auto_fields(input)
+        assert.is_nil(err)
+        assert.same({ new_A = "test-1", new_B = { x = "test-2" }, new_C = "test-3", new_D_1 = "test-4-1", new_D_2 = "test-4-2" }, output)
+      end)
+
+      it("allows to set explicit nulls when only one set of fields was passed", function()
+        -- when new values are null it's still accepted
+        local input = { new_A = ngx.null,
+                        new_B = { x = ngx.null },
+                        new_C = ngx.null,
+                        new_D_1 = ngx.null, new_D_2 = ngx.null }
+        local output, err = TestSchema:process_auto_fields(input)
+        assert.is_nil(err)
+        assert.same({new_A = ngx.null, new_B = { x = ngx.null }, new_C = ngx.null, new_D_1 = ngx.null, new_D_2 = ngx.null}, output)
+
+        -- when old values are null it's still accepted
+        local input = { old_A = ngx.null,
+                        old_B = ngx.null,
+                        old_C = ngx.null,
+                        old_D = ngx.null }
+        local output, err = TestSchema:process_auto_fields(input)
+        assert.is_nil(err)
+        assert.same({new_A = ngx.null, new_B = { x = ngx.null }, new_C = ngx.null, new_D_1 = ngx.null, new_D_2 = ngx.null}, output)
+      end)
+    end)
+
+    describe("with complex field reverse_mapping_function", function()
+      local TestSchema = Schema.new({
+        name = "test",
+        fields = {
+          { new_A = { type = "string" } },
+          { new_B = {
+            type = "record",
+            fields = {
+              { x = { type = "string" } }
+            },
+          }},
+          { new_C = {
+            type = "array",
+            elements = {
+              type = "number"
+            }
+          }}
+        },
+        shorthand_fields = {
+          {
+            old_A = {
+              type = "string",
+              func = function(value)
+                if value == ngx.null then
+                  return { new_A = ngx.null }
+                end
+                return { new_A = value:upper() }
+              end,
+              deprecation = {
+                replaced_with = {
+                  { path = { "new_A" },
+                    reverse_mapping_function = function(data)
+                      if data.new_A and data.new_A ~= ngx.null then
+                        return data.new_A:lower()
+                      end
+
+                      return data.new_A
+                    end }
+                },
+                message = "old_A is deprecated, please use new_A instead",
+                removal_in_version = "4.0",
+              },
+            },
+          },
+          {
+            old_B = {
+              type = "string",
+              func = function(value)
+                if value == ngx.null then
+                  return {
+                    new_B = {
+                      x = ngx.null,
+                    },
+                  }
+                end
+
+                return {
+                  new_B = {
+                    x = value:upper(),
+                  },
+                }
+              end,
+              deprecation = {
+                replaced_with = {
+                  { path = { "new_B", "x" },
+                    reverse_mapping_function = function (data)
+                      if data.new_B and data.new_B.x ~= ngx.null then
+                        return data.new_B.x:lower()
+                      end
+                      return ngx.null
+                    end
+                } },
+                message = "old_B is deprecated, please use new_B.x instead",
+                removal_in_version = "4.0",
+              },
+            },
+          },
+          {
+            old_C = {
+              type = "array",
+              elements = {
+                type = "number"
+              },
+              func = function(value)
+                if value == ngx.null then
+                  return { new_C = ngx.null }
+                end
+                local copy = table_copy(value)
+                table.sort(copy, function(a,b) return a > b end )
+                return { new_C = copy } -- new field is reversed
+              end,
+              deprecation = {
+                replaced_with = {
+                  { path = { "new_C" },
+                    reverse_mapping_function = function (data)
+                      if data.new_C == ngx.null then
+                        return ngx.null
+                      end
+
+                      local copy = table_copy(data.new_C)
+                      table.sort(copy, function(a,b) return a < b end)
+                      return copy
+                    end
+                  },
+                }
+              }
+            }
+          }
+        },
+      })
+
+      it("notifes of error if values mismatch with replaced field", function()
+        local input = { old_A = "not-test-1", new_A = "TEST1",
+                        old_B = "not-test-2", new_B = { x = "TEST2" },
+                        old_C = { 1, 2, 4 },  new_C = { 3, 2, 1 } }
+        local output, err = TestSchema:process_auto_fields(input)
+        assert.same('both deprecated and new field are used but their values mismatch: old_A = not-test-1 vs new_A = test1', err.old_A)
+        assert.same('both deprecated and new field are used but their values mismatch: old_B = not-test-2 vs new_B.x = test2', err.old_B)
+        assert.matches('both deprecated and new field are used but their values mismatch: old_C = .+ vs new_C = .+', err.old_C)
+        assert.falsy(output)
+      end)
+
+      it("accepts config if both new field and deprecated field defined and their values match", function()
+        local input = { old_A = "test-1", new_A = "TEST-1",
+                        old_B = "test-2", new_B = { x = "TEST-2" },
+                        old_C = { 1, 2, 3 }, new_C = { 3, 2, 1 } }
+        local output, err = TestSchema:process_auto_fields(input)
+        assert.is_nil(err)
+        assert.same({ new_A = "TEST-1", new_B = { x = "TEST-2" }, new_C = { 3, 2, 1 }}, output)
+
+        -- when new values are null it's still accepted
+        local input = { old_A = "test-1", new_A = ngx.null,
+                        old_B = "test-2", new_B = { x = ngx.null },
+                        old_C = { 1, 2, 3 }, new_C = ngx.null }
+        local output, err = TestSchema:process_auto_fields(input)
+        assert.is_nil(err)
+        assert.same({ new_A = "TEST-1", new_B = { x = "TEST-2" }, new_C = { 3, 2, 1 }}, output)
+
+        -- when old values are null it's still accepted
+        local input = { old_A = ngx.null, new_A = "TEST-1",
+                        old_B = ngx.null, new_B = { x = "TEST-2" },
+                        old_C = ngx.null, new_C = { 3, 2, 1 } }
+        local output, err = TestSchema:process_auto_fields(input)
+        assert.is_nil(err)
+        assert.same({ new_A = "TEST-1", new_B = { x = "TEST-2" }, new_C = { 3, 2, 1 }}, output)
+      end)
+
+      it("allows to set explicit nulls when only one set of fields was passed", function()
+        -- when new values are null it's still accepted
+        local input = { new_A = ngx.null,
+                        new_B = { x = ngx.null },
+                        new_C = ngx.null }
+        local output, err = TestSchema:process_auto_fields(input)
+        assert.is_nil(err)
+        assert.same({new_A = ngx.null, new_B = { x = ngx.null }, new_C = ngx.null}, output)
+
+        -- when old values are null it's still accepted
+        local input = { old_A = ngx.null,
+                        old_B = ngx.null,
+                        old_C = ngx.null }
+        local output, err = TestSchema:process_auto_fields(input)
+        assert.is_nil(err)
+        assert.same({new_A = ngx.null, new_B = { x = ngx.null }, new_C = ngx.null}, output)
+      end)
     end)
 
     it("can produce multiple fields", function()

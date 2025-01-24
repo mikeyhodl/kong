@@ -53,6 +53,7 @@ describe("Plugins", function()
 
     local order = {
       "pre-function",
+      "correlation-id",
       "zipkin",
       "bot-detection",
       "cors",
@@ -72,6 +73,14 @@ describe("Plugins", function()
       "response-ratelimiting",
       "request-transformer",
       "response-transformer",
+      "redirect",
+      "ai-request-transformer",
+      "ai-prompt-template",
+      "ai-prompt-decorator",
+      "ai-prompt-guard",
+      "ai-proxy",
+      "ai-response-transformer",
+      "standard-webhooks",
       "aws-lambda",
       "azure-functions",
       "proxy-cache",
@@ -87,7 +96,6 @@ describe("Plugins", function()
       "syslog",
       "grpc-web",
       "request-termination",
-      "correlation-id",
       "post-function",
     }
 

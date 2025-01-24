@@ -1,7 +1,9 @@
 local ngx_ssl = require "ngx.ssl"
 local pl_utils = require "pl.utils"
-local mlcache = require "resty.mlcache"
+local mlcache = require "kong.resty.mlcache"
 local new_tab = require "table.new"
+local constants = require "kong.constants"
+local plugin_servers = require "kong.runloop.plugin_servers"
 local openssl_x509_store = require "resty.openssl.x509.store"
 local openssl_x509 = require "resty.openssl.x509"
 
@@ -19,18 +21,68 @@ local set_cert = ngx_ssl.set_cert
 local set_priv_key = ngx_ssl.set_priv_key
 local tb_concat   = table.concat
 local tb_sort   = table.sort
+local tb_insert   = table.insert
+local kong = kong
+local type = type
+local error = error
+local assert = assert
 local tostring = tostring
 local ipairs = ipairs
 local ngx_md5 = ngx.md5
+local ngx_exit = ngx.exit
+local ngx_ERROR = ngx.ERROR
 
 
 local default_cert_and_key
 
 local DEFAULT_SNI = "*"
 
+local CA_KEY = {
+  id = "",
+}
+
+
 local function log(lvl, ...)
   ngx_log(lvl, "[ssl] ", ...)
 end
+
+
+local function parse_cert(cert, parsed)
+  if cert == nil then
+    return nil, nil, parsed
+  end
+
+  if type(cert) == "cdata" then
+    return cert, nil, parsed
+  end
+
+  local err
+  cert, err = parse_pem_cert(cert)
+  if not cert then
+    return nil, "could not parse PEM certificate: " .. err
+  end
+  return cert, nil, true
+end
+
+
+
+local function parse_key(key, parsed)
+  if key == nil then
+    return nil, nil, parsed
+  end
+
+  if type(key) == "cdata" then
+    return key, nil, parsed
+  end
+
+  local err
+  key, err = parse_pem_priv_key(key)
+  if not key then
+    return nil, "could not parse PEM private key: " .. err
+  end
+  return key, nil, true
+end
+
 
 local function parse_key_and_cert(row)
   if row == false then
@@ -39,36 +91,43 @@ local function parse_key_and_cert(row)
 
   -- parse cert and priv key for later usage by ngx.ssl
 
-  local cert, err = parse_pem_cert(row.cert)
-  if not cert then
-    return nil, "could not parse PEM certificate: " .. err
+  local err, parsed
+  local key, key_alt
+  local cert, cert_alt
+
+  cert, err, parsed = parse_cert(row.cert)
+  if err then
+    return nil, err
   end
 
-  local key, err = parse_pem_priv_key(row.key)
-  if not key then
-    return nil, "could not parse PEM private key: " .. err
+  key, err, parsed = parse_key(row.key, parsed)
+  if err then
+    return nil, err
   end
 
-  local cert_alt
-  local key_alt
-  if row.cert_alt and row.key_alt then
-    cert_alt, err = parse_pem_cert(row.cert_alt)
-    if not cert_alt then
-      return nil, "could not parse alternate PEM certificate: " .. err
+  cert_alt, err, parsed = parse_cert(row.cert_alt, parsed)
+  if err then
+    return nil, err
+  end
+
+  if cert_alt then
+    key_alt, err, parsed = parse_key(row.key_alt, parsed)
+    if err then
+      return nil, err
     end
-
-    key_alt, err = parse_pem_priv_key(row.key_alt)
-    if not key_alt then
-      return nil, "could not parse alternate PEM private key: " .. err
-    end
   end
 
-  return {
-    cert = cert,
-    key = key,
-    cert_alt = cert_alt,
-    key_alt = key_alt,
-  }
+  if parsed then
+    return {
+      cert = cert,
+      key = key,
+      cert_alt = cert_alt,
+      key_alt = key_alt,
+      ["$refs"] = row["$refs"],
+    }
+  end
+
+  return row
 end
 
 
@@ -129,8 +188,10 @@ local function fetch_sni(sni, i)
 end
 
 
-local function fetch_certificate(pk, sni_name)
-  local certificate, err = kong.db.certificates:select(pk)
+local function fetch_certificate(pk, sni_name, ws_id)
+  local certificate, err = kong.db.certificates:select(pk, {
+    workspace = ws_id,
+  })
   if err then
     if sni_name then
       return nil, "failed to fetch certificate for '" .. sni_name .. "' SNI: " ..
@@ -192,11 +253,18 @@ local function init()
 end
 
 
-local function get_certificate(pk, sni_name)
+local function get_certificate(pk, sni_name, ws_id)
   local cache_key = kong.db.certificates:cache_key(pk)
-  return kong.core_cache:get(cache_key,
-                             get_certificate_opts, fetch_certificate,
-                             pk, sni_name)
+  local certificate, err, hit_level = kong.core_cache:get(cache_key,
+                                                          get_certificate_opts,
+                                                          fetch_certificate,
+                                                          pk, sni_name, ws_id)
+
+  if certificate and hit_level ~= 3 and certificate["$refs"] then
+    certificate = parse_key_and_cert(kong.vault.update(certificate))
+  end
+
+  return certificate, err
 end
 
 
@@ -227,12 +295,36 @@ local function find_certificate(sni)
     return nil, err
   end
 
-  for _, sni, err in mlcache.each_bulk_res(res) do
+  for _, new_sni, err in mlcache.each_bulk_res(res) do
+    if new_sni then
+      return get_certificate(new_sni.certificate, new_sni.name)
+    end
     if err then
-      log(ERR, "failed to fetch SNI: ", err)
+      -- we choose to not call typedefs.wildcard_host.custom_validator(sni)
+      -- in the front to reduce the cost in normal flow.
+      -- these error messages are from validate_wildcard_host()
+      local patterns = {
+        "must not be an IP",
+        "must not have a port",
+        "invalid value: ",
+        "only one wildcard must be specified",
+        "wildcard must be leftmost or rightmost character",
+      }
+      local idx
 
-    elseif sni then
-      return get_certificate(sni.certificate, sni.name)
+      for _, pat in ipairs(patterns) do
+        idx = err:find(pat, nil, true)
+        if idx then
+          break
+        end
+      end
+
+      if idx then
+        kong.log.debug("invalid SNI '", sni, "', ", err:sub(idx),
+                       ", serving default SSL certificate")
+      else
+        log(ERR, "failed to fetch SNI: ", err)
+      end
     end
   end
 
@@ -244,13 +336,13 @@ local function execute()
   local sn, err = server_name()
   if err then
     log(ERR, "could not retrieve SNI: ", err)
-    return ngx.exit(ngx.ERROR)
+    return ngx_exit(ngx_ERROR)
   end
 
   local cert_and_key, err = find_certificate(sn)
   if err then
     log(ERR, err)
-    return ngx.exit(ngx.ERROR)
+    return ngx_exit(ngx_ERROR)
   end
 
   if cert_and_key == default_cert_and_key then
@@ -263,32 +355,32 @@ local function execute()
   local ok, err = clear_certs()
   if not ok then
     log(ERR, "could not clear existing (default) certificates: ", err)
-    return ngx.exit(ngx.ERROR)
+    return ngx_exit(ngx_ERROR)
   end
 
   ok, err = set_cert(cert_and_key.cert)
   if not ok then
     log(ERR, "could not set configured certificate: ", err)
-    return ngx.exit(ngx.ERROR)
+    return ngx_exit(ngx_ERROR)
   end
 
   ok, err = set_priv_key(cert_and_key.key)
   if not ok then
     log(ERR, "could not set configured private key: ", err)
-    return ngx.exit(ngx.ERROR)
+    return ngx_exit(ngx_ERROR)
   end
 
   if cert_and_key.cert_alt and cert_and_key.key_alt then
     ok, err = set_cert(cert_and_key.cert_alt)
     if not ok then
       log(ERR, "could not set alternate configured certificate: ", err)
-      return ngx.exit(ngx.ERROR)
+      return ngx_exit(ngx_ERROR)
     end
 
     ok, err = set_priv_key(cert_and_key.key_alt)
     if not ok then
       log(ERR, "could not set alternate configured private key: ", err)
-      return ngx.exit(ngx.ERROR)
+      return ngx_exit(ngx_ERROR)
     end
   end
 end
@@ -302,12 +394,11 @@ end
 
 local function fetch_ca_certificates(ca_ids)
   local cas = new_tab(#ca_ids, 0)
-  local key = new_tab(1, 0)
 
   for i, ca_id in ipairs(ca_ids) do
-    key.id = ca_id
+    CA_KEY.id = ca_id
 
-    local obj, err = kong.db.ca_certificates:select(key)
+    local obj, err = kong.db.ca_certificates:select(CA_KEY)
     if not obj then
       if err then
         return nil, err
@@ -330,6 +421,99 @@ local function get_ca_certificate_store(ca_ids)
 end
 
 
+local function get_ca_certificate_store_for_plugin(ca_ids)
+  return kong.cache:get(ca_ids_cache_key(ca_ids),
+                        get_ca_store_opts, fetch_ca_certificates,
+                        ca_ids)
+end
+
+
+-- here we assume the field name is always `ca_certificates`
+local get_ca_certificate_reference_entities
+do
+  local function is_entity_referencing_ca_certificates(name)
+    local entity_schema = require("kong.db.schema.entities." .. name)
+    for _, field in ipairs(entity_schema.fields) do
+      if field.ca_certificates then
+        return true
+      end
+    end
+
+    return false
+  end
+
+  -- ordinary entities that reference ca certificates
+  -- For example: services
+  local CA_CERT_REFERENCE_ENTITIES
+  get_ca_certificate_reference_entities = function()
+    if not CA_CERT_REFERENCE_ENTITIES then
+      CA_CERT_REFERENCE_ENTITIES = {}
+      for _, entity_name in ipairs(constants.CORE_ENTITIES) do
+        local res = is_entity_referencing_ca_certificates(entity_name)
+        if res then
+          tb_insert(CA_CERT_REFERENCE_ENTITIES, entity_name)
+        end
+      end
+    end
+
+    return CA_CERT_REFERENCE_ENTITIES
+  end
+end
+
+
+-- here we assume the field name is always `ca_certificates`
+local get_ca_certificate_reference_plugins
+do
+  local load_module_if_exists = require "kong.tools.module".load_module_if_exists
+
+  local function is_plugin_referencing_ca_certificates(name)
+    local plugin_schema = "kong.plugins." .. name .. ".schema"
+    local ok, schema = load_module_if_exists(plugin_schema)
+    if not ok then
+      ok, schema = plugin_servers.load_schema(name)
+    end
+
+    if not ok then
+      return nil, "no configuration schema found for plugin: " .. name
+    end
+
+    for _, field in ipairs(schema.fields) do
+      if field.config then
+        for _, field in ipairs(field.config.fields) do
+          if field.ca_certificates then
+            return true
+          end
+        end
+      end
+    end
+
+    return false
+  end
+
+  -- loaded plugins that reference ca certificates
+  -- For example: mtls-auth
+  local CA_CERT_REFERENCE_PLUGINS
+  get_ca_certificate_reference_plugins = function()
+    if not CA_CERT_REFERENCE_PLUGINS then
+      CA_CERT_REFERENCE_PLUGINS = {}
+      local loaded_plugins = kong.configuration.loaded_plugins
+      for name, v in pairs(loaded_plugins) do
+        local res, err = is_plugin_referencing_ca_certificates(name)
+        if err then
+          return nil, err
+        end
+
+        if res then
+          CA_CERT_REFERENCE_PLUGINS[name] = true
+        end
+      end
+    end
+
+    return CA_CERT_REFERENCE_PLUGINS
+  end
+end
+
+
 return {
   init = init,
   find_certificate = find_certificate,
@@ -337,4 +521,8 @@ return {
   execute = execute,
   get_certificate = get_certificate,
   get_ca_certificate_store = get_ca_certificate_store,
+  get_ca_certificate_store_for_plugin = get_ca_certificate_store_for_plugin,
+  ca_ids_cache_key = ca_ids_cache_key,
+  get_ca_certificate_reference_entities = get_ca_certificate_reference_entities,
+  get_ca_certificate_reference_plugins = get_ca_certificate_reference_plugins,
 }

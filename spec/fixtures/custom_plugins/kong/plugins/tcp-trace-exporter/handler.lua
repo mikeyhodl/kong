@@ -78,7 +78,7 @@ local function push_data(premature, data, config)
   end
 
   local tcpsock = ngx.socket.tcp()
-  tcpsock:settimeout(1000)
+  tcpsock:settimeouts(10000, 10000, 10000)
   local ok, err = tcpsock:connect(config.host, config.port)
   if not ok then
     kong.log.err("connect err: ".. err)
@@ -104,6 +104,9 @@ function _M:log(config)
 
   local spans = {}
   local process_span = function (span)
+    if span.should_sample == false then
+      return
+    end
     local s = table.clone(span)
     s.tracer = nil
     s.parent = nil

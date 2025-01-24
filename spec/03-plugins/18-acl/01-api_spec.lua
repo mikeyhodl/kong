@@ -1,4 +1,4 @@
-local utils   = require "kong.tools.utils"
+local uuid    = require "kong.tools.uuid"
 local cjson   = require "cjson"
 local helpers = require "spec.helpers"
 
@@ -417,10 +417,7 @@ for _, strategy in helpers.each_strategy() do
           assert.equal(3, #json_2.data)
 
           assert.not_same(json_1.data, json_2.data)
-          -- Disabled: on Cassandra, the last page still returns a
-          -- next_page token, and thus, an offset proprty in the
-          -- response of the Admin API.
-          --assert.is_nil(json_2.offset) -- last page
+          assert.is_nil(json_2.offset) -- last page
         end)
       end)
 
@@ -469,7 +466,7 @@ for _, strategy in helpers.each_strategy() do
         end)
 
         it("does not create acl when missing consumer", function()
-          local res = admin_client:put("/acls/" .. utils.uuid(), {
+          local res = admin_client:put("/acls/" .. uuid.uuid(), {
             body = { group = "test-group" },
             headers = {
               ["Content-Type"] = "application/json"
@@ -481,7 +478,7 @@ for _, strategy in helpers.each_strategy() do
         end)
 
         it("creates acl", function()
-          local res = admin_client:put("/acls/" .. utils.uuid(), {
+          local res = admin_client:put("/acls/" .. uuid.uuid(), {
             body = {
               group = "test-group",
               consumer = {

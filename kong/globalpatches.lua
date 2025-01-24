@@ -13,10 +13,19 @@ return function(options)
 
   options = options or {}
   local meta = require "kong.meta"
+  local constants = require "kong.constants"
 
 
-  require("cjson.safe").encode_sparse_array(nil, nil, 2^15)
+  local cjson_safe = require("cjson.safe")
+  cjson_safe.encode_sparse_array(nil, nil, 2^15)
+  cjson_safe.encode_number_precision(constants.CJSON_MAX_PRECISION)
 
+  local pb = require "pb"
+
+  -- let pb decode arrays to table cjson.empty_array_mt metatable
+  -- so empty arrays are encoded as `[]` instead of `nil` or `{}` by cjson.
+  pb.option("decode_default_array")
+  pb.defaults("*array", cjson_safe.empty_array_mt)
 
   if options.cli then
     -- disable the _G write guard alert log introduced in OpenResty 1.15.8.1
@@ -89,7 +98,10 @@ return function(options)
       _timerng:start()
 
     else
-      _timerng = require("resty.timerng").new()
+      _timerng = require("resty.timerng").new({
+        min_threads = 256,
+        max_threads = 1024,
+      })
     end
 
     _G.timerng = _timerng
@@ -104,10 +116,129 @@ return function(options)
   end
 
 
+  do
+    if ngx.config.subsystem == "http" then
+      local get_request = require("resty.core.base").get_request
 
-  do  -- implement a Lua based shm for: cli (and hence rbusted)
+      local error = error
 
-    if options.cli then
+      local get_req_headers = ngx.req.get_headers
+      local get_resp_headers = ngx.resp.get_headers
+      local get_uri_args = ngx.req.get_uri_args
+      local get_post_args = ngx.req.get_post_args
+      local decode_args = ngx.decode_args
+
+      local DEFAULT_MAX_REQ_HEADERS = 100
+      local DEFAULT_MAX_RESP_HEADERS = 100
+      local DEFAULT_MAX_URI_ARGS = 100
+      local DEFAULT_MAX_POST_ARGS = 100
+      local DEFAULT_MAX_DECODE_ARGS = 100
+
+      local MAX_REQ_HEADERS
+      local MAX_RESP_HEADERS
+      local MAX_URI_ARGS
+      local MAX_POST_ARGS
+      local MAX_DECODE_ARGS
+
+      -- REQUEST HEADERS [
+      local function get_req_headers_real(max_req_headers, ...)
+        local request_headers, err = get_req_headers(max_req_headers or MAX_REQ_HEADERS or DEFAULT_MAX_REQ_HEADERS, ...)
+        if err == "truncated" then
+          kong.log.notice("request headers truncated")
+        end
+        return request_headers, err
+      end
+
+      _G.ngx.req.get_headers = function(max_req_headers, ...)
+        if not get_request() then
+          error("no request found")
+        end
+        MAX_REQ_HEADERS = kong and kong.configuration and kong.configuration.lua_max_req_headers or DEFAULT_MAX_REQ_HEADERS
+        _G.ngx.req.get_headers = get_req_headers_real
+        return get_req_headers_real(max_req_headers or MAX_REQ_HEADERS, ...)
+      end
+      -- ]
+
+      -- RESPONSE HEADERS [
+      local function get_resp_headers_real(max_resp_headers, ...)
+        local response_headers, err = get_resp_headers(max_resp_headers or MAX_RESP_HEADERS or DEFAULT_MAX_RESP_HEADERS, ...)
+        if err == "truncated" then
+          kong.log.notice("response headers truncated")
+        end
+        return response_headers, err
+      end
+
+      _G.ngx.resp.get_headers = function(max_resp_headers, ...)
+        if not get_request() then
+          error("no request found")
+        end
+        MAX_RESP_HEADERS = kong and kong.configuration and kong.configuration.lua_max_resp_headers or DEFAULT_MAX_RESP_HEADERS
+        _G.ngx.resp.get_headers = get_resp_headers_real
+        return get_resp_headers_real(max_resp_headers or MAX_RESP_HEADERS, ...)
+      end
+      -- ]
+
+      -- URI ARGS [
+      local function get_uri_args_real(max_uri_args, ...)
+        local uri_args, err = get_uri_args(max_uri_args or MAX_URI_ARGS or DEFAULT_MAX_URI_ARGS, ...)
+        if err == "truncated" then
+          kong.log.notice("uri args truncated")
+        end
+        return uri_args, err
+      end
+
+      _G.ngx.req.get_uri_args = function(max_uri_args, ...)
+        if not get_request() then
+          error("no request found")
+        end
+        MAX_URI_ARGS = kong and kong.configuration and kong.configuration.lua_max_uri_args or DEFAULT_MAX_URI_ARGS
+        _G.ngx.req.get_uri_args = get_uri_args_real
+        return get_uri_args_real(max_uri_args or MAX_URI_ARGS, ...)
+      end
+      -- ]
+
+      -- POST ARGS [
+      local function get_post_args_real(max_post_args, ...)
+        local post_args, err = get_post_args(max_post_args or MAX_POST_ARGS or DEFAULT_MAX_POST_ARGS, ...)
+        if err == "truncated" then
+          kong.log.notice("post args truncated")
+        end
+        return post_args, err
+      end
+
+      _G.ngx.req.get_post_args = function(max_post_args, ...)
+        if not get_request() then
+          error("no request found")
+        end
+        MAX_POST_ARGS = kong and kong.configuration and kong.configuration.lua_max_post_args or DEFAULT_MAX_POST_ARGS
+        _G.ngx.req.get_post_args = get_post_args_real
+        return get_post_args_real(max_post_args or MAX_POST_ARGS, ...)
+      end
+      -- ]
+
+      -- DECODE ARGS [
+      local function decode_args_real(str, max_args, ...)
+        local args, err = decode_args(str, max_args or MAX_DECODE_ARGS or DEFAULT_MAX_DECODE_ARGS, ...)
+        if err == "truncated" then
+          kong.log.notice("decode args truncated")
+        end
+        return args, err
+      end
+
+      _G.ngx.decode_args = function(str, max_args, ...)
+        -- Currently the kong.configuration.lua_max_uri_args is used for this too.
+        MAX_DECODE_ARGS = kong and kong.configuration and kong.configuration.lua_max_uri_args or DEFAULT_MAX_DECODE_ARGS
+        _G.ngx.decode_args = decode_args_real
+        return decode_args_real(str, max_args or MAX_DECODE_ARGS, ...)
+      end
+      -- ]
+    end
+  end
+
+
+  do  -- implement a Lua based shm for: cli
+
+    if options.cli and not options.rbusted then
       -- ngx.shared.DICT proxy
       -- https://github.com/bsm/fakengx/blob/master/fakengx.lua
       -- with minor fixes and additions such as exptime
@@ -115,11 +246,22 @@ return function(options)
       -- See https://github.com/openresty/resty-cli/pull/12
       -- for a definitive solution of using shms in CLI
       local SharedDict = {}
-      local function set(data, key, value, expire_at)
+      local function set(data, key, value, expire_at, flags)
         data[key] = {
           value = value,
-          info = {expire_at = expire_at}
+          info = {expire_at = expire_at, flags=flags}
         }
+        return data[key]
+      end
+      local function is_stale(item)
+        return item.info.expire_at and item.info.expire_at <= ngx.now()
+      end
+      local function get(data, key)
+        local item = data[key]
+        if item and is_stale(item) then
+          item = nil
+        end
+        return item
       end
       function SharedDict:new()
         return setmetatable({data = {}}, {__index = self})
@@ -131,34 +273,35 @@ return function(options)
         return 0
       end
       function SharedDict:get(key)
-        return self.data[key] and self.data[key].value, nil
+        local item = get(self.data, key)
+        if item then
+          return item.value, item.info.flags
+        end
+        return nil
       end
-      SharedDict.get_stale = SharedDict.get
-      function SharedDict:set(key, value)
-        set(self.data, key, value)
+      function SharedDict:get_stale(key)
+        local item = self.data[key]
+        if item then
+          return item.value, item.info.flags, is_stale(item)
+        end
+        return nil
+      end
+      function SharedDict:set(key, value, exptime)
+        local expire_at = (exptime and exptime ~= 0) and (ngx.now() + exptime)
+        set(self.data, key, value, expire_at)
         return true, nil, false
       end
       SharedDict.safe_set = SharedDict.set
       function SharedDict:add(key, value, exptime)
-        if self.data[key] ~= nil then
+        if get(self.data, key) then
           return false, "exists", false
         end
 
-        local expire_at = nil
-
-        if exptime then
-          ngx.timer.at(exptime, function()
-            self.data[key] = nil
-          end)
-          expire_at = ngx.now() + exptime
-        end
-
-        set(self.data, key, value, expire_at)
-        return true, nil, false
+        return self:set(key, value, exptime)
       end
       SharedDict.safe_add = SharedDict.add
       function SharedDict:replace(key, value)
-        if self.data[key] == nil then
+        if not get(key) then
           return false, "not found", false
         end
         set(self.data, key, value)
@@ -171,23 +314,17 @@ return function(options)
         return true
       end
       function SharedDict:incr(key, value, init, init_ttl)
-        if not self.data[key] then
+        local item = get(self.data, key)
+        if not item then
           if not init then
             return nil, "not found"
-          else
-            self.data[key] = { value = init, info = {} }
-            if init_ttl then
-              self.data[key].info.expire_at = ngx.now() + init_ttl
-              ngx.timer.at(init_ttl, function()
-                self.data[key] = nil
-              end)
-            end
           end
-        elseif type(self.data[key].value) ~= "number" then
+          item = set(self.data, key, init, init_ttl and ngx.now() + init_ttl)
+        elseif type(item.value) ~= "number" then
           return nil, "not a number"
         end
-        self.data[key].value = self.data[key].value + value
-        return self.data[key].value, nil
+        item.value = item.value + value
+        return item.value, nil
       end
       function SharedDict:flush_all()
         for _, item in pairs(self.data) do
@@ -199,7 +336,7 @@ return function(options)
         local flushed = 0
 
         for key, item in pairs(self.data) do
-          if item.info.expire_at and item.info.expire_at <= ngx.now() then
+          if is_stale(item) then
             data[key] = nil
             flushed = flushed + 1
             if n and flushed == n then
@@ -214,11 +351,13 @@ return function(options)
         n = n or 1024
         local i = 0
         local keys = {}
-        for k in pairs(self.data) do
-          keys[#keys+1] = k
-          i = i + 1
-          if n ~= 0 and i == n then
-            break
+        for k, item in pairs(self.data) do
+          if not is_stale(item) then
+            keys[#keys+1] = k
+            i = i + 1
+            if n ~= 0 and i == n then
+              break
+            end
           end
         end
         return keys
@@ -227,19 +366,15 @@ return function(options)
         local item = self.data[key]
         if item == nil then
           return nil, "not found"
-        else
-          local expire_at = item.info.expire_at
-          if expire_at == nil then
-            return 0
-          else
-            local remaining = expire_at - ngx.now()
-            if remaining < 0 then
-              return nil, "not found"
-            else
-              return remaining
-            end
-          end
         end
+        local expire_at = item.info.expire_at
+        if expire_at == nil then
+          return 0
+        end
+        -- There is a problem that also exists in the official OpenResty:
+        -- 0 means the key never expires. So it's hard to distinguish between a
+        -- never-expired key and an expired key with a TTL value of 0.
+        return expire_at - ngx.now()
       end
 
       -- hack
@@ -270,9 +405,13 @@ return function(options)
     --
     -- This patched method will create a unique seed per worker process,
     -- using a combination of both time and the worker's pid.
-    local util = require "kong.tools.utils"
+    local get_rand_bytes = require("kong.tools.rand").get_rand_bytes
     local seeded = {}
     local randomseed = math.randomseed
+
+    if options.rbusted then
+      _G.math.native_randomseed = randomseed
+    end
 
     _G.math.randomseed = function()
       local pid = ngx.worker.pid()
@@ -301,7 +440,7 @@ return function(options)
       end
 
       local seed
-      local bytes, err = util.get_rand_bytes(8)
+      local bytes, err = get_rand_bytes(8)
       if bytes then
         ngx.log(ngx.DEBUG, "seeding PRNG from OpenSSL RAND_bytes()")
 
@@ -377,10 +516,14 @@ return function(options)
     end
   end
 
-
-
   do -- cosockets connect patch for dns resolution for: cli, rbusted and OpenResty
     local sub = string.sub
+
+    local client = package.loaded["kong.resty.dns.client"]
+    if not client then
+      -- dns initialization here is essential for busted tests.
+      client = require("kong.tools.dns")()
+    end
 
     --- Patch the TCP connect and UDP setpeername methods such that all
     -- connections will be resolved first by the internal DNS resolver.
@@ -388,7 +531,6 @@ return function(options)
     require "resty.dns.resolver" -- will cache TCP and UDP functions
 
     -- STEP 2: forward declaration of locals to hold stuff loaded AFTER patching
-    local toip
 
     -- STEP 3: store original unpatched versions
     local old_tcp = ngx.socket.tcp
@@ -396,6 +538,8 @@ return function(options)
 
     local old_tcp_connect
     local old_udp_setpeername
+
+    local old_ngx_log = ngx.log
 
     -- need to do the extra check here: https://github.com/openresty/lua-nginx-module/issues/860
     local function strip_nils(first, second)
@@ -409,7 +553,7 @@ return function(options)
     local function resolve_connect(f, sock, host, port, opts)
       if sub(host, 1, 5) ~= "unix:" then
         local try_list
-        host, port, try_list = toip(host, port)
+        host, port, try_list = client.toip(host, port)
         if not host then
           return nil, "[cosocket] DNS resolution failed: " .. tostring(port) ..
                       ". Tried: " .. tostring(try_list)
@@ -452,23 +596,44 @@ return function(options)
       return sock
     end
 
-    -- STEP 5: load code that should be using the patched versions, if any (because of dependency chain)
-    do
-      local client = package.loaded["kong.resty.dns.client"]
-      if not client then
-        client = require("kong.tools.dns")()
+    -- OTel-formatted logs feature
+    local dynamic_hook = require "kong.dynamic_hook"
+    local hook_called = false
+    _G.ngx.log = function(...)
+      if hook_called then
+        -- detect recursive loops or yielding from the hook:
+        old_ngx_log(ngx.ERR, debug.traceback("concurrent execution detected for: ngx.log", 2))
+        return old_ngx_log(...)
       end
 
-      toip = client.toip
+      -- stack level = 5:
+      -- 1: maybe_push
+      -- 2: dynamic_hook.pcall
+      -- 3: dynamic_hook.run_hook
+      -- 4: patched function
+      -- 5: caller
+      hook_called = true
+      dynamic_hook.run_hook("observability_logs", "push", 5, nil, ...)
+      hook_called = false
+      return old_ngx_log(...)
+    end
+    -- export native ngx.log to be used where
+    -- the patched code must not be executed
+    _G.native_ngx_log = old_ngx_log
 
-      -- DNS query is lazily patched, it will only be wrapped
-      -- when instrumentation module is initialized later and
-      -- `opentelemetry_tracing` includes "dns_query" or set
-      -- to "all".
-      local instrumentation = require "kong.tracing.instrumentation"
-      instrumentation.set_patch_dns_query_fn(toip, function(wrap)
-        toip = wrap
-      end)
+    if not options.cli and not options.rbusted then
+      local timing = require "kong.timing"
+      timing.register_hooks()
+    end
+
+    -- STEP 5: load code that should be using the patched versions, if any (because of dependency chain)
+    do
+      -- dns query patch
+      local instrumentation = require "kong.observability.tracing.instrumentation"
+      client.toip = instrumentation.get_wrapped_dns_query(client.toip)
+
+      -- patch request_uri to record http_client spans
+      instrumentation.http_client()
     end
   end
 

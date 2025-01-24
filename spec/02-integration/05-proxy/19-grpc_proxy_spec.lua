@@ -4,15 +4,30 @@ local pl_path = require "pl.path"
 
 local FILE_LOG_PATH = os.tmpname()
 
+
+local function reload_router(flavor)
+  helpers = require("spec.internal.module").reload_helpers(flavor)
+end
+
+
+-- TODO: remove it when we confirm it is not needed
+local function gen_route(flavor, r)
+  return r
+end
+
+
+for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions" }) do
 for _, strategy in helpers.each_strategy() do
 
-  describe("gRPC Proxying [#" .. strategy .. "]", function()
+  describe("gRPC Proxying [#" .. strategy .. ", flavor = " .. flavor .. "]", function()
     local proxy_client_grpc
     local proxy_client_grpcs
     local proxy_client
     local proxy_client_ssl
     local proxy_client_h2c
     local proxy_client_h2
+
+    reload_router(flavor)
 
     lazy_setup(function()
       local bp = helpers.get_db_utils(strategy, {
@@ -54,38 +69,38 @@ for _, strategy in helpers.each_strategy() do
         target = "127.0.0.1:8765",
       })
 
-      assert(bp.routes:insert {
+      assert(bp.routes:insert(gen_route(flavor, {
         protocols = { "grpc" },
         hosts = { "grpc" },
         service = service1,
-      })
+      })))
 
-      assert(bp.routes:insert {
+      assert(bp.routes:insert(gen_route(flavor, {
         protocols = { "grpcs" },
         hosts = { "grpcs" },
         service = service2,
-      })
+      })))
 
-      assert(bp.routes:insert {
+      assert(bp.routes:insert(gen_route(flavor, {
         protocols = { "grpc" },
         hosts = { "grpc_authority_1.example" },
         service = mock_grpc_service,
         preserve_host = true,
-      })
+      })))
 
-      assert(bp.routes:insert {
+      assert(bp.routes:insert(gen_route(flavor, {
         protocols = { "grpc" },
         hosts = { "grpc_authority_2.example" },
         service = mock_grpc_service,
         preserve_host = false,
-      })
+      })))
 
-      assert(bp.routes:insert {
+      assert(bp.routes:insert(gen_route(flavor, {
         protocols = { "grpc" },
         hosts = { "grpc_authority_retry.example" },
         service = mock_grpc_service_retry,
         preserve_host = false,
-      })
+      })))
 
       assert(bp.plugins:insert {
         service = mock_grpc_service_retry,
@@ -103,7 +118,8 @@ for _, strategy in helpers.each_strategy() do
       fixtures.http_mock.my_server_block = [[
         server {
           server_name myserver;
-          listen 8765 http2;
+          listen 8765;
+          http2 on;
 
           location ~ / {
             content_by_lua_block {
@@ -115,6 +131,7 @@ for _, strategy in helpers.each_strategy() do
       ]]
 
       assert(helpers.start_kong({
+        router_flavor = flavor,
         database = strategy,
         nginx_conf       = "spec/fixtures/custom_nginx.template",
       }, nil, nil, fixtures))
@@ -357,9 +374,11 @@ for _, strategy in helpers.each_strategy() do
           }
         })
         assert.falsy(ok)
+
         assert.matches("Code: Canceled", resp, nil, true)
         assert.matches("Message: gRPC request matched gRPCs route", resp, nil, true)
       end)
     end)
   end)
 end
+end   -- flavor

@@ -39,18 +39,21 @@ end
 
 local phases = {
   ["%[logger%] init_worker phase"] = 1,
+  ["%[logger%] configure phase"] = 1,
   ["%[logger%] preread phase"] = 1,
   ["%[logger%] log phase"] = 1,
 }
 
 local phases_2 = {
   ["%[logger%] init_worker phase"] = 1,
+  ["%[logger%] configure phase"] = 1,
   ["%[logger%] preread phase"] = 0,
   ["%[logger%] log phase"] = 1,
 }
 
 local phases_tls = {
   ["%[logger%] init_worker phase"] = 1,
+  ["%[logger%] configure phase"] = 1,
   ["%[logger%] certificate phase"] = 1,
   ["%[logger%] preread phase"] = 1,
   ["%[logger%] log phase"] = 1,
@@ -58,6 +61,7 @@ local phases_tls = {
 
 local phases_tls_2 = {
   ["%[logger%] init_worker phase"] = 1,
+  ["%[logger%] configure phase"] = 1,
   ["%[logger%] certificate phase"] = 1,
   ["%[logger%] preread phase"] = 0,
   ["%[logger%] log phase"] = 1,
@@ -69,8 +73,23 @@ local function assert_phases(phrases)
   end
 end
 
+
+local function reload_router(flavor)
+  helpers = require("spec.internal.module").reload_helpers(flavor)
+end
+
+
+-- TODO: remove it when we confirm it is not needed
+local function gen_route(flavor, r)
+  return r
+end
+
+
+for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions" }) do
 for _, strategy in helpers.each_strategy() do
-  describe("#stream Proxying [#" .. strategy .. "]", function()
+  describe("#stream Proxying [#" .. strategy .. ", flavor = " .. flavor .. "]", function()
+    reload_router(flavor)
+
     local bp
 
     before_each(function()
@@ -89,7 +108,7 @@ for _, strategy in helpers.each_strategy() do
         protocol = "tcp"
       })
 
-      bp.routes:insert {
+      bp.routes:insert(gen_route(flavor, {
         destinations = {
           {
             port = 19000,
@@ -99,7 +118,7 @@ for _, strategy in helpers.each_strategy() do
           "tcp",
         },
         service = tcp_srv,
-      }
+      }))
 
       local tls_srv = bp.services:insert({
         name = "tls",
@@ -108,7 +127,7 @@ for _, strategy in helpers.each_strategy() do
         protocol = "tls"
       })
 
-      bp.routes:insert {
+      bp.routes:insert(gen_route(flavor, {
         destinations = {
           {
             port = 19443,
@@ -118,13 +137,14 @@ for _, strategy in helpers.each_strategy() do
           "tls",
         },
         service = tls_srv,
-      }
+      }))
 
       bp.plugins:insert {
         name = "logger",
       }
 
       assert(helpers.start_kong({
+        router_flavor = flavor,
         database   = strategy,
         nginx_conf = "spec/fixtures/custom_nginx.template",
         plugins = "logger",
@@ -163,7 +183,9 @@ for _, strategy in helpers.each_strategy() do
     end)
   end)
 
-  describe("#stream Proxying [#" .. strategy .. "]", function()
+  describe("#stream Proxying [#" .. strategy .. ", flavor = " .. flavor .. "]", function()
+    reload_router(flavor)
+
     local bp
 
     before_each(function()
@@ -183,7 +205,7 @@ for _, strategy in helpers.each_strategy() do
         protocol = "tcp"
       })
 
-      bp.routes:insert {
+      bp.routes:insert(gen_route(flavor, {
         destinations = {
           {
             port = 19000,
@@ -193,7 +215,7 @@ for _, strategy in helpers.each_strategy() do
           "tcp",
         },
         service = tcp_srv,
-      }
+      }))
 
       local tls_srv = bp.services:insert({
         name = "tls",
@@ -202,7 +224,7 @@ for _, strategy in helpers.each_strategy() do
         protocol = "tls"
       })
 
-      bp.routes:insert {
+      bp.routes:insert(gen_route(flavor, {
         destinations = {
           {
             port = 19443,
@@ -212,7 +234,7 @@ for _, strategy in helpers.each_strategy() do
           "tls",
         },
         service = tls_srv,
-      }
+      }))
 
       bp.plugins:insert {
         name = "logger",
@@ -227,6 +249,7 @@ for _, strategy in helpers.each_strategy() do
       }
 
       assert(helpers.start_kong({
+        router_flavor = flavor,
         database   = strategy,
         nginx_conf = "spec/fixtures/custom_nginx.template",
         plugins = "logger,short-circuit",
@@ -277,3 +300,4 @@ for _, strategy in helpers.each_strategy() do
     end)
   end)
 end
+end -- for flavor

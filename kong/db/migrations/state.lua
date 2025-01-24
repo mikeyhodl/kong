@@ -1,8 +1,10 @@
-local utils = require "kong.tools.utils"
 local log = require "kong.cmd.utils.log"
 local Schema = require "kong.db.schema"
 local Migration = require "kong.db.schema.others.migrations"
 local Errors = require "kong.db.errors"
+
+
+local load_module_if_exists = require "kong.tools.module".load_module_if_exists
 
 
 local MigrationSchema = Schema.new(Migration)
@@ -67,12 +69,12 @@ local function load_subsystems(db, plugin_names)
       for _, plugin_name in ipairs(sorted_plugin_names) do
         local namespace = ss.namespace:gsub("%*", plugin_name)
 
-        local ok, mig_idx = utils.load_module_if_exists(namespace)
+        local ok, mig_idx = load_module_if_exists(namespace)
 
         if not ok then
           -- fallback to using ".init" since "/?/init.lua" isn't always in a
           -- Lua-path by default, see https://github.com/Kong/kong/issues/6867
-          ok, mig_idx = utils.load_module_if_exists(namespace .. ".init")
+          ok, mig_idx = load_module_if_exists(namespace .. ".init")
         end
 
         if ok then
@@ -104,7 +106,7 @@ local function load_subsystems(db, plugin_names)
     for _, mig_name in ipairs(subsys.migrations_index) do
       local mig_module = fmt("%s.%s", subsys.namespace, mig_name)
 
-      local ok, migration = utils.load_module_if_exists(mig_module)
+      local ok, migration = load_module_if_exists(mig_module)
       if not ok then
         return nil, fmt_err(db, "failed to load migration '%s' of '%s' subsystem",
                             mig_module, subsys.name)
@@ -135,7 +137,6 @@ State.__index = State
 -- @return nil (no executed migrations for subsystem found) or an array with at
 -- least one element like:
 -- { name = "000_base",
---   cassandra = { up = string, teardown = function | nil },
 --   postgres = { up = string, teardown = function | nil }
 -- },
 local function get_executed_migrations_for_subsystem(self, subsystem_name)
@@ -175,7 +176,6 @@ end
 --                                          -- like "kong.plugins.acl.migrations
 --   migrations = { -- an array with at least one element like:
 --     { name = "000_base",
---       cassandra = { up = string, teardown = function | nil },
 --       postgres = { up = string, teardown = function | nil }
 --    },
 -- }
@@ -184,7 +184,7 @@ function State.load(db)
 
   log.debug("loading subsystems migrations...")
 
-  local subsystems, err = load_subsystems(db, db.kong_config.loaded_plugins)
+  local subsystems, err = load_subsystems(db, db.loaded_plugins)
   if not subsystems then
     return nil, prefix_err(db, err)
   end

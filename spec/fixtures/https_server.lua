@@ -9,10 +9,13 @@ local pl_dir = require "pl.dir"
 local pl_file = require "pl.file"
 local pl_template = require "pl.template"
 local pl_path = require "pl.path"
-local pl_stringx = require "pl.stringx"
 local uuid = require "resty.jit-uuid"
 local http_client = require "resty.http"
 local cjson = require "cjson"
+local shell = require "resty.shell"
+
+
+local Template = require("pl.stringx").Template
 
 
 -- we need this to get random UUIDs
@@ -61,7 +64,7 @@ local function create_conf(params)
     return nil, err
   end
 
-  local compiled_tpl = pl_stringx.Template(tpl:render(params, { ipairs = ipairs }))
+  local compiled_tpl = Template(tpl:render(params, { ipairs = ipairs }))
   local conf_filename = params.base_path .. "/nginx.conf"
   local conf, err = io.open (conf_filename, "w")
   if err then
@@ -183,6 +186,7 @@ function https_server.start(self)
     http_port = self.http_port,
     protocol = self.protocol,
     worker_num = self.worker_num,
+    disable_ipv6 = self.disable_ipv6,
   }
 
   local file, err = create_conf(conf_params)
@@ -191,7 +195,7 @@ function https_server.start(self)
   end
 
   for _ = 1, HTTPS_SERVER_START_MAX_RETRY do
-    if os.execute("nginx -c " .. file .. " -p " .. self.base_path) then
+    if shell.run("nginx -c " .. file .. " -p " .. self.base_path, nil, 0) then
       return
     end
 
@@ -212,7 +216,7 @@ function https_server.shutdown(self)
     end
 
     local kill_nginx_cmd = fmt("kill -s TERM %s", tostring(pid))
-    local status = os.execute(kill_nginx_cmd)
+    local status = shell.run(kill_nginx_cmd, nil, 0)
     if not status then
       error(fmt("could not kill nginx test server. %s was not removed", self.base_path), 2)
     end
@@ -245,8 +249,8 @@ function https_server.shutdown(self)
   return count
 end
 
-
-function https_server.new(port, hostname, protocol, check_hostname, workers, delay)
+-- **DEPRECATED**: please use `spec.helpers.http_mock` instead.
+function https_server.new(port, hostname, protocol, check_hostname, workers, delay, disable_ipv6)
   local self = setmetatable({}, https_server)
   local host
   local hosts
@@ -270,6 +274,7 @@ function https_server.new(port, hostname, protocol, check_hostname, workers, del
   self.logs_dir = "logs"
   self.protocol = protocol or "http"
   self.worker_num = workers or 2
+  self.disable_ipv6 = disable_ipv6
 
   return self
 end

@@ -1,5 +1,5 @@
 local endpoints = require "kong.api.endpoints"
-local utils = require "kong.tools.utils"
+local uuid = require "kong.tools.uuid"
 
 
 local kong = kong
@@ -21,11 +21,16 @@ local function set_target_health(self, db, is_healthy)
   end
 
   local target
-  if utils.is_valid_uuid(unescape_uri(self.params.targets)) then
+  if uuid.is_valid_uuid(unescape_uri(self.params.targets)) then
     target, _, err_t = endpoints.select_entity(self, db, db.targets.schema)
 
   else
-    local opts = endpoints.extract_options(self.args.uri, db.targets.schema, "select")
+    local opts
+    opts, _, err_t = endpoints.extract_options(db, self.args.uri, db.targets.schema, "select")
+    if err_t then
+      return endpoints.handle_error(err_t)
+    end
+
     local upstream_pk = db.upstreams.schema:extract_pk_values(upstream)
     local filter = { target = unescape_uri(self.params.targets) }
     target, _, err_t = db.targets:select_by_upstream_filter(upstream_pk, filter, opts)
@@ -90,11 +95,15 @@ local function target_endpoint(self, db, callback)
   end
 
   local target
-  if utils.is_valid_uuid(unescape_uri(self.params.targets)) then
+  if uuid.is_valid_uuid(unescape_uri(self.params.targets)) then
     target, _, err_t = endpoints.select_entity(self, db, db.targets.schema)
 
   else
-    local opts = endpoints.extract_options(self.args.uri, db.targets.schema, "select")
+    local opts
+    opts, _, err_t = endpoints.extract_options(db, self.args.uri, db.targets.schema, "select")
+    if err_t then
+      return endpoints.handle_error(err_t)
+    end
     local upstream_pk = db.upstreams.schema:extract_pk_values(upstream)
     local filter = { target = unescape_uri(self.params.targets) }
     target, _, err_t = db.targets:select_by_upstream_filter(upstream_pk, filter, opts)

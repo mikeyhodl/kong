@@ -1,5 +1,5 @@
 -- Copyright (C) Kong Inc.
-local uuid = require "kong.tools.utils".uuid
+local uuid = require "kong.tools.uuid".uuid
 local kong_meta = require "kong.meta"
 
 
@@ -42,7 +42,7 @@ end
 local CorrelationIdHandler = {}
 
 
-CorrelationIdHandler.PRIORITY = 1
+CorrelationIdHandler.PRIORITY = 100001
 CorrelationIdHandler.VERSION = kong_meta.version
 
 
@@ -62,6 +62,8 @@ function CorrelationIdHandler:access(conf)
       kong.service.request.set_header(conf.header_name, correlation_id)
     end
   end
+
+  kong.log.set_serialize_value("correlation_id", correlation_id)
 
   if conf.echo_downstream then
     -- For later use, to echo it back downstream

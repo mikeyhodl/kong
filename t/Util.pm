@@ -28,6 +28,10 @@ our $InitByLuaBlockConfig = <<_EOC_;
     if os.getenv("PDK_PHASE_CHECKS_LUACOV") == "1" then
         require("luacov.runner")("t/phase_checks.luacov")
         jit.off()
+    
+    elseif os.getenv("PDK_LUACOV") == "1" then
+        require("luacov.runner")("t/pdk.luacov")
+        jit.off()
     end
 
     local private_phases = require("kong.pdk.private.phases")
@@ -132,6 +136,7 @@ our $InitByLuaBlockConfig = <<_EOC_;
 
             if not forced_false
                 and ok1 == false
+                and err1
                 and not err1:match("attempt to index field ")
                 and not err1:match("API disabled in the ")
                 and not err1:match("headers have already been sent") then
@@ -166,7 +171,7 @@ our $InitByLuaBlockConfig = <<_EOC_;
                 end
 
                 -- if failed with OpenResty phase error
-                if err1:match("API disabled in the ") then
+                if err1 and err1:match("API disabled in the ") then
                     -- should replace with a Kong error
                     if not err2:match("function cannot be called") then
                         log(ERR, msg, "a Kong-generated error; got: ", (err2:gsub(",", ";")))

@@ -1,8 +1,10 @@
 local cjson = require "cjson"
 local declarative = require "kong.db.declarative"
 local helpers = require "spec.helpers"
-local utils = require "kong.tools.utils"
+local format_host = require("kong.tools.ip").format_host
+local kong_table = require "kong.tools.table"
 local https_server = require "spec.fixtures.https_server"
+local uuid = require("kong.tools.uuid").uuid
 
 
 local CONSISTENCY_FREQ = 1
@@ -49,7 +51,7 @@ local prefix = ""
 
 
 local function healthchecks_config(config)
-  return utils.deep_merge(healthchecks_defaults, config)
+  return kong_table.cycle_aware_deep_merge(healthchecks_defaults, config)
 end
 
 
@@ -86,7 +88,7 @@ local function put_target_endpoint(upstream_id, host, port, endpoint)
   end
   local path = "/upstreams/" .. upstream_id
                              .. "/targets/"
-                             .. utils.format_host(host, port)
+                             .. format_host(host, port)
                              .. "/" .. endpoint
   local api_client = helpers.admin_client()
   local res, err = assert(api_client:put(prefix .. path, {
@@ -99,11 +101,42 @@ local function put_target_endpoint(upstream_id, host, port, endpoint)
   return res, err
 end
 
+-- client_sync_request requires a route with
+-- hosts = { "200.test" } to sync requests
+local function client_sync_request(proxy_host , proxy_port)
+  -- kong have two port 9100(TCP) and 80(HTTP)
+  -- we just need to request http
+  if proxy_port == 9100 then
+    proxy_port = 80
+  end
+  local proxy_client = helpers.proxy_client({
+    host = proxy_host,
+    port = proxy_port,
+  })
+
+  local res = assert(proxy_client:send {
+      method  = "GET",
+      headers = {
+        ["Host"] = "200.test",
+      },
+      path = "/",
+  })
+  local status = res.status
+  proxy_client:close()
+  return status == 200
+end
 
 local function client_requests(n, host_or_headers, proxy_host, proxy_port, protocol, uri)
   local oks, fails = 0, 0
   local last_status
   for _ = 1, n do
+    -- hack sync avoid concurrency request
+    -- There is an issue here, if a request is completed and a response is received,
+    -- it does not necessarily mean that the log phase has been executed
+    -- (many operations require execution in the log phase, such as passive health checks),
+    -- so we need to ensure that the log phase has been completely executed here.
+    -- We choose to wait here for the log phase of the last connection to finish.
+    client_sync_request(proxy_host, proxy_port)
     local client
     if proxy_host and proxy_port then
       client = helpers.http_client({
@@ -196,16 +229,16 @@ do
   end
 
   add_certificate = function(bp, data)
-    local certificate_id = utils.uuid()
-    local req = utils.deep_copy(data) or {}
+    local certificate_id = uuid()
+    local req = kong_table.cycle_aware_deep_copy(data) or {}
     req.id = certificate_id
     bp.certificates:insert(req)
     return certificate_id
   end
 
   add_upstream = function(bp, data)
-    local upstream_id = utils.uuid()
-    local req = utils.deep_copy(data) or {}
+    local upstream_id = uuid()
+    local req = kong_table.cycle_aware_deep_copy(data) or {}
     local upstream_name = req.name or gen_sym("upstream")
     req.name = upstream_name
     req.slots = req.slots or SLOTS
@@ -280,11 +313,11 @@ do
 
   add_target = function(bp, upstream_id, host, port, data)
     port = port or get_available_port()
-    local req = utils.deep_copy(data) or {}
+    local req = kong_table.cycle_aware_deep_copy(data) or {}
     if host == "[::1]" then
       host = "[0000:0000:0000:0000:0000:0000:0000:0001]"
     end
-    req.target = req.target or utils.format_host(host, port)
+    req.target = req.target or format_host(host, port)
     req.weight = req.weight or 10
     req.upstream = { id = upstream_id }
     local new_target = bp.targets:insert(req)
@@ -292,11 +325,11 @@ do
   end
 
   update_target = function(bp, upstream_id, host, port, data)
-    local req = utils.deep_copy(data) or {}
+    local req = kong_table.cycle_aware_deep_copy(data) or {}
     if host == "[::1]" then
       host = "[0000:0000:0000:0000:0000:0000:0000:0001]"
     end
-    req.target = req.target or utils.format_host(host, port)
+    req.target = req.target or format_host(host, port)
     req.weight = req.weight or 10
     req.upstream = { id = upstream_id }
     bp.targets:update(req.id or req.target, req)
@@ -304,8 +337,8 @@ do
 
   add_api = function(bp, upstream_name, opts)
     opts = opts or {}
-    local route_id = utils.uuid()
-    local service_id = utils.uuid()
+    local route_id = uuid()
+    local service_id = uuid()
     local route_host = gen_sym("host")
     local sproto = opts.service_protocol or opts.route_protocol or "http"
     local rproto = opts.route_protocol or "http"
@@ -314,6 +347,20 @@ do
     local rpaths = {
       "/",
       "~/(?<namespace>[^/]+)/(?<id>[0-9]+)/?", -- uri capture hash value
+    }
+
+    -- add a 200 route to sync kong async thread
+    local route = bp.routes:insert {
+      hosts = { "200.test" },
+    }
+
+    bp.plugins:insert {
+      route = route,
+      name = "request-termination",
+      config = {
+        status_code = 200,
+        message = "Terminated"
+      },
     }
 
     bp.services:insert({

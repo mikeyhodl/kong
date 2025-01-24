@@ -1,6 +1,6 @@
 local Errors  = require "kong.db.errors"
 local helpers = require "spec.helpers"
-local utils   = require "kong.tools.utils"
+local uuid   = require "kong.tools.uuid"
 
 
 local fmt = string.format
@@ -66,9 +66,7 @@ for _, strategy in helpers.each_strategy() do
         -- I/O
         it("returns existing Unique Foreign", function()
           for i = 1, 5 do
-            local unique_reference, err, err_t = db.unique_references:select_by_unique_foreign({
-              id = unique_foreigns[i].id,
-            })
+            local unique_reference, err, err_t = db.unique_references:select_by_unique_foreign(unique_foreigns[i])
 
             assert.is_nil(err)
             assert.is_nil(err_t)
@@ -80,7 +78,7 @@ for _, strategy in helpers.each_strategy() do
         it("returns nothing on non-existing Unique Foreign", function()
           for i = 1, 5 do
             local unique_reference, err, err_t = db.unique_references:select_by_unique_foreign({
-              id = utils.uuid()
+              id = uuid.uuid()
             })
 
             assert.is_nil(err)
@@ -99,9 +97,7 @@ for _, strategy in helpers.each_strategy() do
         end)
 
         it("errors on invalid values", function()
-          local unique_reference, err, err_t = db.unique_references:update_by_unique_foreign({
-            id = unique_foreigns[1].id,
-          }, {
+          local unique_reference, err, err_t = db.unique_references:update_by_unique_foreign(unique_foreigns[1], {
             note = 123,
           })
           assert.is_nil(unique_reference)
@@ -120,7 +116,7 @@ for _, strategy in helpers.each_strategy() do
 
         -- I/O
         it("returns not found error", function()
-          local uuid = utils.uuid()
+          local uuid = uuid.uuid()
           local unique_reference, err, err_t = db.unique_references:update_by_unique_foreign({
             id = uuid,
           }, {
@@ -135,27 +131,21 @@ for _, strategy in helpers.each_strategy() do
         end)
 
         it("updates an existing Unique Reference", function()
-          local unique_reference, err, err_t = db.unique_references:update_by_unique_foreign({
-              id = unique_foreigns[1].id,
-            }, {
+          local unique_reference, err, err_t = db.unique_references:update_by_unique_foreign(unique_foreigns[1], {
             note = "note updated",
           })
           assert.is_nil(err_t)
           assert.is_nil(err)
           assert.equal("note updated", unique_reference.note)
 
-          local unique_reference_in_db, err, err_t = db.unique_references:select({
-            id = unique_reference.id
-          })
+          local unique_reference_in_db, err, err_t = db.unique_references:select(unique_reference)
           assert.is_nil(err_t)
           assert.is_nil(err)
           assert.equal("note updated", unique_reference_in_db.note)
         end)
 
         it("cannot update a Unique Reference to be an already existing Unique Foreign", function()
-          local updated_service, _, err_t = db.unique_references:update_by_unique_foreign({
-            id = unique_foreigns[1].id,
-          }, {
+          local updated_service, _, err_t = db.unique_references:update_by_unique_foreign(unique_foreigns[1], {
             unique_foreign = {
               id = unique_foreigns[2].id,
             }
@@ -184,9 +174,7 @@ for _, strategy in helpers.each_strategy() do
         end)
 
         it("errors on invalid values", function()
-          local unique_reference, err, err_t = db.unique_references:upsert_by_unique_foreign({
-            id = unique_foreigns[1].id,
-          }, {
+          local unique_reference, err, err_t = db.unique_references:upsert_by_unique_foreign(unique_foreigns[1], {
             note = 123,
           })
           assert.is_nil(unique_reference)
@@ -205,7 +193,7 @@ for _, strategy in helpers.each_strategy() do
 
         -- I/O
         it("returns not found error", function()
-          local uuid = utils.uuid()
+          local uuid = uuid.uuid()
           local unique_reference, err, err_t = db.unique_references:upsert_by_unique_foreign({
             id = uuid,
           }, {
@@ -220,18 +208,14 @@ for _, strategy in helpers.each_strategy() do
         end)
 
         it("upserts an existing Unique Reference", function()
-          local unique_reference, err, err_t = db.unique_references:upsert_by_unique_foreign({
-            id = unique_foreigns[1].id,
-          }, {
+          local unique_reference, err, err_t = db.unique_references:upsert_by_unique_foreign(unique_foreigns[1], {
             note = "note updated",
           })
           assert.is_nil(err_t)
           assert.is_nil(err)
           assert.equal("note updated", unique_reference.note)
 
-          local unique_reference_in_db, err, err_t = db.unique_references:select({
-            id = unique_reference.id
-          })
+          local unique_reference_in_db, err, err_t = db.unique_references:select(unique_reference)
           assert.is_nil(err_t)
           assert.is_nil(err)
           assert.equal("note updated", unique_reference_in_db.note)
@@ -241,9 +225,7 @@ for _, strategy in helpers.each_strategy() do
           -- TODO: this is slightly unexpected, but it has its uses when thinking about idempotency
           --       of `PUT`. This has been like that with other DAO methods do, but perhaps we want
           --       to revisit this later.
-          local unique_reference, err, err_t = db.unique_references:upsert_by_unique_foreign({
-            id = unique_foreigns[1].id,
-          }, {
+          local unique_reference, err, err_t = db.unique_references:upsert_by_unique_foreign(unique_foreigns[1], {
             unique_foreign = {
               id = unique_foreigns[2].id,
             }
@@ -257,9 +239,7 @@ for _, strategy in helpers.each_strategy() do
 
       describe(":update()", function()
         it("cannot update a Unique Reference to be an already existing Unique Foreign", function()
-          local updated_unique_reference, _, err_t = db.unique_references:update({
-            id = unique_references[1].id,
-          }, {
+          local updated_unique_reference, _, err_t = db.unique_references:update(unique_references[1], {
             unique_foreign = {
               id = unique_foreigns[2].id,
             }
@@ -284,9 +264,7 @@ for _, strategy in helpers.each_strategy() do
             name = "new unique foreign",
           }))
 
-          local updated_unique_reference, err, err_t = db.unique_references:update({
-            id = unique_references[1].id,
-          }, {
+          local updated_unique_reference, err, err_t = db.unique_references:update(unique_references[1], {
             note = "updated note",
             unique_foreign = {
               id = unique_foreign.id,
@@ -327,7 +305,7 @@ for _, strategy in helpers.each_strategy() do
         -- I/O
         it("returns nothing if the Unique Foreign does not exist", function()
           local ok, err, err_t = db.unique_references:delete_by_unique_foreign({
-            id = utils.uuid()
+            id = uuid.uuid()
           })
           assert.is_true(ok)
           assert.is_nil(err_t)
@@ -335,16 +313,12 @@ for _, strategy in helpers.each_strategy() do
         end)
 
         it("deletes an existing Unique Reference", function()
-          local ok, err, err_t = db.unique_references:delete_by_unique_foreign({
-            id = unique_foreign.id,
-          })
+          local ok, err, err_t = db.unique_references:delete_by_unique_foreign(unique_foreign)
           assert.is_nil(err_t)
           assert.is_nil(err)
           assert.is_true(ok)
 
-          local unique_reference, err, err_t = db.unique_references:select({
-            id = unique_reference.id
-          })
+          local unique_reference, err, err_t = db.unique_references:select(unique_reference)
           assert.is_nil(err_t)
           assert.is_nil(err)
           assert.is_nil(unique_reference)

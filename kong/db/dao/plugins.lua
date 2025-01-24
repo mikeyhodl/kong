@@ -1,16 +1,18 @@
 local constants = require "kong.constants"
-local utils = require "kong.tools.utils"
 local DAO = require "kong.db.dao"
 local plugin_loader = require "kong.db.schema.plugin_loader"
 local reports = require "kong.reports"
 local plugin_servers = require "kong.runloop.plugin_servers"
+local wasm_plugins = require "kong.runloop.wasm.plugins"
 local version = require "version"
-local sort_by_handler_priority = utils.sort_by_handler_priority
+local load_module_if_exists = require "kong.tools.module".load_module_if_exists
+
 
 local Plugins = {}
 
 
 local fmt = string.format
+local type = type
 local null = ngx.null
 local pairs = pairs
 local tostring = tostring
@@ -64,9 +66,8 @@ local function check_protocols_match(self, plugin)
       })
       return nil, tostring(err_t), err_t
     end
-  end
 
-  if type(plugin.service) == "table" then
+  elseif type(plugin.service) == "table" then
     if not has_common_protocol_with_service(self, plugin, plugin.service) then
       local err_t = self.errors:schema_violation({
         protocols = "must match the protocols of at least one route " ..
@@ -89,15 +90,23 @@ end
 
 
 function Plugins:update(primary_key, entity, options)
-  local rbw_entity = self.super.select(self, primary_key, options) -- ignore errors
-  if rbw_entity then
-    entity = self.schema:merge_values(entity, rbw_entity)
+  if entity.protocols or entity.service or entity.route then
+    if (entity.protocols and not entity.route)
+    or (entity.service and not entity.protocols)
+    or (entity.route and not entity.protocols)
+    then
+      local rbw_entity = self.super.select(self, primary_key, options)
+      if rbw_entity then
+        entity.protocols = entity.protocols or rbw_entity.protocols
+        entity.service = entity.service or rbw_entity.service
+        entity.route = entity.route or rbw_entity.route
+      end
+    end
+    local ok, err, err_t = check_protocols_match(self, entity)
+    if not ok then
+      return nil, err, err_t
+    end
   end
-  local ok, err, err_t = check_protocols_match(self, entity)
-  if not ok then
-    return nil, err, err_t
-  end
-
   return self.super.update(self, primary_key, entity, options)
 end
 
@@ -151,7 +160,14 @@ local load_plugin_handler do
     -- NOTE: no version _G.kong (nor PDK) in plugins main chunk
 
     local plugin_handler = "kong.plugins." .. plugin .. ".handler"
-    local ok, handler = utils.load_module_if_exists(plugin_handler)
+    local ok, handler = load_module_if_exists(plugin_handler)
+    if not ok then
+      ok, handler = wasm_plugins.load_plugin(plugin)
+      if type(handler) == "table" then
+        handler._wasm = true
+      end
+    end
+
     if not ok then
       ok, handler = plugin_servers.load_plugin(plugin)
       if type(handler) == "table" then
@@ -203,7 +219,7 @@ local function load_plugin_entity_strategy(schema, db, plugin)
 
   local custom_strat = fmt("kong.plugins.%s.strategies.%s.%s",
                            plugin, db.strategy, schema.name)
-  local exists, mod = utils.load_module_if_exists(custom_strat)
+  local exists, mod = load_module_if_exists(custom_strat)
   if exists and mod then
     local parent_mt = getmetatable(strategy)
     local mt = {
@@ -336,6 +352,23 @@ function Plugins:load_plugin_schemas(plugin_set)
 end
 
 
+---
+-- Sort by handler priority and check for collisions. In case of a collision
+-- sorting will be applied based on the plugin's name.
+-- @tparam table plugin table containing `handler` table and a `name` string
+-- @tparam table plugin table containing `handler` table and a `name` string
+-- @treturn boolean outcome of sorting
+local sort_by_handler_priority = function (a, b)
+  local prio_a = a.handler.PRIORITY or 0
+  local prio_b = b.handler.PRIORITY or 0
+  if prio_a == prio_b and not
+      (prio_a == 0 or prio_b == 0) then
+    return a.name > b.name
+  end
+  return prio_a > prio_b
+end
+
+
 -- Requires Plugins:load_plugin_schemas to be loaded first
 -- @return an array where each element has the format { name = "keyauth", handler = function() .. end }. Or nil, error
 function Plugins:get_handlers()
@@ -353,6 +386,24 @@ function Plugins:get_handlers()
   table.sort(list, sort_by_handler_priority)
 
   return list
+end
+
+-- @ca_id: the id of ca certificate to be searched
+-- @limit: the maximum number of entities to return (must >= 0)
+-- @plugin_names: the plugin names to filter the entities (must be of type table, string or nil)
+-- @return an array of the plugin entity
+function Plugins:select_by_ca_certificate(ca_id, limit, plugin_names)
+  local param_type = type(plugin_names)
+  if param_type ~= "table" and param_type ~= "string" and param_type ~= "nil" then
+    return nil, "parameter `plugin_names` must be of type table, string, or nil"
+  end
+
+  local plugins, err = self.strategy:select_by_ca_certificate(ca_id, limit, plugin_names)
+  if err then
+    return nil, err
+  end
+
+  return self:rows_to_entities(plugins), nil
 end
 
 

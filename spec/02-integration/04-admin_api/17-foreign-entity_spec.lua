@@ -1,6 +1,6 @@
 local helpers = require "spec.helpers"
 local cjson = require "cjson"
-local utils = require "kong.tools.utils"
+local uuid = require "kong.tools.uuid"
 local Errors = require "kong.db.errors"
 
 
@@ -30,10 +30,14 @@ for _, strategy in helpers.each_strategy() do
         [[./spec/fixtures/custom_plugins/?.lua;]]..
         [[./spec/fixtures/custom_plugins/?/init.lua;" ]]
 
+      -- bootstrap db in case it's not done yet
+      -- ignore errors if it's already bootstrapped
+      helpers.kong_exec("migrations bootstrap -c " .. helpers.test_conf_path, env, true, lua_path)
+
       local cmdline = "migrations up -c " .. helpers.test_conf_path
       local _, code, _, stderr = helpers.kong_exec(cmdline, env, true, lua_path)
-      assert.same(0, code)
       assert.equal("", stderr)
+      assert.same(0, code)
 
       local _
       _, db = helpers.get_db_utils(strategy, {
@@ -51,7 +55,7 @@ for _, strategy in helpers.each_strategy() do
     end)
 
     lazy_teardown(function()
-      helpers.stop_kong(nil, true)
+      helpers.stop_kong()
     end)
 
     before_each(function()
@@ -76,8 +80,8 @@ for _, strategy in helpers.each_strategy() do
           local json = cjson.decode(body)
           assert.same(foreign_entity, json)
 
-          assert(db.foreign_references:delete({ id = foreign_reference.id }))
-          assert(db.foreign_entities:delete({ id = foreign_entity.id }))
+          assert(db.foreign_references:delete(foreign_reference))
+          assert(db.foreign_entities:delete(foreign_entity))
         end)
 
         it("retrieves by name", function()
@@ -90,12 +94,12 @@ for _, strategy in helpers.each_strategy() do
           local json = cjson.decode(body)
           assert.same(foreign_entity, json)
 
-          assert(db.foreign_references:delete({ id = foreign_reference.id }))
-          assert(db.foreign_entities:delete({ id = foreign_entity.id }))
+          assert(db.foreign_references:delete(foreign_reference))
+          assert(db.foreign_entities:delete(foreign_entity))
         end)
 
         it("returns 404 if not found", function()
-          local res = client:get("/foreign-references/" .. utils.uuid() .. "/same")
+          local res = client:get("/foreign-references/" .. uuid.uuid() .. "/same")
           assert.res_status(404, res)
         end)
 
@@ -116,8 +120,8 @@ for _, strategy in helpers.each_strategy() do
           })
           assert.res_status(200, res)
 
-          assert(db.foreign_references:delete({ id = foreign_reference.id }))
-          assert(db.foreign_entities:delete({ id = foreign_entity.id }))
+          assert(db.foreign_references:delete(foreign_reference))
+          assert(db.foreign_entities:delete(foreign_entity))
         end)
       end)
 
@@ -145,11 +149,11 @@ for _, strategy in helpers.each_strategy() do
             local json = cjson.decode(body)
             assert.equal(edited_name, json.name)
 
-            local in_db = assert(db.foreign_entities:select({ id = foreign_entity.id }, { nulls = true }))
+            local in_db = assert(db.foreign_entities:select(foreign_entity, { nulls = true }))
             assert.same(json, in_db)
 
-            assert(db.foreign_references:delete({ id = foreign_reference.id }))
-            assert(db.foreign_entities:delete({ id = foreign_entity.id }))
+            assert(db.foreign_references:delete(foreign_reference))
+            assert(db.foreign_entities:delete(foreign_entity))
           end
         end)
 
@@ -175,18 +179,18 @@ for _, strategy in helpers.each_strategy() do
             local json = cjson.decode(body)
             assert.equal(edited_name, json.name)
 
-            local in_db = assert(db.foreign_entities:select({ id = foreign_entity.id }, { nulls = true }))
+            local in_db = assert(db.foreign_entities:select(foreign_entity, { nulls = true }))
             assert.same(json, in_db)
 
-            assert(db.foreign_references:delete({ id = foreign_reference.id }))
-            assert(db.foreign_entities:delete({ id = foreign_entity.id }))
+            assert(db.foreign_references:delete(foreign_reference))
+            assert(db.foreign_entities:delete(foreign_entity))
           end
         end)
 
         describe("errors", function()
           it_content_types("returns 404 if not found", function(content_type)
             return function()
-              local res = client:patch("/foreign-references/" .. utils.uuid() .. "/same", {
+              local res = client:patch("/foreign-references/" .. uuid.uuid() .. "/same", {
                 headers = {
                   ["Content-Type"] = content_type
                 },
@@ -220,8 +224,8 @@ for _, strategy in helpers.each_strategy() do
                 },
               }, cjson.decode(body))
 
-              assert(db.foreign_references:delete({ id = foreign_reference.id }))
-              assert(db.foreign_entities:delete({ id = foreign_entity.id }))
+              assert(db.foreign_references:delete(foreign_reference))
+              assert(db.foreign_entities:delete(foreign_entity))
             end
           end)
         end)
@@ -236,17 +240,17 @@ for _, strategy in helpers.each_strategy() do
             local body = assert.res_status(405, res)
             assert.same({ message = 'Method not allowed' }, cjson.decode(body))
 
-            assert(db.foreign_references:delete({ id = foreign_reference.id }))
-            assert(db.foreign_entities:delete({ id = foreign_entity.id }))
+            assert(db.foreign_references:delete(foreign_reference))
+            assert(db.foreign_entities:delete(foreign_entity))
           end)
 
           it("returns HTTP 404 with non-existing foreign entity ", function()
-            local res = client:delete("/foreign-entities/" .. utils.uuid() .. "/foreign-references/" .. utils.uuid())
+            local res = client:delete("/foreign-entities/" .. uuid.uuid() .. "/foreign-references/" .. uuid.uuid())
             assert.res_status(404, res)
           end)
 
           it("returns HTTP 404 with non-existing foreign reference", function()
-            local res = client:delete("/foreign-references/" .. utils.uuid() .. "/same")
+            local res = client:delete("/foreign-references/" .. uuid.uuid() .. "/same")
             assert.res_status(404, res)
           end)
 
@@ -254,6 +258,27 @@ for _, strategy in helpers.each_strategy() do
             local res = client:delete("/foreign-references/in-existent-route/same")
             assert.res_status(404, res)
           end)
+        end)
+
+        it("invalidates cache on deletion", function()
+          -- Create foreign entity and reference
+          local foreign_entity = assert(db.foreign_entities:insert({ name = "foreign-entity-cache" }, { nulls = true }))
+
+          -- Load foreign entity and reference into cache
+          local res  = client:get("/foreign_entities_cache_warmup/" .. foreign_entity.name)
+          assert.res_status(200, res)
+
+          -- use kong's /cache endpoint to verify foreign_entity is in cache
+          local cache_key = db.foreign_entities:cache_key(foreign_entity)
+          local res  = client:get("/cache/" .. cache_key)
+          assert.res_status(200, res)
+
+          -- delete foreign_entities entity
+          res = client:delete("/foreign-entities/" .. foreign_entity.id)
+          assert.res_status(204, res)
+          -- ensure cache is gone
+          local res  = client:get("/cache/" .. cache_key)
+          assert.res_status(404, res)
         end)
       end)
     end)

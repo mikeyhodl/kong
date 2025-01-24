@@ -32,7 +32,7 @@ for _, strategy in helpers.each_strategy() do
 
       for i = 1, test_entity_count do
         local service = {
-          host = "example-" .. i .. ".com",
+          host = "example-" .. i .. ".test",
           name = "service" .. i,
           tags = { "team_ a", "level "..fmod(i, 5), "service"..i }
         }
@@ -109,7 +109,7 @@ for _, strategy in helpers.each_strategy() do
         it(func, function()
           local tags = { "team_b_" .. func, "team_ a" }
           local row, err, err_t = db.services[func](db.services,
-          key, { tags = tags, host = 'whatever.com' })
+          key, { tags = tags, host = 'whatever.test' })
 
           assert.is_nil(err)
           assert.is_nil(err_t)
@@ -188,9 +188,9 @@ for _, strategy in helpers.each_strategy() do
       -- due to the different sql in postgres stragey
       -- we need to test these two methods seperately
       -- note this is different from test "update row in tags table with"
-      -- as this test actually creats new records
+      -- as this test actually creates new records
       local scenarios = {
-        { "upsert", { id = require("kong.tools.utils").uuid() }, { "service-upsert-1" } },
+        { "upsert", { id = require("kong.tools.uuid").uuid() }, { "service-upsert-1" } },
         { "upsert_by_name", "service-upsert-2", { "service-upsert-2" } },
       }
       for _, scenario in pairs(scenarios) do
@@ -198,7 +198,7 @@ for _, strategy in helpers.each_strategy() do
 
         it(func, function()
           local row, err, err_t = db.services[func](db.services,
-          key, { tags = tags, host = 'whatever.com' })
+          key, { tags = tags, host = 'whatever.test' })
 
           assert.is_nil(err)
           assert.is_nil(err_t)
@@ -221,7 +221,7 @@ for _, strategy in helpers.each_strategy() do
       local total_entities_count = 100
       for i = 1, total_entities_count do
         local service = {
-          host = "anotherexample-" .. i .. ".org",
+          host = "anotherexample-" .. i .. ".test",
           name = "service-paging" .. i,
           tags = { "paging", "team_paging_" .. fmod(i, 5), "irrelevant_tag" }
         }
@@ -303,64 +303,6 @@ for _, strategy in helpers.each_strategy() do
         end
       end
 
-      local func = pending
-      if strategy == "cassandra" then
-        func = describe
-      end
-
-      func("limits maximum queries in single request", function()
-        local match = require("luassert.match")
-        -- Might be flaky because it depends on how cassandra partition/order row
-        it("and exits early if PAGING_MAX_QUERY_ROUNDS exceeded", function()
-          stub(ngx, "log")
-
-          local rows, err, err_t, offset = db.services:page(2, nil,
-            { tags = { "paging", "tag_notexist" }, tags_cond = 'and' })
-          assert(is_valid_page(rows, err, err_t))
-          assert.is_not_nil(offset)
-          -- actually #rows will be 0 in this certain test case,
-          -- but put as < 2(size) as it's what logically expected
-          assert.is_true(#rows < 2)
-
-          assert.stub(ngx.log).was_called()
-          assert.stub(ngx.log).was_called_with(ngx.WARN, match.is_same("maximum "),  match.is_same(20),
-                                        match.is_same(" rounds exceeded "),
-                                        match.is_same("without retrieving required size of rows, "),
-                                        match.is_same("consider lower the sparsity of tags, or increase the paging size per request"))
-        end)
-
-        local enough_page_size = total_entities_count/single_tag_count
-        it("and doesn't throw warning if page size is large enough", function()
-          stub(ngx, "log")
-
-          local rows, err, err_t, offset = db.services:page(enough_page_size, nil,
-            { tags = { "paging", "tag_notexist" }, tags_cond = 'and' })
-          assert(is_valid_page(rows, err, err_t))
-          assert.equal(0, #rows)
-          assert.is_nil(offset)
-
-          assert.stub(ngx.log).was_not_called()
-        end)
-
-        it("#flaky and returns as normal if page size is large enough", function()
-          stub(ngx, "log")
-
-          local rows, err, err_t, offset = db.services:page(enough_page_size, nil,
-          { tags = { "paging", "team_paging_1" }, tags_cond = 'and' })
-          assert(is_valid_page(rows, err, err_t))
-          assert.equal(enough_page_size, #rows)
-          if offset then
-            rows, err, err_t, offset = db.services:page(enough_page_size, offset,
-            { tags = { "paging", "team_paging_1" }, tags_cond = 'and' })
-            assert(is_valid_page(rows, err, err_t))
-            assert.equal(0, #rows)
-            assert.is_nil(offset)
-          end
-
-          assert.stub(ngx.log).was_not_called()
-        end)
-      end)
-
       it("allow tags_cond omitted if there's only one tag", function()
         local rows, err, err_t, _ = db.services:page(nil, nil, { tags = { "foo" } })
         assert(is_valid_page(rows, err, err_t))
@@ -409,7 +351,7 @@ for _, strategy in helpers.each_strategy() do
 
     it("#db errors if tag value is invalid", function()
       local ok, err = pcall(bp.services.insert, bp.services, {
-        host = "invalid-tag.com",
+        host = "invalid-tag.test",
         name = "service-invalid-tag",
         tags = { "tag,with,commas" }
       })
@@ -417,7 +359,7 @@ for _, strategy in helpers.each_strategy() do
       assert.matches("invalid tag", err)
 
       local ok, err = pcall(bp.services.insert, bp.services, {
-        host = "invalid-tag.com",
+        host = "invalid-tag.test",
         name = "service-invalid-tag",
         tags = { "tag/with/slashes" }
       })
@@ -425,7 +367,7 @@ for _, strategy in helpers.each_strategy() do
       assert.matches("invalid tag", err)
 
       local ok, err = pcall(bp.services.insert, bp.services, {
-        host = "invalid-tag.com",
+        host = "invalid-tag.test",
         name = "service-invalid-tag",
         tags = { "tag-with-invalid-utf8" .. string.char(255) }
       })

@@ -1,7 +1,7 @@
 local ssl_fixtures = require "spec.fixtures.ssl"
 local helpers = require "spec.helpers"
 local cjson = require "cjson"
-local utils = require "kong.tools.utils"
+local uuid = require "kong.tools.uuid"
 local Errors  = require "kong.db.errors"
 
 
@@ -36,12 +36,23 @@ describe("Admin API: #" .. strategy, function()
     local n2 = get_name()
     local names = { n1, n2 }
 
+     local certificate = {
+      cert  = ssl_fixtures.cert,
+      key   = ssl_fixtures.key,
+      snis  = names,
+    }
+
+    local validate_res = client:post("/schemas/certificates/validate", {
+      body    = certificate,
+      headers = { ["Content-Type"] = "application/json" },
+    })
+
+    local validate_body = assert.res_status(200, validate_res)
+    local json = cjson.decode(validate_body)
+    assert.equal("schema validation successful", json.message)
+
     local res = client:post("/certificates", {
-      body    = {
-        cert  = ssl_fixtures.cert,
-        key   = ssl_fixtures.key,
-        snis  = names,
-      },
+      body    = certificate,
       headers = { ["Content-Type"] = "application/json" },
     })
 
@@ -74,7 +85,12 @@ describe("Admin API: #" .. strategy, function()
   local function get_certificates()
     local res  = client:get("/certificates")
     local body = assert.res_status(200, res)
-    return cjson.decode(body)
+    local json = cjson.decode(body)
+    for _, cert in ipairs(json.data) do
+      cert.updated_at = nil
+    end
+
+    return json
   end
 
   local bp, db
@@ -336,12 +352,12 @@ describe("Admin API: #" .. strategy, function()
       end)
 
       it("returns 404 for a random non-existing uuid", function()
-        local res = client:get("/certificates/" .. utils.uuid())
+        local res = client:get("/certificates/" .. uuid.uuid())
         assert.res_status(404, res)
       end)
 
       it("returns 404 for a random non-existing sni", function()
-        local res = client:get("/certificates/doesntexist.com")
+        local res = client:get("/certificates/doesntexist.test")
         assert.res_status(404, res)
       end)
     end)
@@ -349,7 +365,7 @@ describe("Admin API: #" .. strategy, function()
     describe("PUT", function()
       it("creates if not found", function()
         local n1 = get_name()
-        local id = utils.uuid()
+        local id = uuid.uuid()
         local res = client:put("/certificates/" .. id, {
           body = {
             cert = ssl_fixtures.cert,
@@ -365,9 +381,8 @@ describe("Admin API: #" .. strategy, function()
         assert.equal(cjson.null, json.key_alt)
 
         assert.same({ n1 }, json.snis)
-        json.snis = nil
 
-        local in_db = assert(db.certificates:select({ id = id }, { nulls = true }))
+        local in_db = assert(db.certificates:select_with_name_list({ id = id }, { nulls = true }))
         assert.same(json, in_db)
       end)
 
@@ -390,9 +405,8 @@ describe("Admin API: #" .. strategy, function()
         assert.equal(cjson.null, json.key_alt)
 
         assert.same({ n1, n2 }, json.snis)
-        json.snis = nil
 
-        local in_db = assert(db.certificates:select({ id = json.id }, { nulls = true }))
+        local in_db = assert(db.certificates:select_with_name_list(json, { nulls = true }))
         assert.same(json, in_db)
       end)
 
@@ -415,15 +429,15 @@ describe("Admin API: #" .. strategy, function()
         assert.equal(cjson.null, json.key_alt)
 
         assert.same({ n1, n2 }, json.snis)
-        json.snis = nil
 
-        local in_db = assert(db.certificates:select({ id = json.id }, { nulls = true }))
+        local in_db = assert(db.certificates:select_with_name_list(json, { nulls = true }))
         assert.same(json, in_db)
       end)
 
       it("upserts if found", function()
         local certificate = add_certificate()
 
+        ngx.sleep(1)
         local res = client:put("/certificates/" .. certificate.id, {
           body = { cert = ssl_fixtures.cert_alt, key = ssl_fixtures.key_alt },
           headers = { ["Content-Type"] = "application/json" },
@@ -436,10 +450,9 @@ describe("Admin API: #" .. strategy, function()
         assert.equal(cjson.null, json.cert_alt)
         assert.equal(cjson.null, json.key_alt)
         assert.same({}, json.snis)
+        assert.truthy(certificate.updated_at < json.updated_at)
 
-        json.snis = nil
-
-        local in_db = assert(db.certificates:select({ id = certificate.id }, { nulls = true }))
+        local in_db = assert(db.certificates:select_with_name_list(certificate, { nulls = true }))
         assert.same(json, in_db)
       end)
 
@@ -463,15 +476,13 @@ describe("Admin API: #" .. strategy, function()
         assert.same(ssl_fixtures.key_alt_ecdsa, json.key_alt)
         assert.same({}, json.snis)
 
-        json.snis = nil
-
-        local in_db = assert(db.certificates:select({ id = certificate.id }, { nulls = true }))
+        local in_db = assert(db.certificates:select_with_name_list(certificate, { nulls = true }))
         assert.same(json, in_db)
       end)
 
       it("handles invalid input", function()
         -- Missing params
-        local res = client:put("/certificates/" .. utils.uuid(), {
+        local res = client:put("/certificates/" .. uuid.uuid(), {
           body = {},
           headers = { ["Content-Type"] = "application/json" }
         })
@@ -489,7 +500,7 @@ describe("Admin API: #" .. strategy, function()
 
       it("handles invalid input with alternate certificate", function()
         -- Missing params
-        local res = client:put("/certificates/" .. utils.uuid(), {
+        local res = client:put("/certificates/" .. uuid.uuid(), {
           body = {
             cert = ssl_fixtures.cert,
             key = ssl_fixtures.key,
@@ -654,6 +665,9 @@ describe("Admin API: #" .. strategy, function()
           local body = assert.res_status(200, res)
           local json = cjson.decode(body)
 
+          certificate.updated_at = nil
+          json.updated_at = nil
+
           assert.same(certificate, json)
         end
       end)
@@ -669,7 +683,8 @@ describe("Admin API: #" .. strategy, function()
 
           local body = assert.res_status(200, res)
           local json = cjson.decode(body)
-
+          json.updated_at = nil
+          certificate.updated_at = nil
           assert.same(certificate, json)
         end
       end)
@@ -752,7 +767,8 @@ describe("Admin API: #" .. strategy, function()
 
           local body = assert.res_status(200, res)
           local json = cjson.decode(body)
-
+          json.updated_at = nil
+          certificate.updated_at = nil
           assert.same(certificate, json)
         end
       end)
@@ -768,14 +784,15 @@ describe("Admin API: #" .. strategy, function()
 
           local body = assert.res_status(200, res)
           local json = cjson.decode(body)
-
+          json.updated_at = nil
+          certificate.updated_at = nil
           assert.same(certificate, json)
         end
       end)
 
       it("returns 404 for a random non-existing id", function()
         local n1 = get_name()
-        local res = client:patch("/certificates/" .. utils.uuid(), {
+        local res = client:patch("/certificates/" .. uuid.uuid(), {
           body    = {
             cert  = ssl_fixtures.cert,
             key   = ssl_fixtures.key,
@@ -885,6 +902,8 @@ describe("Admin API: #" .. strategy, function()
 
         -- make sure we did not add any certificate or sni
         local json = get_certificates()
+        json.updated_at = nil
+        json_before.updated_at = nil
         assert.same(json_before, json)
       end)
 
@@ -932,6 +951,8 @@ describe("Admin API: #" .. strategy, function()
 
         -- make sure we did not add any certificate or sni
         local json = get_certificates()
+        json_before.updated_at = nil
+        json.update_at = nil
         assert.same(json_before, json)
       end)
 
@@ -1148,14 +1169,14 @@ describe("Admin API: #" .. strategy, function()
           local certificate = add_certificate()
 
           bp.snis:insert({
-            name = "*.wildcard.com",
+            name = "*.wildcard.test",
             certificate = { id = certificate.id },
           })
 
-          local res = client:get("/snis/%2A.wildcard.com")
+          local res = client:get("/snis/%2A.wildcard.test")
           local body = assert.res_status(200, res)
           local json = cjson.decode(body)
-          assert.equal("*.wildcard.com", json.name)
+          assert.equal("*.wildcard.test", json.name)
         end)
       end)
     end)
@@ -1189,7 +1210,7 @@ describe("Admin API: #" .. strategy, function()
       it("creates if not found", function()
         local certificate = add_certificate()
         local n1 = get_name()
-        local id = utils.uuid()
+        local id = uuid.uuid()
         local res = client:put("/snis/" .. id, {
           body = {
             certificate = { id = certificate.id },
@@ -1214,6 +1235,7 @@ describe("Admin API: #" .. strategy, function()
         })
         local n2 = get_name()
 
+        ngx.sleep(1)
         local res = client:put("/snis/" .. sni.id, {
           body = {
             name = n2,
@@ -1226,13 +1248,14 @@ describe("Admin API: #" .. strategy, function()
         local json = cjson.decode(body)
         assert.same(n2, json.name)
 
-        local in_db = assert(db.snis:select({ id = sni.id }, { nulls = true }))
+        local in_db = assert(db.snis:select(sni, { nulls = true }))
         assert.same(json, in_db)
+        assert.truthy(sni.updated_at < json.updated_at)
       end)
 
       it("handles invalid input", function()
         -- Missing params
-        local res = client:put("/snis/" .. utils.uuid(), {
+        local res = client:put("/snis/" .. uuid.uuid(), {
           body = {},
           headers = { ["Content-Type"] = "application/json" }
         })

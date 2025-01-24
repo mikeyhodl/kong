@@ -404,7 +404,7 @@ describe("Admin API: #" .. strategy, function()
             })
             body = assert.res_status(400, res)
             local json = cjson.decode(body)
-            assert.equals("bad cookie name 'not a <> valid <> cookie name', allowed characters are A-Z, a-z, 0-9, '_', and '-'",
+            assert.equals([[contains one or more invalid characters. ASCII control characters (0-31;127), space, tab and the characters ()<>@,;:\"/?={}[] are not allowed.]],
                           json.fields.hash_on_cookie)
 
             -- Invalid cookie path
@@ -437,7 +437,7 @@ describe("Admin API: #" .. strategy, function()
             })
             body = assert.res_status(400, res)
             local json = cjson.decode(body)
-            assert.equals("bad cookie name 'not a <> valid <> cookie name', allowed characters are A-Z, a-z, 0-9, '_', and '-'",
+            assert.equals([[contains one or more invalid characters. ASCII control characters (0-31;127), space, tab and the characters ()<>@,;:\"/?={}[] are not allowed.]],
                           json.fields.hash_on_cookie)
 
             -- Invalid cookie path in hash fallback
@@ -637,6 +637,16 @@ describe("Admin API: #" .. strategy, function()
         })
         assert.res_status(200, res)
       end)
+      it("returns bad request for empty tags", function()
+        local res = assert(client:send {
+          method = "GET",
+          path = "/upstreams",
+          query = { tags = ngx.null}
+        })
+        res = assert.res_status(400, res)
+        local json = cjson.decode(res)
+        assert.same("invalid option (tags: cannot be null)", json.message)
+      end)
 
       describe("empty results", function()
         lazy_setup(function()
@@ -824,4 +834,65 @@ describe("Admin API: #" .. strategy, function()
   end)
 end)
 
+end
+
+for _, strategy in helpers.all_strategies() do
+  describe("#regression #" .. strategy, function()
+    local client
+    lazy_setup(function()
+      local bp, _ = helpers.get_db_utils(strategy)
+      bp.upstreams:insert {
+        name = "my-upstream",
+        slots = 100,
+      }
+      bp.upstreams:insert {
+        name = "my-upstream-2",
+        slots = 100,
+      }
+      bp.upstreams:insert {
+        name = "my-upstream-3",
+        slots = 100,
+      }
+
+      assert(helpers.start_kong{
+        database = strategy
+      })
+      client = assert(helpers.admin_client())
+    end)
+
+    lazy_teardown(function()
+      if client then client:close() end
+      helpers.stop_kong()
+    end)
+
+    it("page size 1", function()
+      local res = assert(client:send {
+        method = "GET",
+        path = "/upstreams?size=1"
+      })
+      assert.response(res).has.status(200)
+      local json = assert.response(res).has.jsonbody()
+      assert.equal(1, #json.data)
+      assert.truthy(json.offset)
+
+      res = assert(client:send {
+        method = "GET",
+        path = "/upstreams",
+        query = {size = 1, offset = json.offset}
+      })
+      assert.response(res).has.status(200)
+      local json = assert.response(res).has.jsonbody()
+      assert.equal(1, #json.data)
+      assert.truthy(json.offset)
+
+      res = assert(client:send {
+        method = "GET",
+        path = "/upstreams?size=2"
+      })
+      assert.response(res).has.status(200)
+      local json = assert.response(res).has.jsonbody()
+      assert.equal(2, #json.data)
+      assert.truthy(json.offset)
+    end)
+  end)
 end

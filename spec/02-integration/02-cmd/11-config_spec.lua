@@ -3,6 +3,7 @@ local constants = require "kong.constants"
 local cjson = require "cjson"
 local lyaml = require "lyaml"
 local lfs = require "lfs"
+local shell = require "resty.shell"
 
 
 local function sort_by_name(a, b)
@@ -80,6 +81,12 @@ describe("kong config", function()
           config:
             port: 10000
             host: 127.0.0.1
+        - name: rate-limiting
+          config:
+            minute: 200
+            policy: redis
+            redis:
+              host: 127.0.0.1
       plugins:
       - name: correlation-id
         id: 467f719f-a544-4a8f-bc4b-7cd12913a9d4
@@ -97,6 +104,7 @@ describe("kong config", function()
     assert(helpers.start_kong({
       nginx_conf = "spec/fixtures/custom_nginx.template",
       dns_hostsfile = dns_hostsfile,
+      resolver_hosts_file = dns_hostsfile,
       anonymous_reports = "on",
     }))
 
@@ -104,13 +112,13 @@ describe("kong config", function()
 
     assert(helpers.kong_exec("config db_import " .. filename, {
       prefix = helpers.test_conf.prefix,
+      anonymous_reports = "on",
     }))
 
     local _, res = assert(thread:join())
     assert.matches("signal=config-db-import", res, nil, true)
     -- it will be updated on-the-fly
-    -- but the version should still be 1.1
-    assert.matches("decl_fmt_version=1.1", res, nil, true)
+    assert.matches("decl_fmt_version=3.0", res, nil, true)
     assert.matches("file_ext=.yml", res, nil, true)
 
     local client = helpers.admin_client()
@@ -129,15 +137,17 @@ describe("kong config", function()
     local res = client:get("/services/bar/plugins")
     local body = assert.res_status(200, res)
     local json = cjson.decode(body)
-    assert.equals(2, #json.data)
+    assert.equals(3, #json.data)
 
     local res = client:get("/plugins/467f719f-a544-4a8f-bc4b-7cd12913a9d4")
     local body = assert.res_status(200, res)
     local json = cjson.decode(body)
     json.created_at = nil
+    json.updated_at = nil
     json.protocols = nil
     assert.same({
       name = "correlation-id",
+      instance_name = ngx.null,
       id = "467f719f-a544-4a8f-bc4b-7cd12913a9d4",
       route = ngx.null,
       service = ngx.null,
@@ -529,7 +539,17 @@ describe("kong config", function()
 
     local service2 = bp.services:insert({ name = "service2" }, { nulls = true })
     local route2 = bp.routes:insert({ service = service2, methods = { "GET" }, name = "b" }, { nulls = true })
-    local plugin3 = bp.tcp_log_plugins:insert({
+    local plugin3 = bp.rate_limiting_plugins:insert({
+      service = service2,
+      config = {
+        minute = 100,
+        policy = "redis",
+        redis = {
+          host = "localhost"
+        }
+      }
+    }, { nulls = true })
+    local plugin4 = bp.tcp_log_plugins:insert({
       service = service2,
     }, { nulls = true })
     local consumer = bp.consumers:insert(nil, { nulls = true })
@@ -600,7 +620,7 @@ describe("kong config", function()
     assert.equals(route2.name, yaml.routes[2].name)
     assert.equals(service2.id, yaml.routes[2].service)
 
-    assert.equals(3, #yaml.plugins)
+    assert.equals(4, #yaml.plugins)
     table.sort(yaml.plugins, sort_by_name)
     assert.equals(plugin1.id, yaml.plugins[1].id)
     assert.equals(plugin1.name, yaml.plugins[1].name)
@@ -612,6 +632,8 @@ describe("kong config", function()
 
     assert.equals(plugin3.id, yaml.plugins[3].id)
     assert.equals(plugin3.name, yaml.plugins[3].name)
+    assert.equals(plugin4.id, yaml.plugins[4].id)
+    assert.equals(plugin4.name, yaml.plugins[4].name)
     assert.equals(service2.id, yaml.plugins[3].service)
 
     assert.equals(1, #yaml.consumers)
@@ -690,11 +712,11 @@ describe("kong config", function()
     local kong_yml_exists = false
     if lfs.attributes("kong.yml") then
       kong_yml_exists = true
-      os.execute("mv kong.yml kong.yml~")
+      shell.run("mv kong.yml kong.yml~", nil, 0)
     end
     finally(function()
       if kong_yml_exists then
-        os.execute("mv kong.yml~ kong.yml")
+        shell.run("mv kong.yml~ kong.yml", nil, 0)
       else
         os.remove("kong.yml")
       end
@@ -702,9 +724,13 @@ describe("kong config", function()
 
     os.remove("kong.yml")
     assert.is_nil(lfs.attributes("kong.yml"))
-    assert(helpers.kong_exec("config init"))
+    assert(helpers.kong_exec("config init", {
+      prefix = helpers.test_conf.prefix,
+    }))
     assert.not_nil(lfs.attributes("kong.yml"))
-    assert(helpers.kong_exec("config parse kong.yml"))
+    assert(helpers.kong_exec("config parse kong.yml", {
+      prefix = helpers.test_conf.prefix,
+    }))
   end)
 
   it("config init can take an argument", function()
@@ -715,8 +741,12 @@ describe("kong config", function()
 
     os.remove(tmpname)
     assert.is_nil(lfs.attributes(tmpname))
-    assert(helpers.kong_exec("config init " .. tmpname))
+    assert(helpers.kong_exec("config init " .. tmpname, {
+      prefix = helpers.test_conf.prefix,
+    }))
     assert.not_nil(lfs.attributes(tmpname))
-    assert(helpers.kong_exec("config parse " .. tmpname))
+    assert(helpers.kong_exec("config parse " .. tmpname, {
+      prefix = helpers.test_conf.prefix,
+    }))
   end)
 end)

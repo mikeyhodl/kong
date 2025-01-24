@@ -1,5 +1,5 @@
-local utils = require "kong.tools.utils"
 local declarative = require "kong.db.declarative"
+local bytes_to_str = require("kong.tools.string").bytes_to_str
 
 local tonumber = tonumber
 local kong = kong
@@ -29,7 +29,7 @@ return {
 
         -- validate unit and scale arguments
 
-        local pok, perr = pcall(utils.bytes_to_str, 0, unit, scale)
+        local pok, perr = pcall(bytes_to_str, 0, unit, scale)
         if not pok then
           return kong.response.exit(400, { message = perr })
         end
@@ -51,6 +51,8 @@ return {
       -- has been reset to empty).
       if dbless or data_plane_role then
         status_response.configuration_hash = declarative.get_current_hash()
+        -- remove the meanless database entry when in dbless mode or data plane
+        status_response.database = nil
       end
 
       -- TODO: no way to bypass connection pool

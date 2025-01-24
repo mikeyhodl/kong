@@ -1,9 +1,15 @@
 local pl_pretty = require("pl.pretty").write
 local pl_keys = require("pl.tablex").keys
+local nkeys = require("table.nkeys")
+local table_isarray = require("table.isarray")
+local uuid = require("kong.tools.uuid")
+local json = require("kong.tools.cjson")
 
 
 local type         = type
 local null         = ngx.null
+local log          = ngx.log
+local WARN         = ngx.WARN
 local error        = error
 local upper        = string.upper
 local fmt          = string.format
@@ -14,6 +20,9 @@ local setmetatable = setmetatable
 local getmetatable = getmetatable
 local concat       = table.concat
 local sort         = table.sort
+local insert       = table.insert
+local remove       = table.remove
+local new_array    = json.new_array
 
 
 local sorted_keys = function(tbl)
@@ -45,6 +54,7 @@ local ERRORS              = {
   INVALID_FOREIGN_KEY     = 16, -- foreign key is valid for matching a row
   INVALID_WORKSPACE       = 17, -- strategy reports a workspace error
   INVALID_UNIQUE_GLOBAL   = 18, -- unique field value is invalid for global query
+  REFERENCED_BY_OTHERS    = 19, -- still referenced by other entities
 }
 
 
@@ -70,6 +80,7 @@ local ERRORS_NAMES                 = {
   [ERRORS.INVALID_FOREIGN_KEY]     = "invalid foreign key",
   [ERRORS.INVALID_WORKSPACE]       = "invalid workspace",
   [ERRORS.INVALID_UNIQUE_GLOBAL]   = "invalid global query",
+  [ERRORS.REFERENCED_BY_OTHERS]    = "referenced by others",
 }
 
 
@@ -507,6 +518,656 @@ function _M:invalid_unique_global(name)
 
   return new_err_t(self, ERRORS.INVALID_UNIQUE_GLOBAL,
                    fmt("unique key %s is invalid for global query", name))
+end
+
+
+function _M:referenced_by_others(err)
+  if type(err) ~= "string" then
+    error("err must be a string", 2)
+  end
+
+  return new_err_t(self, ERRORS.REFERENCED_BY_OTHERS, err)
+end
+
+
+local flatten_errors
+do
+  local function singular(noun)
+    if noun:sub(-1) == "s" then
+      return noun:sub(1, -2)
+    end
+    return noun
+  end
+
+
+  local function join(ns, field)
+    if type(ns) == "string" and ns ~= "" then
+      return ns .. "." .. field
+    end
+    return field
+  end
+
+  local function is_array(v)
+    return type(v) == "table" and table_isarray(v)
+  end
+
+
+  local each_foreign_field
+  do
+    ---@type table<string, { field:string, entity:string, reference:string }[]>
+    local relationships
+
+    -- for each known entity, build a table of other entities which may
+    -- reference it via a foreign key relationship as well as any of its
+    -- own foreign key relationships.
+    local function build_relationships()
+      relationships = setmetatable({}, {
+        __index = function(self, k)
+          local t = {}
+          rawset(self, k, t)
+          return t
+        end,
+      })
+
+      for entity, dao in pairs(kong.db.daos) do
+        for fname, field in dao.schema:each_field() do
+          if field.type == "foreign" then
+            insert(relationships[entity], {
+              field     = fname,
+              entity    = entity,
+              reference = field.reference,
+            })
+
+            -- create a backref for entities that may be nested under their
+            -- foreign key reference entity (one-to-many relationships)
+            --
+            -- example: services and routes
+            --
+            -- route.service = { type = "foreign", reference = "services" }
+            --
+            -- insert(relationships.services, {
+            --    field     = "service",
+            --    entity    = "routes",
+            --    reference = "services",
+            -- })
+            --
+            insert(relationships[field.reference], {
+              field     = fname,
+              entity    = entity,
+              reference = field.reference,
+            })
+          end
+        end
+      end
+    end
+
+    local empty = function() end
+
+    ---@param  entity_type   string
+    ---@return fun():{ field:string, entity:string, reference:string }? iterator
+    function each_foreign_field(entity_type)
+      -- this module is require()-ed before the kong global is initialized, so
+      -- the lookup table of relationships needs to be built lazily
+      if not relationships then
+        build_relationships()
+      end
+
+      local fields = relationships[entity_type]
+
+      if not fields then
+        return empty
+      end
+
+      local i = 0
+      return function()
+        i = i + 1
+        return fields[i]
+      end
+    end
+  end
+
+
+  ---@param err       table|string
+  ---@param flattened table
+  local function add_entity_error(err, flattened)
+    if type(err) == "table" then
+      for _, message in ipairs(err) do
+        add_entity_error(message, flattened)
+      end
+
+    else
+      insert(flattened, {
+        type = "entity",
+        message = err,
+      })
+    end
+  end
+
+
+  ---@param field     string
+  ---@param err       table|string
+  ---@param flattened table
+  local function add_field_error(field, err, flattened)
+    if type(err) == "table" then
+      for _, message in ipairs(err) do
+        add_field_error(field, message, flattened)
+      end
+
+    else
+      insert(flattened, {
+        type = "field",
+        field = field,
+        message = err,
+      })
+    end
+  end
+
+
+  ---@param state { t:table, [integer]:any }
+  ---@return any? key
+  ---@return any? value
+  local function drain_iter(state)
+    local key = remove(state)
+    if key == nil then
+      return
+    end
+
+    local t = state.t
+    local value = t[key]
+
+    -- the value was removed from the table during iteration
+    if value == nil then
+      -- skip to the next key
+      return drain_iter(state)
+    end
+
+    t[key] = nil
+
+    return key, value
+  end
+
+
+  --- Iterate over the elements in a table while removing them.
+  ---
+  --- The original table is not used for iteration state. Instead, state is
+  --- kept in a separate table along with a copy of the table's keys. This
+  --- means that it is safe to mutate the original table during iteration.
+  ---
+  --- Any items explicitly removed (`original_table[key] = nil`) from the
+  --- original table during iteration will be skipped.
+  ---
+  ---@generic K, V
+  ---@param t table<K, V>
+  ---@return fun():K?, V iterator
+  ---@return table state
+  local function drain(t)
+    local state = {
+      t = t,
+    }
+
+    local n = 0
+    for k in pairs(t) do
+      n = n + 1
+      state[n] = k
+    end
+
+    -- not sure if really necessary, but the consistency probably doesn't hurt
+    sort(state)
+
+    return drain_iter, state
+  end
+
+
+  ---@param errs       table
+  ---@param ns?        string
+  ---@param flattened? table
+  local function categorize_errors(errs, ns, flattened)
+    flattened = flattened or new_array()
+
+    for field, err in drain(errs) do
+      local errtype = type(err)
+
+      if field == "@entity" then
+        add_entity_error(err, flattened)
+
+      elseif errtype == "string" then
+        add_field_error(join(ns, field), err, flattened)
+
+      elseif errtype == "table" then
+        categorize_errors(err, join(ns, field), flattened)
+
+      else
+        log(WARN, "unknown error type: ", errtype, " at key: ", field)
+      end
+    end
+
+    return flattened
+  end
+
+
+  ---@param name any
+  ---@return string|nil
+  local function validate_name(name)
+    return (type(name) == "string"
+            and name:len() > 0
+            and name)
+           or nil
+  end
+
+
+  ---@param id any
+  ---@return string|nil
+  local function validate_id(id)
+    return (type(id) == "string"
+            and uuid.is_valid_uuid(id)
+            and id)
+           or nil
+  end
+
+
+  ---@param tags any
+  ---@return string[]|nil
+  local function validate_tags(tags)
+    if type(tags) == "table" and is_array(tags) then
+      for i = 1, #tags do
+        if type(tags[i]) ~= "string" then
+          return
+        end
+      end
+
+      return tags
+    end
+  end
+
+
+  -- given an entity table with an .id attribute that is a valid UUID,
+  -- yield a primary key table
+  --
+  ---@param entity table
+  ---@return table?
+  local function make_pk(entity)
+    if validate_id(entity.id) then
+      return { id = entity.id }
+    end
+  end
+
+
+  ---@param entity_type string
+  ---@param entity      table
+  ---@param err_t       table
+  ---@param flattened   table
+  local function add_entity_errors(entity_type, entity, err_t, flattened)
+    local err_type = type(err_t)
+
+    -- promote error strings to `@entity` type errors
+    if err_type == "string" then
+      err_t = { ["@entity"] = err_t }
+
+    elseif err_type ~= "table" or nkeys(err_t) == 0 then
+      return
+    end
+
+    -- this *should* be unreachable, but it's relatively cheap to guard against
+    -- compared to everything else we're doing in this code path
+    if type(entity) ~= "table" then
+      log(WARN, "could not parse ", entity_type, " errors for non-table ",
+                "input: '", tostring(entity), "'")
+      return
+    end
+
+    local entity_pk = make_pk(entity)
+
+    -- promote errors for foreign key relationships up to the top level
+    -- array of errors and recursively flatten any of their validation
+    -- errors
+    for ref in each_foreign_field(entity_type) do
+      -- owned one-to-one relationship
+      --
+      -- Example:
+      --
+      -- entity_type => "services"
+      --
+      -- entity => {
+      --   name = "my-invalid-service",
+      --   url  = "https://localhost:1234"
+      --   client_certificate = {
+      --     id   = "d2e33f63-1424-408f-be55-d9d16cd2a382",
+      --     cert = "bad cert data",
+      --     key  = "bad cert key data",
+      --   }
+      -- }
+      --
+      -- ref => {
+      --   entity    = "services",
+      --   field     = "client_certificate",
+      --   reference = "certificates"
+      -- }
+      --
+      -- field_name => "client_certificate"
+      --
+      -- field_entity_type => "certificates"
+      --
+      -- field_value => {
+      --   id   = "d2e33f63-1424-408f-be55-d9d16cd2a382",
+      --   cert = "bad cert data",
+      --   key  = "bad cert key data",
+      -- }
+      --
+      -- because the client certificate entity has a valid ID, we store a
+      -- reference to it as a primary key on our entity table:
+      --
+      -- entity => {
+      --   name = "my-invalid-service",
+      --   url  = "https://localhost:1234"
+      --   client_certificate = {
+      --     id   = "d2e33f63-1424-408f-be55-d9d16cd2a382",
+      --   }
+      -- }
+      --
+      if ref.entity == entity_type then
+        local field_name = ref.field
+        local field_value = entity[field_name]
+        local field_entity_type = ref.reference
+        local field_err_t = err_t[field_name]
+
+        -- if the foreign value is _not_ a table, attempting to treat it like
+        -- an entity or array of entities will only yield confusion.
+        --
+        -- instead, it's better to leave the error intact so that it will be
+        -- categorized as a field error on the current entity
+        if type(field_value) == "table" then
+          entity[field_name] = make_pk(field_value)
+          err_t[field_name] = nil
+
+          add_entity_errors(field_entity_type, field_value, field_err_t, flattened)
+        end
+
+
+      -- foreign one-to-many relationship
+      --
+      -- Example:
+      --
+      -- entity_type => "routes"
+      --
+      -- entity => {
+      --   name     = "my-invalid-route",
+      --   id       = "d2e33f63-1424-408f-be55-d9d16cd2a382",
+      --   paths    = { 123 },
+      --   plugins  = {
+      --     {
+      --       name   = "http-log",
+      --       config = {
+      --         invalid_param = 456,
+      --       },
+      --     },
+      --     {
+      --       name   = "file-log",
+      --       config = {
+      --         invalid_param = 456,
+      --       },
+      --     },
+      --   },
+      -- }
+      --
+      -- ref => {
+      --   entity    = "plugins",
+      --   field     = "route",
+      --   reference = "routes"
+      -- }
+      --
+      -- field_name => "plugins"
+      --
+      -- field_entity_type => "plugins"
+      --
+      -- field_value => {
+      --   {
+      --     name   = "http-log",
+      --     config = {
+      --       invalid_param = 456,
+      --     },
+      --   },
+      --   {
+      --     name   = "file-log",
+      --     config = {
+      --       invalid_param = 456,
+      --     },
+      --   },
+      -- }
+      --
+      -- before recursing on each plugin in `entity.plugins` to handle their
+      -- respective validation errors, we add our route's primary key to them,
+      -- yielding:
+      --
+      -- {
+      --   {
+      --     name   = "http-log",
+      --     config = {
+      --       invalid_param = 456,
+      --     },
+      --     route = {
+      --       id = "d2e33f63-1424-408f-be55-d9d16cd2a382",
+      --     },
+      --   },
+      --   {
+      --     name   = "file-log",
+      --     config = {
+      --       invalid_param = 456,
+      --     },
+      --     route = {
+      --       id = "d2e33f63-1424-408f-be55-d9d16cd2a382",
+      --     },
+      --   },
+      -- }
+      --
+      else
+        local field_name = ref.entity
+        local field_value = entity[field_name]
+        local field_entity_type = field_name
+        local field_err_t = err_t[field_name]
+        local field_fk = ref.field
+
+        -- same as the one-to-one case: if the field's value is not a table,
+        -- we will let any errors related to it be categorized as a field-level
+        -- error instead
+        if type(field_value) == "table" then
+          entity[field_name] = nil
+          err_t[field_name] = nil
+
+          if field_err_t then
+            for i = 1, #field_value do
+              local item = field_value[i]
+
+              -- add our entity's primary key to each child item
+              if item[field_fk] == nil then
+                item[field_fk] = entity_pk
+              end
+
+              add_entity_errors(field_entity_type, item, field_err_t[i], flattened)
+            end
+          end
+        end
+      end
+    end
+
+    -- all of our errors were related to foreign relationships;
+    -- nothing left to do
+    if nkeys(err_t) == 0 then
+      return
+    end
+
+    local entity_errors = categorize_errors(err_t)
+    if #entity_errors > 0 then
+      insert(flattened, {
+        -- entity_id, entity_name, and entity_tags must be validated to ensure
+        -- that the response is well-formed. They are also optional, so we will
+        -- simply leave them out if they are invalid.
+        --
+        -- The nested entity object itself will retain the original, untouched
+        -- values for these fields.
+        entity_name   = validate_name(entity.name),
+        entity_id     = validate_id(entity.id),
+        entity_tags   = validate_tags(entity.tags),
+        entity_type   = singular(entity_type),
+        entity        = entity,
+        errors        = entity_errors,
+      })
+    else
+      log(WARN, "failed to categorize errors for ", entity_type,
+                ", ", entity.name or entity.id)
+    end
+  end
+
+
+  ---@param  err_t table
+  ---@param  input table
+  ---@return table
+  function flatten_errors(input, err_t)
+    local flattened = new_array()
+
+    for entity_type, section_errors in drain(err_t) do
+      if type(section_errors) ~= "table" then
+        -- don't flatten it; just put it back
+        err_t[entity_type] = section_errors
+        goto next_section
+      end
+
+      local entities = input[entity_type]
+
+      if type(entities) ~= "table" then
+        -- put it back into the error table
+        err_t[entity_type] = section_errors
+        goto next_section
+      end
+
+      for i, err_t_i in drain(section_errors) do
+        local entity = entities[i]
+
+        if type(entity) == "table" then
+          add_entity_errors(entity_type, entity, err_t_i, flattened)
+
+        else
+          log(WARN, "failed to resolve errors for ", entity_type, " at ",
+                    "index '", i, "'")
+          section_errors[i] = err_t_i
+        end
+      end
+
+      ::next_section::
+    end
+
+    return flattened
+  end
+end
+
+
+-- traverse declarative schema validation errors and correlate them with
+-- objects/entities from the original user input
+--
+-- Produces a list of errors with the following format:
+--
+-- ```lua
+-- {
+--   entity_type = "service",    -- service, route, plugin, etc
+--   entity_id   = "<uuid>",     -- useful to correlate errors across fk relationships
+--   entity_name = "my-service", -- may be nil
+--   entity_tags = { "my-tag" },
+--   entity = {                  -- the full entity object
+--     name = "my-service",
+--     id  = "<uuid>",
+--     tags = { "my-tag" },
+--     host = "127.0.0.1",
+--     protocol = "tcp",
+--     path = "/path",
+--   },
+--   errors = {
+--     {
+--       type = "entity"
+--       message = "failed conditional validation given value of field 'protocol'",
+--     },
+--     {
+--       type = "field"
+--       field = "path",
+--       message = "value must be null",
+--     }
+--   }
+-- }
+-- ```
+--
+-- Nested foreign relationships are hoisted up to the top level, so
+-- given the following input:
+--
+-- ```lua
+-- {
+--   services = {
+--     name = "matthew",
+--     url = "http:/127.0.0.1:80/",
+--     routes = {
+--       {
+--         name = "joshua",
+--         protocols = { "nope" },            -- invalid protocol
+--       }
+--     },
+--     plugins = {
+--       {
+--         name = "i-am-not-a-real-plugin",   -- nonexistent plugin
+--         config = {
+--           foo = "bar",
+--         },
+--       },
+--       {
+--         name = "http-log",
+--         config = {},                       -- missing required field(s)
+--       },
+--     },
+--   }
+-- }
+-- ```
+-- ... the output error array will have three entries, one for the route,
+-- and one for each of the plugins.
+--
+-- Errors for record fields and nested schema properties are rolled up and
+-- added to their parent entity, with the full path to the property
+-- represented as a period-delimited string:
+--
+-- ```lua
+-- {
+--   entity_type = "plugin",
+--   entity_name = "http-log",
+--   entity = {
+--     name = "http-log",
+--     config = {
+--       -- empty
+--     },
+--   },
+--   errors = {
+--     {
+--       field = "config.http_endpoint",
+--       message = "missing host in url",
+--       type = "field"
+--     }
+--   },
+-- }
+-- ```
+--
+---@param  err_t table
+---@param  input table
+---@return table
+function _M:declarative_config_flattened(err_t, input)
+  if type(err_t) ~= "table" then
+    error("err_t must be a table", 2)
+  end
+
+  if type(input) ~= "table" then
+    error("err_t input is nil or not a table", 2)
+  end
+
+  local flattened = flatten_errors(input, err_t)
+
+  err_t = self:declarative_config(err_t)
+
+  err_t.flattened_errors = flattened
+
+  return err_t
 end
 
 

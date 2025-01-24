@@ -33,9 +33,6 @@ end
 
 
 local function wait_until_no_common_workers(workers, expected_total, strategy)
-  if strategy == "cassandra" then
-    ngx.sleep(0.5)
-  end
   helpers.wait_until(function()
     local pok, admin_client = pcall(helpers.admin_client)
     if not pok then
@@ -113,7 +110,7 @@ for _, strategy in helpers.each_strategy() do
         local body = assert.res_status(200, res)
         local json = cjson.decode(body)
         assert.equal(meta._VERSION, json.version)
-        assert.equal("{vault://mock/admin-listen}", json.configuration.admin_listen)
+        assert.same({ "{vault://mock/admin-listen}" }, json.configuration.admin_listen)
         assert.falsy(exists(join(helpers.test_conf.prefix, ".kong_process_secrets")))
       end)
     end)
@@ -144,8 +141,30 @@ for _, strategy in helpers.each_strategy() do
         local body = assert.res_status(200, res)
         local json = cjson.decode(body)
         assert.equal(meta._VERSION, json.version)
-        assert.equal("{vault://mock/listen?prefix=admin_}", json.configuration.admin_listen)
+        assert.same({ "{vault://mock/listen?prefix=admin_}" }, json.configuration.admin_listen)
       end)
     end)
   end)
+
+  if strategy == "postgres" then
+    describe("ENV Vault #" .. strategy, function ()
+      describe("Kong Start", function ()
+        it("can resolve reference in init_phase", function ()
+          helpers.setenv("TEST_ENV_VAULT_LOGLEVEL", "debug")
+
+          assert(helpers.start_kong {
+            database = strategy,
+            prefix = helpers.test_conf.prefix,
+            nginx_conf = "spec/fixtures/custom_nginx.template",
+            vaults = "env",
+            log_level = "{vault://env/TEST_ENV_VAULT_LOGLEVEL}"
+          })
+
+          finally(function ()
+            assert(helpers.stop_kong())
+          end)
+        end)
+      end)
+    end)
+  end
 end

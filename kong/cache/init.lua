@@ -1,7 +1,8 @@
-local resty_mlcache = require "resty.mlcache"
-local marshall = require "kong.cache.marshall"
+local resty_mlcache = require "kong.resty.mlcache"
+local buffer = require "string.buffer"
 
 
+local encode  = buffer.encode
 local type    = type
 local pairs   = pairs
 local error   = error
@@ -11,9 +12,13 @@ local shared  = ngx.shared
 local ngx_log = ngx.log
 
 
+
 local ERR     = ngx.ERR
 local NOTICE  = ngx.NOTICE
 local DEBUG   = ngx.DEBUG
+
+
+local NO_TTL_FLAG = resty_mlcache.NO_TTL_FLAG
 
 
 local CHANNEL_NAME = "mlcache"
@@ -81,7 +86,11 @@ function _M.new(opts)
     error("opts.resty_lock_opts must be a table", 2)
   end
 
-  local shm_name      = opts.shm_name
+  if opts.invalidation_channel and type(opts.invalidation_channel) ~= "string" then
+    error("opts.invalidation_channel must be a string", 2)
+  end
+
+  local shm_name = opts.shm_name
   if not shared[shm_name] then
     log(ERR, "shared dictionary ", shm_name, " not found")
   end
@@ -97,8 +106,8 @@ function _M.new(opts)
   local mlcache, err = resty_mlcache.new(shm_name, shm_name, {
     shm_miss         = shm_miss_name,
     shm_locks        = "kong_locks",
-    shm_set_retries  = 3,
-    lru_size         = LRU_SIZE,
+    shm_set_tries    = 3,
+    lru_size         = opts.lru_size or LRU_SIZE,
     ttl              = ttl,
     neg_ttl          = neg_ttl,
     resurrect_ttl    = opts.resurrect_ttl or 30,
@@ -126,6 +135,8 @@ function _M.new(opts)
   end
 
   local cluster_events = opts.cluster_events
+  local invalidation_channel = opts.invalidation_channel
+                               or ("invalidations_" .. shm_name)
   local self       = {
     cluster_events = cluster_events,
     mlcache        = mlcache,
@@ -133,10 +144,11 @@ function _M.new(opts)
     shm_name       = shm_name,
     ttl            = ttl,
     neg_ttl        = neg_ttl,
+    invalidation_channel = invalidation_channel,
   }
 
-  local ok, err = cluster_events:subscribe("invalidations", function(key)
-    log(DEBUG, "received invalidate event from cluster for key: '", key, "'")
+  local ok, err = cluster_events:subscribe(self.invalidation_channel, function(key)
+    log(DEBUG, self.shm_name .. " received invalidate event from cluster for key: '", key, "'")
     self:invalidate_local(key)
   end)
   if not ok then
@@ -155,12 +167,26 @@ function _M:get(key, opts, cb, ...)
     error("key must be a string", 2)
   end
 
-  local v, err = self.mlcache:get(key, opts, cb, ...)
+  local v, err, hit_lvl = self.mlcache:get(key, opts, cb, ...)
   if err then
     return nil, "failed to get from node cache: " .. err
   end
 
-  return v
+  return v, nil, hit_lvl
+end
+
+
+function _M:renew(key, opts, cb, ...)
+  if type(key) ~= "string" then
+    error("key must be a string", 2)
+  end
+
+  local v, err, ttl = self.mlcache:renew(key, opts, cb, ...)
+  if err then
+    return nil, "failed to renew key in node cache: " .. err
+  end
+
+  return v, nil, ttl
 end
 
 
@@ -183,12 +209,12 @@ end
 
 
 function _M:safe_set(key, value)
-  local marshalled, err = marshall(value, self.ttl, self.neg_ttl)
+  local marshalled, err = encode(value)
   if err then
     return nil, err
   end
 
-  return self.dict:safe_set(self.shm_name .. key, marshalled)
+  return self.dict:safe_set(self.shm_name .. key, marshalled, self.ttl, self.ttl == 0 and NO_TTL_FLAG or 0)
 end
 
 
@@ -211,7 +237,7 @@ function _M:invalidate_local(key)
     error("key must be a string", 2)
   end
 
-  log(DEBUG, "invalidating (local): '", key, "'")
+  log(DEBUG, self.shm_name, " invalidating (local): '", key, "'")
 
   local ok, err = self.mlcache:delete(key)
   if not ok then
@@ -229,7 +255,7 @@ function _M:invalidate(key)
 
   log(DEBUG, "broadcasting (cluster) invalidation for key: '", key, "'")
 
-  local ok, err = self.cluster_events:broadcast("invalidations", key)
+  local ok, err = self.cluster_events:broadcast(self.invalidation_channel, key)
   if not ok then
     log(ERR, "failed to broadcast cached entity invalidation: ", err)
   end

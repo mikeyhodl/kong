@@ -3,6 +3,7 @@ local api_helpers = require "kong.api.api_helpers"
 local Schema = require "kong.db.schema"
 local Errors = require "kong.db.errors"
 local process = require "ngx.process"
+local wasm = require "kong.runloop.wasm"
 
 local kong = kong
 local meta = require "kong.meta"
@@ -42,6 +43,29 @@ local function validate_schema(db_entity_name, params)
     return kong.response.exit(400, errors:schema_violation(err_t))
   end
   return kong.response.exit(200, { message = "schema validation successful" })
+end
+
+local default_filter_config_schema
+do
+  local default
+
+  function default_filter_config_schema(db)
+    if default then
+      return default
+    end
+
+    local dao = db.filter_chains or kong.db.filter_chains
+    for key, field in dao.schema:each_field() do
+      if key == "filters" then
+        for _, ffield in ipairs(field.elements.fields) do
+          if ffield.config and ffield.config.json_schema then
+            default = ffield.config.json_schema.default
+            return default
+          end
+        end
+      end
+    end
+  end
 end
 
 
@@ -106,6 +130,7 @@ return {
       return kong.response.exit(200, {
         tagline = tagline,
         version = version,
+        edition = meta._VERSION:match("enterprise") and "enterprise" or "community",
         hostname = knode.get_hostname(),
         node_id = node_id,
         timers = {
@@ -125,15 +150,20 @@ return {
   ["/endpoints"] = {
     GET = function(self, dao, helpers)
       local endpoints = setmetatable({}, cjson.array_mt)
-      local lapis_endpoints = require("kong.api").ordered_routes
-
-      for k, v in pairs(lapis_endpoints) do
-        if type(k) == "string" then -- skip numeric indices
-          endpoints[#endpoints + 1] = k:gsub(":([^/:]+)", function(m)
-              return "{" .. m .. "}"
-            end)
+      local application = require("kong.api")
+      local each_route = require("lapis.application.route_group").each_route
+      local filled_endpoints = {}
+      each_route(application, true, function(path)
+        if type(path) == "table" then
+          path = next(path)
         end
-      end
+        if not filled_endpoints[path] then
+          filled_endpoints[path] = true
+          endpoints[#endpoints + 1] = path:gsub(":([^/:]+)", function(m)
+            return "{" .. m .. "}"
+          end)
+        end
+      end)
       table.sort(endpoints, function(a, b)
         -- when sorting use lower-ascii char for "/" to enable segment based
         -- sorting, so not this:
@@ -170,12 +200,30 @@ return {
       return validate_schema("plugins", self.params)
     end
   },
+  ["/schemas/vaults/validate"] = {
+    POST = function(self, db, helpers)
+      return validate_schema("vaults", self.params)
+    end
+  },
   ["/schemas/:db_entity_name/validate"] = {
     POST = function(self, db, helpers)
       local db_entity_name = self.params.db_entity_name
       -- What happens when db_entity_name is a field name in the schema?
       self.params.db_entity_name = nil
       return validate_schema(db_entity_name, self.params)
+    end
+  },
+
+  ["/schemas/vaults/:name"] = {
+    GET = function(self, db, helpers)
+      local subschema = kong.db.vaults.schema.subschemas[self.params.name]
+      if not subschema then
+        return kong.response.exit(404, { message = "No vault named '"
+                                  .. self.params.name .. "'" })
+      end
+      local copy = api_helpers.schema_to_jsonable(subschema)
+      strip_foreign_schemas(copy.fields)
+      return kong.response.exit(200, copy)
     end
   },
   ["/schemas/plugins/:name"] = {
@@ -191,11 +239,27 @@ return {
       return kong.response.exit(200, copy)
     end
   },
+  ["/schemas/filters/:name"] = {
+    GET = function(self, db)
+      local name = self.params.name
+
+      if not wasm.filters_by_name[name] then
+        local msg = "Filter '" .. name .. "' not found"
+        return kong.response.exit(404, { message = msg })
+      end
+
+      local schema = wasm.filter_meta[name]
+                 and wasm.filter_meta[name].config_schema
+                  or default_filter_config_schema(db)
+
+      return kong.response.exit(200, schema)
+    end
+  },
   ["/timers"] = {
     GET = function (self, db, helpers)
       local body = {
         worker = {
-          id = ngx.worker.id(),
+          id = ngx.worker.id() or -1,
           count = ngx.worker.count(),
         },
         stats = kong.timer:stats({
@@ -205,5 +269,20 @@ return {
       }
       return kong.response.exit(200, body)
     end
-  }
+  },
+  ["/status/dns"] = {
+    GET = function (self, db, helpers)
+      if not kong.configuration.new_dns_client then
+        return kong.response.exit(501, { message = "not implemented with the legacy DNS client" })
+      end
+
+      return kong.response.exit(200, {
+        worker = {
+          id = ngx.worker.id() or -1,
+          count = ngx.worker.count(),
+        },
+        stats = kong.dns.stats(),
+      })
+    end
+  },
 }

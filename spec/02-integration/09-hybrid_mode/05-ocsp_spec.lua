@@ -14,9 +14,12 @@ local function set_ocsp_status(status)
 end
 
 
+for _, v in ipairs({ {"off", "off"}, {"on", "off"}, {"on", "on"}, }) do
+  local rpc, rpc_sync = v[1], v[2]
+
 for _, strategy in helpers.each_strategy() do
 
-describe("cluster_ocsp = on works #" .. strategy, function()
+describe("cluster_ocsp = on works #" .. strategy .. " rpc_sync=" .. rpc_sync, function()
   describe("DP certificate good", function()
     lazy_setup(function()
       helpers.get_db_utils(strategy, {
@@ -40,6 +43,8 @@ describe("cluster_ocsp = on works #" .. strategy, function()
         -- additional attributes for PKI:
         cluster_mtls = "pki",
         cluster_ca_cert = "spec/fixtures/ocsp_certs/ca.crt",
+        cluster_rpc = rpc,
+        cluster_rpc_sync = rpc_sync,
       }))
 
       set_ocsp_status("good")
@@ -57,6 +62,8 @@ describe("cluster_ocsp = on works #" .. strategy, function()
         cluster_mtls = "pki",
         cluster_server_name = "kong_clustering",
         cluster_ca_cert = "spec/fixtures/ocsp_certs/ca.crt",
+        cluster_rpc = rpc,
+        cluster_rpc_sync = rpc_sync,
       }))
     end)
 
@@ -110,6 +117,8 @@ describe("cluster_ocsp = on works #" .. strategy, function()
         -- additional attributes for PKI:
         cluster_mtls = "pki",
         cluster_ca_cert = "spec/fixtures/ocsp_certs/ca.crt",
+        cluster_rpc = rpc,
+        cluster_rpc_sync = rpc_sync,
       }))
 
       set_ocsp_status("revoked")
@@ -127,6 +136,8 @@ describe("cluster_ocsp = on works #" .. strategy, function()
         cluster_server_name = "kong_clustering",
         cluster_ca_cert = "spec/fixtures/ocsp_certs/ca.crt",
         nginx_conf = "spec/fixtures/custom_nginx.template",
+        cluster_rpc = rpc,
+        cluster_rpc_sync = rpc_sync,
       }))
     end)
 
@@ -178,6 +189,8 @@ describe("cluster_ocsp = on works #" .. strategy, function()
         -- additional attributes for PKI:
         cluster_mtls = "pki",
         cluster_ca_cert = "spec/fixtures/ocsp_certs/ca.crt",
+        cluster_rpc = rpc,
+        cluster_rpc_sync = rpc_sync,
       }))
 
       set_ocsp_status("error")
@@ -195,6 +208,8 @@ describe("cluster_ocsp = on works #" .. strategy, function()
         cluster_server_name = "kong_clustering",
         cluster_ca_cert = "spec/fixtures/ocsp_certs/ca.crt",
         nginx_conf = "spec/fixtures/custom_nginx.template",
+        cluster_rpc = rpc,
+        cluster_rpc_sync = rpc_sync,
       }))
     end)
 
@@ -225,7 +240,7 @@ describe("cluster_ocsp = on works #" .. strategy, function()
   end)
 end)
 
-describe("cluster_ocsp = off works with #" .. strategy .. " backend", function()
+describe("cluster_ocsp = off works with #" .. strategy .. " rpc_sync=" .. rpc_sync .. " backend", function()
   describe("DP certificate revoked, not checking for OCSP", function()
     lazy_setup(function()
       helpers.get_db_utils(strategy, {
@@ -249,6 +264,8 @@ describe("cluster_ocsp = off works with #" .. strategy .. " backend", function()
         -- additional attributes for PKI:
         cluster_mtls = "pki",
         cluster_ca_cert = "spec/fixtures/ocsp_certs/ca.crt",
+        cluster_rpc = rpc,
+        cluster_rpc_sync = rpc_sync,
       }))
 
       set_ocsp_status("revoked")
@@ -266,6 +283,8 @@ describe("cluster_ocsp = off works with #" .. strategy .. " backend", function()
         cluster_mtls = "pki",
         cluster_server_name = "kong_clustering",
         cluster_ca_cert = "spec/fixtures/ocsp_certs/ca.crt",
+        cluster_rpc = rpc,
+        cluster_rpc_sync = rpc_sync,
       }))
     end)
 
@@ -297,7 +316,7 @@ describe("cluster_ocsp = off works with #" .. strategy .. " backend", function()
   end)
 end)
 
-describe("cluster_ocsp = optional works with #" .. strategy .. " backend", function()
+describe("cluster_ocsp = optional works with #" .. strategy .. " rpc_sync=" .. rpc_sync .. " backend", function()
   describe("DP certificate revoked", function()
     lazy_setup(function()
       helpers.get_db_utils(strategy, {
@@ -321,6 +340,8 @@ describe("cluster_ocsp = optional works with #" .. strategy .. " backend", funct
         -- additional attributes for PKI:
         cluster_mtls = "pki",
         cluster_ca_cert = "spec/fixtures/ocsp_certs/ca.crt",
+        cluster_rpc = rpc,
+        cluster_rpc_sync = rpc_sync,
       }))
 
       set_ocsp_status("revoked")
@@ -338,6 +359,8 @@ describe("cluster_ocsp = optional works with #" .. strategy .. " backend", funct
         cluster_server_name = "kong_clustering",
         cluster_ca_cert = "spec/fixtures/ocsp_certs/ca.crt",
         nginx_conf = "spec/fixtures/custom_nginx.template",
+        cluster_rpc = rpc,
+        cluster_rpc_sync = rpc_sync,
       }))
     end)
 
@@ -389,6 +412,8 @@ describe("cluster_ocsp = optional works with #" .. strategy .. " backend", funct
         -- additional attributes for PKI:
         cluster_mtls = "pki",
         cluster_ca_cert = "spec/fixtures/ocsp_certs/ca.crt",
+        cluster_rpc = rpc,
+        cluster_rpc_sync = rpc_sync,
       }))
 
       set_ocsp_status("error")
@@ -406,6 +431,8 @@ describe("cluster_ocsp = optional works with #" .. strategy .. " backend", funct
         cluster_server_name = "kong_clustering",
         cluster_ca_cert = "spec/fixtures/ocsp_certs/ca.crt",
         nginx_conf = "spec/fixtures/custom_nginx.template",
+        cluster_rpc = rpc,
+        cluster_rpc_sync = rpc_sync,
       }))
     end)
 
@@ -440,4 +467,5 @@ describe("cluster_ocsp = optional works with #" .. strategy .. " backend", funct
   end)
 end)
 
-end
+end -- for _, strategy
+end -- for rpc_sync

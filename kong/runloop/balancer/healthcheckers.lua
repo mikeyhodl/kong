@@ -1,4 +1,4 @@
-local pl_tablex = require "pl.tablex"
+local cycle_aware_deep_copy = require("kong.tools.table").cycle_aware_deep_copy
 local get_certificate = require "kong.runloop.certificate".get_certificate
 
 local balancers = require "kong.runloop.balancer.balancers"
@@ -245,7 +245,7 @@ function healthcheckers_M.create_healthchecker(balancer, upstream)
   if (ngx.config.subsystem == "stream" and checks.active.type ~= "tcp")
     or (ngx.config.subsystem == "http" and checks.active.type == "tcp")
   then
-    checks = pl_tablex.deepcopy(checks)
+    checks = cycle_aware_deep_copy(checks)
     checks.active.healthy.interval = 0
     checks.active.unhealthy.interval = 0
   end
@@ -256,7 +256,7 @@ function healthcheckers_M.create_healthchecker(balancer, upstream)
 
   local ssl_cert, ssl_key
   if upstream.client_certificate then
-    local cert, err = get_certificate(upstream.client_certificate)
+    local cert, err = get_certificate(upstream.client_certificate, nil, upstream.ws_id)
     if not cert then
       log(ERR, "unable to fetch upstream client TLS certificate ",
         upstream.client_certificate.id, ": ", err)
@@ -270,8 +270,7 @@ function healthcheckers_M.create_healthchecker(balancer, upstream)
     ssl_cert, ssl_key = parse_global_cert_and_key()
   end
 
-  local events_module = kong.configuration.legacy_worker_events
-                        and "resty.worker.events" or "resty.events"
+  local events_module = "resty.events"
   local healthchecker, err = healthcheck.new({
     name = assert(upstream.ws_id) .. ":" .. upstream.name,
     shm_name = "kong_healthchecks",
@@ -358,7 +357,10 @@ function healthcheckers_M.get_balancer_health(upstream_id)
   end
 
   local healthchecker
-  local balancer_status
+
+  local balancer_status = balancer:getStatus()
+  local balancer_health = balancer_status.healthy and "HEALTHY" or "UNHEALTHY"
+
   local health = "HEALTHCHECKS_OFF"
   if is_upstream_using_healthcheck(upstream) then
     healthchecker = balancer.healthchecker
@@ -366,12 +368,12 @@ function healthcheckers_M.get_balancer_health(upstream_id)
       return nil, "healthchecker not found"
     end
 
-    balancer_status = balancer:getStatus()
-    health = balancer_status.healthy and "HEALTHY" or "UNHEALTHY"
+    health = balancer_health
   end
 
   return {
     health = health,
+    balancer_health = balancer_health,
     id = upstream_id,
     details = balancer_status,
   }
@@ -416,7 +418,12 @@ end
 -- the health checker, this parameter is useful to avoid throwing away current
 -- health status.
 function healthcheckers_M.stop_healthcheckers(delay)
-  for _, id in pairs(upstreams.get_all_upstreams()) do
+  local all_upstreams, err = upstreams.get_all_upstreams()
+  if err then
+    log(ERR, "[healthchecks] failed to retrieve all upstreams: ", err)
+    return
+  end
+  for _, id in pairs(all_upstreams) do
     local balancer = balancers.get_balancer_by_id(id)
     if balancer then
       healthcheckers_M.stop_healthchecker(balancer, delay)

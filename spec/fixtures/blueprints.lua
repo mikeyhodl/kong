@@ -1,7 +1,5 @@
 local ssl_fixtures = require "spec.fixtures.ssl"
-local utils = require "kong.tools.utils"
-
-local deep_merge = utils.deep_merge
+local cycle_aware_deep_merge = require("kong.tools.table").cycle_aware_deep_merge
 local fmt = string.format
 
 
@@ -11,7 +9,7 @@ Blueprint.__index = Blueprint
 
 function Blueprint:build(overrides)
   overrides = overrides or {}
-  return deep_merge(self.build_function(overrides), overrides)
+  return cycle_aware_deep_merge(self.build_function(overrides), overrides)
 end
 
 
@@ -62,6 +60,13 @@ function Blueprint:insert_n(n, overrides, options)
   return res
 end
 
+function Blueprint:truncate()
+  local _, err = self.dao:truncate()
+  if err then
+    error(err, 2)
+  end
+  return true
+end
 
 local function new_blueprint(dao, build_function)
   return setmetatable({
@@ -76,15 +81,19 @@ Sequence.__index = Sequence
 
 
 function Sequence:next()
-  self.count = self.count + 1
-  return fmt(self.sequence_string, self.count)
+  return fmt(self.sequence_string, self:gen())
 end
 
+function Sequence:gen()
+  self.count = self.count + 1
+  return self.count
+end
 
-local function new_sequence(sequence_string)
+local function new_sequence(sequence_string, gen)
   return setmetatable({
     count           = 0,
     sequence_string = sequence_string,
+    gen             = gen,
   }, Sequence)
 end
 
@@ -95,7 +104,30 @@ local _M = {}
 function _M.new(db)
   local res = {}
 
+  -- prepare Sequences and random values
   local sni_seq = new_sequence("server-name-%d")
+  local upstream_name_seq = new_sequence("upstream-%d")
+  local consumer_custom_id_seq = new_sequence("consumer-id-%d")
+  local consumer_username_seq = new_sequence("consumer-username-%d")
+  local named_service_name_seq = new_sequence("service-name-%d")
+  local named_service_host_seq = new_sequence("service-host-%d.test")
+  local named_route_name_seq = new_sequence("route-name-%d")
+  local named_route_host_seq = new_sequence("route-host-%d.test")
+  local acl_group_seq = new_sequence("acl-group-%d")
+  local jwt_key_seq = new_sequence("jwt-key-%d")
+  local oauth_code_seq = new_sequence("oauth-code-%d")
+  local keyauth_key_seq = new_sequence("keyauth-key-%d")
+  local hmac_username_seq = new_sequence("hmac-username-%d")
+  local workspace_name_seq = new_sequence("workspace-name-%d")
+  local key_sets_seq = new_sequence("key-sets-%d")
+  local keys_seq = new_sequence("keys-%d")
+
+  local random_ip = tostring(math.random(1, 255)) .. "." ..
+    tostring(math.random(1, 255)) .. "." ..
+    tostring(math.random(1, 255)) .. "." ..
+    tostring(math.random(1, 255))
+  local random_target = random_ip .. ":" .. tostring(math.random(1, 65535))
+
   res.snis = new_blueprint(db.snis, function(overrides)
     return {
       name        = overrides.name or sni_seq:next(),
@@ -116,7 +148,6 @@ function _M.new(db)
     }
   end)
 
-  local upstream_name_seq = new_sequence("upstream-%d")
   res.upstreams = new_blueprint(db.upstreams, function(overrides)
     local slots = overrides.slots or 100
     local name = overrides.name or upstream_name_seq:next()
@@ -129,8 +160,6 @@ function _M.new(db)
     }
   end)
 
-  local consumer_custom_id_seq = new_sequence("consumer-id-%d")
-  local consumer_username_seq = new_sequence("consumer-username-%d")
   res.consumers = new_blueprint(db.consumers, function()
     return {
       custom_id = consumer_custom_id_seq:next(),
@@ -140,8 +169,9 @@ function _M.new(db)
 
   res.targets = new_blueprint(db.targets, function(overrides)
     return {
-      weight = 10,
+      weight = overrides.weight or 10,
       upstream = overrides.upstream or res.upstreams:insert(),
+      target = overrides.target or random_target,
     }
   end)
 
@@ -150,8 +180,15 @@ function _M.new(db)
   end)
 
   res.routes = new_blueprint(db.routes, function(overrides)
+    local service
+    if overrides.no_service then
+      service = nil
+      overrides.no_service = nil
+    else
+      service = overrides.service or res.services:insert()
+    end
     return {
-      service = overrides.service or res.services:insert(),
+      service = service,
     }
   end)
 
@@ -171,8 +208,6 @@ function _M.new(db)
     }
   end)
 
-  local named_service_name_seq = new_sequence("service-name-%d")
-  local named_service_host_seq = new_sequence("service-host-%d.test")
   res.named_services = new_blueprint(db.services, function()
     return {
       protocol = "http",
@@ -182,8 +217,6 @@ function _M.new(db)
     }
   end)
 
-  local named_route_name_seq = new_sequence("route-name-%d")
-  local named_route_host_seq = new_sequence("route-host-%d.test")
   res.named_routes = new_blueprint(db.routes, function(overrides)
     return {
       name = named_route_name_seq:next(),
@@ -199,7 +232,6 @@ function _M.new(db)
     }
   end)
 
-  local acl_group_seq = new_sequence("acl-group-%d")
   res.acls = new_blueprint(db.acls, function()
     return {
       group = acl_group_seq:next(),
@@ -254,7 +286,6 @@ function _M.new(db)
     }
   end)
 
-  local jwt_key_seq = new_sequence("jwt-key-%d")
   res.jwt_secrets = new_blueprint(db.jwt_secrets, function()
     return {
       key       = jwt_key_seq:next(),
@@ -283,7 +314,6 @@ function _M.new(db)
     }
   end)
 
-  local oauth_code_seq = new_sequence("oauth-code-%d")
   res.oauth2_authorization_codes = new_blueprint(db.oauth2_authorization_codes, function()
     return {
       code  = oauth_code_seq:next(),
@@ -306,7 +336,6 @@ function _M.new(db)
     }
   end)
 
-  local keyauth_key_seq = new_sequence("keyauth-key-%d")
   res.keyauth_credentials = new_blueprint(db.keyauth_credentials, function()
     return {
       key = keyauth_key_seq:next(),
@@ -324,7 +353,6 @@ function _M.new(db)
     }
   end)
 
-  local hmac_username_seq = new_sequence("hmac-username-%d")
   res.hmacauth_credentials = new_blueprint(db.hmacauth_credentials, function()
     return {
       username = hmac_username_seq:next(),
@@ -360,7 +388,6 @@ function _M.new(db)
     }
   end)
 
-  local workspace_name_seq = new_sequence("workspace-name-%d")
   res.workspaces = new_blueprint(db.workspaces, function()
     return {
       name = workspace_name_seq:next(),
@@ -374,16 +401,26 @@ function _M.new(db)
     }
   end)
 
-  local key_sets_seq = new_sequence("key-sets-%d")
   res.key_sets = new_blueprint(db.key_sets, function()
     return {
       name = key_sets_seq:next(),
     }
   end)
-  local keys_seq = new_sequence("keys-%d")
+
   res.keys = new_blueprint(db.keys, function()
     return {
       name = keys_seq:next(),
+    }
+  end)
+
+  res.vaults = new_blueprint(db.vaults, function()
+    return {}
+  end)
+
+  local filter_chains_seq = new_sequence("filter-chains-%d")
+  res.filter_chains = new_blueprint(db.filter_chains, function()
+    return {
+      name = filter_chains_seq:next(),
     }
   end)
 

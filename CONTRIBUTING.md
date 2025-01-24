@@ -6,27 +6,46 @@ document is for you! It intends to be both an entry point for newcomers to
 the community (with various technical backgrounds), and a guide/reference for
 contributors and maintainers.
 
+Please have a look at our [Community Pledge](./COMMUNITY_PLEDGE.md) to
+understand how we work with our open-source contributors!
+
 Consult the Table of Contents below, and jump to the desired section.
 
-## Table of Contents
+# Table of Contents
 
-- [Where to seek for help?](#where-to-seek-for-help)
-  - [Enterprise Edition](#enterprise-edition)
-  - [Community Edition](#community-edition)
-- [Where to report bugs?](#where-to-report-bugs)
-- [Where to submit feature requests?](#where-to-submit-feature-requests)
-- [Contributing](#contributing)
-  - [Improving the documentation](#improving-the-documentation)
-  - [Proposing a new plugin](#proposing-a-new-plugin)
-  - [Submitting a patch](#submitting-a-patch)
-    - [Git branches](#git-branches)
-    - [Commit atomicity](#commit-atomicity)
-    - [Commit message format](#commit-message-format)
-    - [Static linting](#static-linting)
-    - [Writing tests](#writing-tests)
-    - [Writing performant code](#writing-performant-code)
-  - [Contributor T-shirt](#contributor-t-shirt)
-- [Code style](#code-style)
+* [Contributing to Kong :monkey_face:](#contributing-to-kong-monkey_face)
+    * [Where to seek for help?](#where-to-seek-for-help)
+        * [Enterprise Edition](#enterprise-edition)
+        * [Community Edition](#community-edition)
+    * [Where to report bugs?](#where-to-report-bugs)
+    * [Where to submit feature requests?](#where-to-submit-feature-requests)
+    * [Contributing](#contributing)
+        * [Improving the documentation](#improving-the-documentation)
+        * [Proposing a new plugin](#proposing-a-new-plugin)
+        * [Submitting a patch](#submitting-a-patch)
+            * [Git branches](#git-branches)
+            * [Commit atomicity](#commit-atomicity)
+            * [Commit message format](#commit-message-format)
+                * [Type](#type)
+                * [Scope](#scope)
+                * [Subject](#subject)
+                * [Body](#body)
+                * [Footer](#footer)
+                * [Examples](#examples)
+            * [Static linting](#static-linting)
+            * [Writing tests](#writing-tests)
+            * [Writing changelog](#writing-changelog)
+            * [Writing performant code](#writing-performant-code)
+            * [Adding Changelog](#adding-changelog)
+        * [Contributor Badge](#contributor-badge)
+    * [Code style](#code-style)
+        * [Table of Contents - Code style](#table-of-contents---code-style)
+        * [Modules](#modules)
+        * [Variables](#variables)
+        * [Tables](#tables)
+        * [Strings](#strings)
+        * [Functions](#functions)
+        * [Conditional expressions](#conditional-expressions)
 
 ## Where to seek for help?
 
@@ -36,11 +55,11 @@ If you are a Kong Enterprise customer, you may contact the Enterprise Support ch
 by opening an Enterprise support ticket on
 [https://support.konghq.com](https://support.konghq.com/).
 
-If you are experiencing a P1 issue, please call at the [24/7 Enterprise Support
+If you are experiencing a P1 issue, please call the [24/7 Enterprise Support
 phone line](https://support.konghq.com/hc/en-us/articles/115004921808-Telephone-Support)
 for immediate assistance, as published in the Customer Success Reference Guide.
 
-If you are interested in becoming a Kong Enterprise customer, please to visit
+If you are interested in becoming a Kong Enterprise customer, please visit
 https://konghq.com/kong-enterprise-edition/ or contact us at
 [sales@konghq.com](mailto:sales@konghq.com).
 
@@ -48,21 +67,18 @@ https://konghq.com/kong-enterprise-edition/ or contact us at
 
 ### Community Edition
 
-There are multiple channels where you can get answers from the community
-or the maintainers of this project:
-
-- Our public forum, [Kong Nation](https://discuss.konghq.com) is great for
-  asking questions, giving advice, and staying up-to-date with the latest
-  announcements. Kong Nation is frequented by Kong maintainers.
-- Two chat channels are used by the community, but are rarely visited by Kong
-  maintainers:
-  - [Gitter](https://gitter.im/Kong/kong)
-  - IRC, registered on freenode as
-    [#kong](https://webchat.freenode.net/?channels=kong)
+For questions about the use of the Community Edition, please use
+[GitHub Discussions](https://github.com/Kong/kong/discussions).  You
+can also join our [Community Slack](http://kongcommunity.slack.com/)
+for real-time conversations around Kong Gateway.
 
 **Please avoid opening GitHub issues for general questions or help**, as those
 should be reserved for actual bug reports. The Kong community is welcoming and
 more than willing to assist you on those channels!
+
+Our public forum, [Kong Nation](https://discuss.konghq.com) is great
+for asking questions, giving advice, and staying up-to-date with the
+latest announcements.
 
 [Back to TOC](#table-of-contents)
 
@@ -95,9 +111,7 @@ on [Submitting a patch](#submitting-a-patch) for details.
 
 ## Contributing
 
-We welcome contributions of all kinds, there is no need to do code to be helpful!
-All of the following tasks are noble and worthy contributions that you can
-make without coding:
+In addition to code enhancements and bug fixes, you can contribute by
 
 - Reporting a bug (see the [report bugs](#where-to-report-bugs) section)
 - Helping other members of the community on the support channels
@@ -126,17 +140,19 @@ https://github.com/Kong/docs.konghq.com/
 
 ### Proposing a new plugin
 
-We **do not** accept new plugins into the core repository. The plugins that are
-currently part of this repository are there because of historical reasons, but
-will be pushed into separate repositories in the foreseeable future.
+We **do not** generally accept new plugins into this repository. The
+plugins that are currently part of it form the foundational set of
+plugins which is available to all installations of Kong Gateway.
+Specialized functionality should be implemented in plugins residing in
+separate repository.
 
-If you are interested in writing a new plugin for your own needs, you should begin by
-reading the [Plugin Development
-Guide](https://docs.konghq.com/latest/plugin-development).
+If you are interested in writing a new plugin for your own needs, you
+should begin by reading the
+[Plugin Development Guide](https://docs.konghq.com/latest/plugin-development).
 
 If you already wrote a plugin, and are thinking about making it available to
 the community, we strongly encourage you to host it on a publicly available
-repository (like GitHub), and to distribute it via
+repository (like GitHub), and distribute it via
 [LuaRocks](https://luarocks.org/search?q=kong). A good resource on how to do
 so is the [Distribution
 Section](https://docs.konghq.com/latest/plugin-development/distribution/#distributing-your-plugin)
@@ -152,9 +168,12 @@ To give visibility to your plugin, we advise that you:
 
 ### Submitting a patch
 
-Feel free to contribute fixes or minor features, we love to receive Pull
-Requests! If you are planning to develop a larger feature, come talk to us
-first!
+Feel free to contribute fixes or minor features by opening a Pull
+Request.  Small contributions are more likely to be merged quicker
+than changes which require a lot of time to review.  If you are
+planning to develop a larger feature, please talk to us first in the
+[GitHub Discussions](https://github.com/Kong/kong/discussions)
+section!
 
 When contributing, please follow the guidelines provided in this document. They
 will cover topics such as the different Git branches we use, the commit message
@@ -172,23 +191,23 @@ to verify a few things:
   development documentation for additional details)
 - The tests are passing: run `make test`, `make test-all`, or whichever is
   appropriate for your change
-- Do not update CHANGELOG.md yourself. Your change will be included therein
-  due time if it is accepted, no worries!
+- Do not update `CHANGELOG.md` inside your Pull Request. This file is automatically regenerated
+  and maintained during the release process.
 
 If the above guidelines are respected, your Pull Request has all its chances
 to be considered and will be reviewed by a maintainer.
 
 If you are asked to update your patch by a reviewer, please do so! Remember:
-**you are responsible for pushing your patch forward**. If you contributed it,
+**You are responsible for pushing your patch forward**. If you contributed it,
 you are probably the one in need of it. You must be ready to apply changes
 to it if necessary.
 
 If your Pull Request was accepted and fixes a bug, adds functionality, or
 makes it significantly easier to use or understand Kong, congratulations!
 You are now an official contributor to Kong. Get in touch with us to receive
-your very own [Contributor T-shirt](#contributor-t-shirt)!
+your very own [Contributor Badge](#contributor-badge)!
 
-Your change will be included in the subsequent release Changelog, and we will
+Your change will be included in the subsequent release and its changelog, and we will
 not forget to include your name if you are an external contributor. :wink:
 
 [Back to TOC](#table-of-contents)
@@ -204,6 +223,8 @@ naming scheme when pushing your branch(es):
 - `refactor/foo-bar` when refactoring code without any behavior change
 - `style/foo-bar` when addressing some style issue
 - `docs/foo-bar` for updates to the README.md, this file, or similar documents
+- `chore/foo-bar` when the change does not concern the functional source
+- `perf/foo-bar` for performance improvements
 
 [Back to TOC](#table-of-contents)
 
@@ -254,6 +275,8 @@ Here is a template of what your commit message should look like:
 <footer>
 ```
 
+[Back to TOC](#table-of-contents)
+
 ##### Type
 
 The type of your commit indicates what type of change this commit is about. The
@@ -272,7 +295,9 @@ accepted types are:
   is too big to be considered just `perf`
 - **chore**: Maintenance changes related to code cleaning that isn't
   considered part of a refactor, build process updates, dependency bumps, or
-  auxiliary tools and libraries updates (LuaRocks, Travis-ci, etc...).
+  auxiliary tools and libraries updates (LuaRocks, GitHub Actions, etc...).
+
+[Back to TOC](#table-of-contents)
 
 ##### Scope
 
@@ -296,6 +321,8 @@ it is at your discretion, but here are some of the most frequent ones:
 - `*`: When the change affects too many parts of the codebase at once (this
   should be rare and avoided)
 
+[Back to TOC](#table-of-contents)
+
 ##### Subject
 
 Your subject should contain a succinct description of the change. It should be
@@ -305,29 +332,35 @@ written so that:
 - It is **not** capitalized: "fix typo", and not "Fix typo"
 - It does **not** include a period. :smile:
 
+[Back to TOC](#table-of-contents)
+
 ##### Body
 
 The body of your commit message should contain a detailed description of your
 changes. Ideally, if the change is significant, you should explain its
-motivation, the chosen implementation, and justify it.
+motivation and the chosen implementation, and justify it.
 
 As previously mentioned, lines in the commit messages should not exceed 72
 characters.
+
+[Back to TOC](#table-of-contents)
 
 ##### Footer
 
 The footer is the ideal place to link to related material about the change:
 related GitHub issues, Pull Requests, fixed bug reports, etc...
 
+[Back to TOC](#table-of-contents)
+
 ##### Examples
 
 Here are a few examples of good commit messages to take inspiration from:
 
 ```
-fix(admin) send HTTP 405 on unsupported method
+fix(admin): send HTTP 405 on unsupported method
 
 The appropriate status code when the request method is not supported
-on an endpoint it 405. We previously used to send HTTP 404, which
+on an endpoint is 405. We previously used to send HTTP 404, which
 is not appropriate. This updates the Admin API helpers to properly
 return 405 on such user errors.
 
@@ -340,7 +373,7 @@ Fix #678
 Or:
 
 ```
-tests(proxy) add a new test case for URI encoding
+tests(proxy): add a new test case for URI encoding
 
 When proxying upstream, the URI sent by Kong should be the one
 received from the client, even if it was percent-encoded.
@@ -371,7 +404,7 @@ $ luacheck .
 
 #### Writing tests
 
-We use [busted](https://olivinelabs.com/busted/) to write our tests. Your patch
+We use [busted](https://lunarmodules.github.io/busted/) to write our tests. Your patch
 must include the related test updates or additions, in the appropriate test
 suite.
 
@@ -382,11 +415,11 @@ suite.
   output
 - `spec/03-plugins` contains tests (both unit and integration) for the bundled
   plugins (those plugins still live in the core repository as of now, but will
-  eventually be externalized)
+  eventually be externalized.)
 
 A few guidelines when writing tests:
 
-- Make sure to use appropriate `describe` and `it` blocks, so it's obvious to what is being
+- Make sure to use appropriate `describe` and `it` blocks, so it's obvious what is being
   tested exactly
 - Ensure the atomicity of your tests: no test should be asserting two
   unrelated behaviors at the same time
@@ -416,6 +449,13 @@ assert.same(t1, t2)
 
 [Back to TOC](#table-of-contents)
 
+#### Writing changelog
+
+Please follow the guidelines in [Changelog Readme](https://github.com/Kong/kong/blob/master/changelog/README.md)
+on how to write a changelog for your change.
+
+[Back to TOC](#table-of-contents)
+
 #### Writing performant code
 
 We write code for the [LuaJIT](https://github.com/Kong/kong/issues/new)
@@ -425,7 +465,7 @@ practices:
 - Do **not** instantiate global variables
 - Consult the [LuaJIT wiki](http://wiki.luajit.org/Home)
 - Follow the [Performance
-  Guide](http://wiki.luajit.org/Numerical-Computing-Performance-Guide)
+  Guide](https://www.freelists.org/post/luajit/Tuning-numerical-computations-for-LuaJIT-was-Re-ANN-Sci10beta1)
   recommendations
 - Do **not** use [NYI functions](http://wiki.luajit.org/NYI) on hot code paths
 - Prefer using the FFI over traditional bindings via the Lua C API
@@ -446,7 +486,8 @@ practices:
   end
   ```
 
-- Cache the globals used by your hot code paths
+- Cache the globals used by your hot code paths,
+  the cached name should be the original name replaced `.` by `_`
 
   ```lua
   -- bad
@@ -455,9 +496,23 @@ practices:
   end
 
   -- good
-  local random = math.random
+  local math_random = math.random
   for i = 1, 100 do
-    t[i] = random()
+    t[i] = math_random()
+  end
+  ```
+
+  For OpenResty built-in APIs, we may drop `ngx.` in the localized version
+
+  ```lua
+  local req_get_post_args = ngx.req.get_post_args
+  ```
+
+  Non-hot paths are localization-optional
+
+  ```lua
+  if err then
+    ngx.log(ngx.ERR, ...) -- this is fine as the error condition is not on the hot path
   end
   ```
 
@@ -480,23 +535,31 @@ practices:
 
 And finally, most importantly: use your best judgment to design an
 efficient algorithm. Doing so will always be more performant than a
-poorly-designed algorithm, even following all the performance tricks of the
+poorly designed algorithm, even following all the performance tricks of the
 language you are using. :smile:
 
 [Back to TOC](#table-of-contents)
 
-### Contributor T-shirt
+#### Adding Changelog
+
+Please follow [the changelog instructions](https://github.com/Kong/gateway-changelog)
+to create the appropriate changelog file for your Pull Request.
+
+[Back to TOC](#table-of-contents)
+
+### Contributor Badge
 
 If your Pull Request to [Kong/kong](https://github.com/Kong/kong) was
 accepted, and it fixes a bug, adds functionality, or makes it significantly
 easier to use or understand Kong, congratulations! You are eligible to
-receive the very special Contributor T-shirt! Go ahead and fill out the
+receive the very special digital Contributor Badge! Go ahead and fill out the
 [Contributors Submissions form](https://goo.gl/forms/5w6mxLaE4tz2YM0L2).
 
-Proudly wear your T-shirt and show it to us by tagging
+Proudly display your Badge and show it to us by tagging
 [@thekonginc](https://twitter.com/thekonginc) on Twitter!
 
-![Kong Contributor T-shirt](https://konghq.com/wp-content/uploads/2018/04/100-contributor-t-shirt-1024x768.jpg)
+*Badges expire after 1 year, at which point you may submit a new contribution
+to renew the badge.*
 
 [Back to TOC](#table-of-contents)
 
@@ -529,6 +592,8 @@ the recommended style are welcome!**
 - [Functions](#functions)
 - [Conditional expressions](#conditional-expressions)
 
+[Back to TOC](#table-of-contents)
+
 ### Modules
 
 When writing a module (a Lua file), separate logical blocks of code with
@@ -556,6 +621,8 @@ return _M
 
 [Back to code style TOC](#table-of-contents---code-style)
 
+[Back to TOC](#table-of-contents)
+
 ### Variables
 
 When naming a variable or function, **do** use snake_case:
@@ -579,6 +646,8 @@ local MAX_LEN = 100
 ```
 
 [Back to code style TOC](#table-of-contents---code-style)
+
+[Back to TOC](#table-of-contents)
 
 ### Tables
 
@@ -608,7 +677,24 @@ local t = {foo="hello",bar="world"}
 local t = { foo = "hello", bar = "world" }
 ```
 
+Prefer `ipairs()` to `for` loop when iterating an array,
+which gives us more readability:
+
+```lua
+-- bad
+for i = 1, #t do
+  ...
+end
+
+-- good
+for _, v in ipairs(t) do
+  ...
+end
+```
+
 [Back to code style TOC](#table-of-contents---code-style)
+
+[Back to TOC](#table-of-contents)
 
 ### Strings
 
@@ -643,7 +729,21 @@ local str = "hello ".."world"
 local str = "hello " .. "world"
 ```
 
+If a string is too long, **do** break it into multiple lines,
+and join them with the concatenation operator:
+
+```lua
+-- bad
+local str = "It is a very very very long string, that should be broken into multiple lines."
+
+-- good
+local str = "It is a very very very long string, " ..
+            "that should be broken into multiple lines."
+```
+
 [Back to code style TOC](#table-of-contents---code-style)
+
+[Back to TOC](#table-of-contents)
 
 ### Functions
 
@@ -726,9 +826,11 @@ local str = string.format("SELECT * FROM users WHERE first_name = '%s'",
 
 [Back to code style TOC](#table-of-contents---code-style)
 
+[Back to TOC](#table-of-contents)
+
 ### Conditional expressions
 
-Avoid writing 1-liner conditions, **do** indent the child branch:
+Avoid writing 1-line conditions, **do** indent the child branch:
 
 ```lua
 -- bad
@@ -852,4 +954,17 @@ then
 end
 ```
 
+When invoking `ngx.log()` with some variable as input, prefer vararg-style
+calls rather than using the string concatenation operator (`..`):
+
+```lua
+-- bad
+ngx.log(ngx.DEBUG, "if `my_var` is nil, this code throws an exception: " .. my_var)
+
+-- good
+ngx.log(ngx.DEBUG, "if `my_var` is nil, this code is fine: ", my_var)
+```
+
 [Back to code style TOC](#table-of-contents---code-style)
+
+[Back to TOC](#table-of-contents)

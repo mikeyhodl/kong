@@ -8,9 +8,11 @@ local MetaSchema   = require "kong.db.schema.metaschema"
 local constants    = require "kong.constants"
 local log          = require "kong.cmd.utils.log"
 local workspaces   = require "kong.workspaces"
-local utils        = require "kong.tools.utils"
 local knode        = kong and kong.node
                      or require "kong.pdk.node".new()
+
+
+local load_module_if_exists = require "kong.tools.module".load_module_if_exists
 
 
 local fmt          = string.format
@@ -71,7 +73,7 @@ function DB.new(kong_config, strategy)
 
       -- load core entities subschemas
       local subschemas
-      ok, subschemas = utils.load_module_if_exists("kong.db.schema.entities." .. entity_name .. "_subschemas")
+      ok, subschemas = load_module_if_exists("kong.db.schema.entities." .. entity_name .. "_subschemas")
       if ok then
         for name, subschema in pairs(subschemas) do
           local ok, err = entity:new_subschema(name, subschema)
@@ -100,7 +102,7 @@ function DB.new(kong_config, strategy)
     strategy   = strategy,
     errors     = errors,
     infos      = connector:infos(),
-    kong_config = kong_config,
+    loaded_plugins = kong_config.loaded_plugins, -- left for MigrationsState.load
   }
 
   do
@@ -136,7 +138,6 @@ function DB:init_connector()
   -- I/O with the DB connector singleton
   -- Implementation up to the strategy's connector. A place for:
   --   - connection check
-  --   - cluster retrieval (cassandra)
   --   - prepare statements
   --   - nop (default)
 
@@ -419,7 +420,6 @@ end
 
 do
   -- migrations
-  local utils = require "kong.tools.utils"
   local MigrationsState = require "kong.db.migrations.state"
 
 
@@ -444,8 +444,7 @@ do
       return nil, prefix_err(self, err)
     end
 
-    local ok, err = self.connector:schema_bootstrap(self.kong_config,
-                                                    DEFAULT_LOCKS_TTL)
+    local ok, err = self.connector:schema_bootstrap(DEFAULT_LOCKS_TTL)
 
     self.connector:close()
 
@@ -491,8 +490,8 @@ do
     if run_teardown and options.skip_teardown_migrations then
       for _, t in ipairs(options.skip_teardown_migrations) do
         for _, mig in ipairs(t.migrations) do
-          local ok, mod = utils.load_module_if_exists(t.namespace .. "." ..
-                                                      mig.name)
+          local ok, mod = load_module_if_exists(t.namespace .. "." ..
+                                                mig.name)
           if ok then
             local strategy_migration = mod[self.strategy]
             if strategy_migration and strategy_migration.teardown then
@@ -524,8 +523,8 @@ do
           self.infos.db_name)
 
       for _, mig in ipairs(t.migrations) do
-        local ok, mod = utils.load_module_if_exists(t.namespace .. "." ..
-                                                    mig.name)
+        local ok, mod = load_module_if_exists(t.namespace .. "." ..
+                                              mig.name)
         if not ok then
           self.connector:close()
           return nil, fmt_err(self, "failed to load migration '%s': %s",
@@ -583,16 +582,6 @@ do
                               skip_teardown_migrations[t.subsystem][mig.name]
 
         if not skip_teardown and run_teardown and strategy_migration.teardown then
-          if run_up then
-            -- ensure schema consensus is reached before running DML queries
-            -- that could span all peers
-            ok, err = self.connector:wait_for_schema_consensus()
-            if not ok then
-              self.connector:close()
-              return nil, prefix_err(self, err)
-            end
-          end
-
           -- kong migrations teardown
           local f = strategy_migration.teardown
 
@@ -612,19 +601,6 @@ do
           end
 
           n_pending = math.max(n_pending - 1, 0)
-
-          if not run_up then
-            -- ensure schema consensus is reached when the next migration to
-            -- run will execute its teardown step, since it may make further
-            -- DML queries; if the next migration runs its up step, it will
-            -- run DDL queries against the same node, so no need to reach
-            -- schema consensus
-            ok, err = self.connector:wait_for_schema_consensus()
-            if not ok then
-              self.connector:close()
-              return nil, prefix_err(self, err)
-            end
-          end
         end
 
         log("%s migrated up to: %s %s", t.subsystem, mig.name,
@@ -632,17 +608,6 @@ do
                                                               or "(executed)")
 
         n_migrations = n_migrations + 1
-      end
-
-      if run_up and i == #migrations then
-        -- wait for schema consensus after the last migration has run
-        -- (only if `run_up`, since if not, we just called it from the
-        -- teardown step)
-        ok, err = self.connector:wait_for_schema_consensus()
-        if not ok then
-          self.connector:close()
-          return nil, prefix_err(self, err)
-        end
       end
     end
 
@@ -673,8 +638,8 @@ do
 
     for _, t in ipairs(migrations) do
       for _, mig in ipairs(t.migrations) do
-        local ok, mod = utils.load_module_if_exists(t.namespace .. "." ..
-                                                    mig.name)
+        local ok, mod = load_module_if_exists(t.namespace .. "." ..
+                                              mig.name)
         if not ok then
           return nil, fmt("failed to load migration '%s': %s", mig.name,
                           mod)

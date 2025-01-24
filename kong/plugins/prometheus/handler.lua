@@ -11,14 +11,20 @@ local PrometheusHandler = {
   VERSION  = kong_meta.version,
 }
 
-function PrometheusHandler.init_worker()
+function PrometheusHandler:init_worker()
   exporter.init_worker()
 end
+
+
+function PrometheusHandler:configure(configs)
+  exporter.configure(configs)
+end
+
 
 local http_subsystem = ngx.config.subsystem == "http"
 
 
-function PrometheusHandler.log(self, conf)
+function PrometheusHandler:log(conf)
   local message = kong.log.serialize()
 
   local serialized = {}
@@ -48,8 +54,8 @@ function PrometheusHandler.log(self, conf)
     serialized.latencies = message.latencies
   end
 
-  if conf.upstream_health_metrics then
-    exporter.set_export_upstream_health_metrics(true)
+  if conf.ai_metrics then
+    serialized.ai_metrics = message.ai
   end
 
   exporter.log(message, serialized)

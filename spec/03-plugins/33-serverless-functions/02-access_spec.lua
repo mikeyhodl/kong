@@ -58,6 +58,38 @@ local mock_fn_ten = [[
   ngx.var.args = nil
 ]]
 
+-- cache is accessible
+local mock_fn_eleven = [[
+  local ok, err = kong.cache:get("foo", nil, function() return "val" end)
+  if err then
+    ngx.exit(500)
+  end
+  local v = kong.cache:get("foo")
+  ngx.status = 200
+  ngx.say(v)
+  ngx.exit(ngx.status)
+]]
+
+-- cache does not allow access to gateway information
+local mock_fn_twelve = [[
+  ngx.status = 200
+  ngx.say(tostring(kong.cache.cluster_events))
+  ngx.exit(ngx.status)
+]]
+
+-- configuration is accessible
+local mock_fn_thirteen = [[
+  ngx.status = 200
+  ngx.say(kong.configuration.plugins[1])
+  ngx.exit(ngx.status)
+]]
+
+-- configuration restricts access to properties
+local mock_fn_fourteen = [[
+  ngx.status = 200
+  ngx.say(kong.configuration.pg_password)
+  ngx.exit(ngx.status)
+]]
 
 
 describe("Plugin: serverless-functions", function()
@@ -95,47 +127,67 @@ for _, plugin_name in ipairs({ "pre-function", "post-function" }) do
 
         local route1 = bp.routes:insert {
           service = { id = service.id },
-          hosts   = { "one." .. plugin_name .. ".com" },
+          hosts   = { "one." .. plugin_name .. ".test" },
         }
 
         local route2 = bp.routes:insert {
           service = { id = service.id },
-          hosts   = { "two." .. plugin_name .. ".com" },
+          hosts   = { "two." .. plugin_name .. ".test" },
         }
 
         local route3 = bp.routes:insert {
           service = { id = service.id },
-          hosts   = { "three." .. plugin_name .. ".com" },
+          hosts   = { "three." .. plugin_name .. ".test" },
         }
 
         local route4 = bp.routes:insert {
           service = { id = service.id },
-          hosts   = { "four." .. plugin_name .. ".com" },
+          hosts   = { "four." .. plugin_name .. ".test" },
         }
 
         local route6 = bp.routes:insert {
           service = { id = service.id },
-          hosts   = { "six." .. plugin_name .. ".com" },
+          hosts   = { "six." .. plugin_name .. ".test" },
         }
 
         local route7 = bp.routes:insert {
           service = { id = service.id },
-          hosts   = { "seven." .. plugin_name .. ".com" },
+          hosts   = { "seven." .. plugin_name .. ".test" },
         }
 
         local route8 = bp.routes:insert {
           service = { id = service.id },
-          hosts   = { "eight." .. plugin_name .. ".com" },
+          hosts   = { "eight." .. plugin_name .. ".test" },
         }
 
         local route9 = bp.routes:insert {
           service = { id = service.id },
-          hosts   = { "nine." .. plugin_name .. ".com" },
+          hosts   = { "nine." .. plugin_name .. ".test" },
         }
 
         local route10 = bp.routes:insert {
           service = { id = service.id },
-          hosts   = { "ten." .. plugin_name .. ".com" },
+          hosts   = { "ten." .. plugin_name .. ".test" },
+        }
+
+        local route11 = bp.routes:insert {
+          service = { id = service.id },
+          hosts   = { "eleven." .. plugin_name .. ".test" },
+        }
+
+        local route12 = bp.routes:insert {
+          service = { id = service.id },
+          hosts   = { "twelve." .. plugin_name .. ".test" },
+        }
+
+        local route13 = bp.routes:insert {
+          service = { id = service.id },
+          hosts   = { "thirteen." .. plugin_name .. ".test" },
+        }
+
+        local route14 = bp.routes:insert {
+          service = { id = service.id },
+          hosts   = { "fourteen." .. plugin_name .. ".test" },
         }
 
         bp.plugins:insert {
@@ -192,6 +244,30 @@ for _, plugin_name in ipairs({ "pre-function", "post-function" }) do
           config  = get_conf { mock_fn_ten },
         }
 
+        bp.plugins:insert {
+          name    = plugin_name,
+          route   = { id = route11.id },
+          config  = get_conf { mock_fn_eleven },
+        }
+
+        bp.plugins:insert {
+          name    = plugin_name,
+          route   = { id = route12.id },
+          config  = get_conf { mock_fn_twelve },
+        }
+
+        bp.plugins:insert {
+          name    = plugin_name,
+          route   = { id = route13.id },
+          config  = get_conf { mock_fn_thirteen },
+        }
+
+        bp.plugins:insert {
+          name    = plugin_name,
+          route   = { id = route14.id },
+          config  = get_conf { mock_fn_fourteen },
+        }
+
         assert(helpers.start_kong({
           nginx_conf = "spec/fixtures/custom_nginx.template",
         }))
@@ -220,7 +296,7 @@ for _, plugin_name in ipairs({ "pre-function", "post-function" }) do
             method = "GET",
             path = "/status/200",
             headers = {
-              ["Host"] = "one." .. plugin_name .. ".com"
+              ["Host"] = "one." .. plugin_name .. ".test"
             }
           })
 
@@ -234,7 +310,7 @@ for _, plugin_name in ipairs({ "pre-function", "post-function" }) do
               method = "GET",
               path = "/status/200",
               headers = {
-                ["Host"] = "six." .. plugin_name .. ".com"
+                ["Host"] = "six." .. plugin_name .. ".test"
               }
             })
 
@@ -251,7 +327,7 @@ for _, plugin_name in ipairs({ "pre-function", "post-function" }) do
             method = "GET",
             path = "/status/200",
             headers = {
-              ["Host"] = "two." .. plugin_name .. ".com"
+              ["Host"] = "two." .. plugin_name .. ".test"
             }
           })
           local body = assert.res_status(404, res)
@@ -263,12 +339,13 @@ for _, plugin_name in ipairs({ "pre-function", "post-function" }) do
             method = "GET",
             path = "/status/200",
             headers = {
-              ["Host"] = "three." .. plugin_name .. ".com"
+              ["Host"] = "three." .. plugin_name .. ".test"
             }
           })
           local body = assert.res_status(406, res)
           local json = cjson.decode(body)
-          assert.same({ message = "Invalid" }, json)
+          assert.not_nil(json)
+          assert.matches("Invalid", json.message)
         end)
 
         it("cascading functions for a 400 and exit", function()
@@ -276,11 +353,11 @@ for _, plugin_name in ipairs({ "pre-function", "post-function" }) do
             method = "GET",
             path = "/status/200",
             headers = {
-              ["Host"] = "four." .. plugin_name .. ".com"
+              ["Host"] = "four." .. plugin_name .. ".test"
             }
           })
           local body = assert.res_status(400, res)
-          assert.same("Bad request", body)
+          assert.matches("Bad request", body)
         end)
 
         it("runtime error aborts with a 500", function()
@@ -288,11 +365,13 @@ for _, plugin_name in ipairs({ "pre-function", "post-function" }) do
             method = "GET",
             path = "/status/200",
             headers = {
-              ["Host"] = "nine." .. plugin_name .. ".com"
+              ["Host"] = "nine." .. plugin_name .. ".test"
             }
           })
           local body = assert.res_status(500, res)
-          assert.same('{"message":"An unexpected error occurred"}', body)
+          local json = cjson.decode(body)
+          assert.not_nil(json)
+          assert.matches("An unexpected error occurred", json.message)
         end)
       end)
 
@@ -303,7 +382,7 @@ for _, plugin_name in ipairs({ "pre-function", "post-function" }) do
             method = "POST",
             path = "/status/200",
             headers = {
-              ["Host"] = "seven." .. plugin_name .. ".com",
+              ["Host"] = "seven." .. plugin_name .. ".test",
               ["Content-Length"] = #tostring(count),
             },
             body = count,
@@ -319,7 +398,7 @@ for _, plugin_name in ipairs({ "pre-function", "post-function" }) do
               method = "POST",
               path = "/status/200",
               headers = {
-                ["Host"] = "seven." .. plugin_name .. ".com",
+                ["Host"] = "seven." .. plugin_name .. ".test",
                 ["Content-Length"] = #tostring(count),
               },
               body = count,
@@ -336,7 +415,7 @@ for _, plugin_name in ipairs({ "pre-function", "post-function" }) do
             method = "POST",
             path = "/status/200",
             headers = {
-              ["Host"] = "eight." .. plugin_name .. ".com",
+              ["Host"] = "eight." .. plugin_name .. ".test",
               ["Content-Length"] = #tostring(count),
             },
             body = count,
@@ -351,7 +430,7 @@ for _, plugin_name in ipairs({ "pre-function", "post-function" }) do
               method = "POST",
               path = "/status/200",
               headers = {
-                ["Host"] = "eight." .. plugin_name .. ".com",
+                ["Host"] = "eight." .. plugin_name .. ".test",
                 ["Content-Length"] = #tostring(count),
               },
               body = count,
@@ -363,11 +442,65 @@ for _, plugin_name in ipairs({ "pre-function", "post-function" }) do
         end)
       end)
 
+      describe("sandbox access", function()
+        it("can access cache", function()
+          local res = assert(client:send {
+            method = "GET",
+            path = "/status/200",
+            headers = {
+              ["Host"] = "eleven." .. plugin_name .. ".test",
+            },
+          })
+          local body = assert.res_status(200, res)
+          assert.is_not_nil(body)
+          assert.equal("val", body)
+        end)
+
+        it("cannot access gateway information through the cache", function()
+          local res = assert(client:send {
+            method = "GET",
+            path = "/status/200",
+            headers = {
+              ["Host"] = "twelve." .. plugin_name .. ".test",
+            },
+          })
+          local body = assert.res_status(200, res)
+          assert.is_not_nil(body)
+          assert.equal("nil", body)
+        end)
+
+        it("can access kong.configuration fields", function()
+          local res = assert(client:send {
+            method = "GET",
+            path = "/status/200",
+            headers = {
+              ["Host"] = "thirteen." .. plugin_name .. ".test",
+            },
+          })
+          local body = assert.res_status(200, res)
+          assert.is_not_nil(body)
+          assert.equal("bundled", body)
+        end)
+
+        it("redacts sensitive configuration fields", function()
+          local res = assert(client:send {
+            method = "GET",
+            path = "/status/200",
+            headers = {
+              ["Host"] = "fourteen." .. plugin_name .. ".test",
+            },
+          })
+          local body = assert.res_status(200, res)
+          assert.is_not_nil(body)
+          assert.match("%*+", body)
+        end)
+      end)
+
       describe("issues", function()
         it("does not crash even when query is cleared, #9246", function()
           local res = client:get("/status/200?a=b", {
             headers = {
-              ["Host"] = "ten." .. plugin_name .. ".com"
+              ["Host"] = "ten." .. plugin_name .. ".test"
             }
           })
           local body = assert.res_status(200, res)

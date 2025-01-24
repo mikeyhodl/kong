@@ -37,9 +37,9 @@ Options:
  -f,--force                         Run migrations even if database reports
                                     as already executed.
 
- --db-timeout     (default 60)      Timeout, in seconds, for all database
-                                    operations (including schema consensus for
-                                    Cassandra).
+ --db-timeout     (optional number) Timeout, in seconds, for all database
+                                    operations.
+
 
  --lock-timeout   (default 60)      Timeout, in seconds, for nodes waiting on
                                     the leader node to finish running
@@ -77,7 +77,7 @@ end
 
 
 local function execute(args)
-  args.db_timeout = args.db_timeout * 1000
+  args.db_timeout = args.db_timeout and (args.db_timeout * 1000) or nil
   args.lock_timeout = args.lock_timeout
 
   if args.quiet then
@@ -90,10 +90,7 @@ local function execute(args)
 
   package.path = conf.lua_package_path .. ";" .. package.path
 
-  conf.pg_timeout = args.db_timeout -- connect + send + read
-
-  conf.cassandra_timeout = args.db_timeout -- connect + send + read
-  conf.cassandra_schema_consensus_timeout = args.db_timeout
+  conf.pg_timeout = args.db_timeout or conf.pg_timeout -- connect + send + read
 
   assert(prefix_handler.prepare_prefix(conf, args.nginx_conf, true))
 

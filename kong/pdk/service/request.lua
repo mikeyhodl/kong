@@ -3,9 +3,10 @@
 -- @module kong.service.request
 
 local cjson = require "cjson.safe"
+local buffer = require "string.buffer"
 local checks = require "kong.pdk.private.checks"
 local phase_checker = require "kong.pdk.private.phases"
-
+local balancer = require "ngx.balancer"
 
 local ngx = ngx
 local ngx_var = ngx.var
@@ -17,12 +18,12 @@ local string_find = string.find
 local string_sub = string.sub
 local string_byte = string.byte
 local string_lower = string.lower
-local normalize_header = checks.normalize_header
 local normalize_multi_header = checks.normalize_multi_header
 local validate_header = checks.validate_header
 local validate_headers = checks.validate_headers
 local check_phase = phase_checker.check
 local escape = require("kong.tools.uri").escape
+local search_remove = require("resty.ada.search").remove
 
 
 local PHASES = phase_checker.phases
@@ -83,32 +84,25 @@ local function new(self)
   -- Enables buffered proxying, which allows plugins to access Service body and
   -- response headers at the same time.
   -- @function kong.service.request.enable_buffering
-  -- @phases `rewrite`, `access`
+  -- @phases `rewrite`, `access`, `balancer`
   -- @return Nothing.
   -- @usage
   -- kong.service.request.enable_buffering()
   request.enable_buffering = function()
-    check_phase(access_and_rewrite)
-
-    if ngx.req.http_version() >= 2 then
-      error("buffered proxying cannot currently be enabled with http/" ..
-            ngx.req.http_version() .. ", please use http/1.x instead", 2)
-    end
-
-
+    check_phase(access_rewrite_balancer)
     ngx.ctx.buffered_proxying = true
   end
 
   ---
   -- Sets the protocol to use when proxying the request to the Service.
   -- @function kong.service.request.set_scheme
-  -- @phases `access`
+  -- @phases `access`, `rewrite`, `balancer`
   -- @tparam string scheme The scheme to be used. Supported values are `"http"` or `"https"`.
   -- @return Nothing; throws an error on invalid inputs.
   -- @usage
   -- kong.service.request.set_scheme("https")
   request.set_scheme = function(scheme)
-    check_phase(PHASES.access)
+    check_phase(access_rewrite_balancer)
 
     if type(scheme) ~= "string" then
       error("scheme must be a string", 2)
@@ -116,6 +110,15 @@ local function new(self)
 
     if scheme ~= "http" and scheme ~= "https" then
       error("invalid scheme: " .. scheme, 2)
+    end
+
+    if ngx.get_phase() == "balancer" then
+      if scheme == "https" then
+        kong.service.request.enable_tls()
+      end
+      if scheme == "http" then
+        kong.service.request.disable_tls()
+      end
     end
 
     ngx_var.upstream_scheme = scheme
@@ -131,14 +134,14 @@ local function new(self)
   --
   -- Input should **not** include the query string.
   -- @function kong.service.request.set_path
-  -- @phases `access`
+  -- @phases `access`, `rewrite`, `balancer`
   -- @tparam string path The path string. Special characters and UTF-8
   -- characters are allowed, for example: `"/v2/movies"` or `"/foo/😀"`.
   -- @return Nothing; throws an error on invalid inputs.
   -- @usage
   -- kong.service.request.set_path("/v2/movies")
   request.set_path = function(path)
-    check_phase(PHASES.access)
+    check_phase(access_rewrite_balancer)
 
     if type(path) ~= "string" then
       error("path must be a string", 2)
@@ -272,10 +275,36 @@ local function new(self)
   end
 
 
+  ---
+  -- Removes all occurrences of the specified query string argument
+  -- from the request to the Service. The order of query string
+  -- arguments is retained.
+  --
+  -- @function kong.service.request.clear_query_arg
+  -- @phases `rewrite`, `access`
+  -- @tparam string name
+  -- @return Nothing; throws an error on invalid inputs.
+  -- @usage
+  -- kong.service.request.clear_query_arg("foo")
+  request.clear_query_arg = function(name)
+    check_phase(access_and_rewrite)
+
+    if type(name) ~= "string" then
+      error("query argument name must be a string", 2)
+    end
+
+    local args = ngx_var.args
+    if args and args ~= "" then
+      ngx_var.args = search_remove(args, name)
+    end
+  end
+
+
   local set_authority
   if ngx.config.subsystem ~= "stream" then
     set_authority = require("resty.kong.grpc").set_authority
   end
+
 
   ---
   -- Sets a header in the request to the Service with the given value. Any existing header
@@ -287,7 +316,7 @@ local function new(self)
   -- @function kong.service.request.set_header
   -- @phases `rewrite`, `access`, `balancer`
   -- @tparam string header The header name. Example: "X-Foo".
-  -- @tparam string|boolean|number value The header value. Example: "hello world".
+  -- @tparam array of strings|string|boolean|number value The header value. Example: "hello world".
   -- @return Nothing; throws an error on invalid inputs.
   -- @usage
   -- kong.service.request.set_header("X-Foo", "value")
@@ -311,7 +340,7 @@ local function new(self)
       end
     end
 
-    ngx.req.set_header(header, normalize_header(value))
+    ngx.req.set_header(header, normalize_multi_header(value))
   end
 
   ---
@@ -323,7 +352,7 @@ local function new(self)
   -- @function kong.service.request.add_header
   -- @phases `rewrite`, `access`
   -- @tparam string header The header name. Example: "Cache-Control".
-  -- @tparam string|number|boolean value The header value. Example: "no-cache".
+  -- @tparam array of strings|string|number|boolean value The header value. Example: "no-cache".
   -- @return Nothing; throws an error on invalid inputs.
   -- @usage
   -- kong.service.request.add_header("Cache-Control", "no-cache")
@@ -342,7 +371,7 @@ local function new(self)
       headers = { headers }
     end
 
-    table_insert(headers, normalize_header(value))
+    table_insert(headers, normalize_multi_header(value))
 
     ngx.req.set_header(header, headers)
   end
@@ -440,13 +469,13 @@ local function new(self)
   -- For a higher-level function to set the body based on the request content type,
   -- see `kong.service.request.set_body()`.
   -- @function kong.service.request.set_raw_body
-  -- @phases `rewrite`, `access`
+  -- @phases `rewrite`, `access`, `balancer`
   -- @tparam string body The raw body.
   -- @return Nothing; throws an error on invalid inputs.
   -- @usage
   -- kong.service.request.set_raw_body("Hello, world!")
   request.set_raw_body = function(body)
-    check_phase(access_and_rewrite)
+    check_phase(access_rewrite_balancer)
 
     if type(body) ~= "string" then
       error("body must be a string", 2)
@@ -459,7 +488,9 @@ local function new(self)
     -- Ensure client request body has been read.
     -- This function is a nop if body has already been read,
     -- and necessary to write the request to the service if it has not.
-    ngx.req.read_body()
+    if ngx.get_phase() ~= "balancer" then
+      ngx.req.read_body()
+    end
 
     ngx.req.set_body_data(body)
   end
@@ -541,26 +572,23 @@ local function new(self)
 
         table_sort(keys)
 
-        local out = {}
-        local i = 1
+        local out = buffer.new()
 
         for _, k in ipairs(keys) do
-          out[i] = "--"
-          out[i + 1] = boundary
-          out[i + 2] = "\r\n"
-          out[i + 3] = 'Content-Disposition: form-data; name="'
-          out[i + 4] = k
-          out[i + 5] = '"\r\n\r\n'
-          local v = args[k]
-          out[i + 6] = v
-          out[i + 7] = "\r\n"
-          i = i + 8
+          out:put("--")
+             :put(boundary)
+             :put("\r\n")
+             :put('Content-Disposition: form-data; name="')
+             :put(k)
+             :put('"\r\n\r\n')
+             :put(args[k])
+             :put("\r\n")
         end
-        out[i] = "--"
-        out[i + 1] = boundary
-        out[i + 2] = "--\r\n"
+        out:put("--")
+           :put(boundary)
+           :put("--\r\n")
 
-        local output = table.concat(out)
+        local output = out:get()
 
         return output, CONTENT_TYPE_FORM_DATA .. "; boundary=" .. boundary
       end,
@@ -597,7 +625,7 @@ local function new(self)
     -- a string with `kong.service.request.set_raw_body()`.
     --
     -- @function kong.service.request.set_body
-    -- @phases `rewrite`, `access`
+    -- @phases `rewrite`, `access`, `balancer`
     -- @tparam table args A table with data to be converted to the appropriate format
     -- and stored in the body.
     -- @tparam[opt] string mimetype can be one of:
@@ -691,6 +719,16 @@ local function new(self)
       check_phase(preread_and_balancer)
 
       return disable_proxy_ssl()
+    end
+  else
+    request.disable_tls = function()
+      check_phase(preread_and_balancer)
+      return balancer.set_upstream_tls(false)
+    end
+
+    request.enable_tls = function()
+      check_phase(preread_and_balancer)
+      return balancer.set_upstream_tls(true)
     end
   end
 

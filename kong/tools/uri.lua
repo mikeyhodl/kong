@@ -38,9 +38,9 @@ do
 end
 
 
-local ESCAPE_PATTERN = "[^!#$&'()*+,/:;=?@[\\]A-Z\\d-_.~%]"
+local ESCAPE_PATTERN = "[^!#$&'()*+,/:;=?@[\\]A-Z\\d\\-_.~%]"
 
-local TMP_OUTPUT = require("table.new")(16, 0)
+local TMP_OUTPUT = table_new(16, 0)
 local DOT = string_byte(".")
 local SLASH = string_byte("/")
 

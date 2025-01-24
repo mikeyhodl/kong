@@ -80,10 +80,6 @@ for _, strategy in helpers.each_strategy() do
     bp  = assert(Blueprints.new(db))
   end)
 
-  lazy_teardown(function()
-    ngx.shared.kong_cassandra:flush_expired()
-  end)
-
   describe(string.format("blueprints for #%s", strategy), function()
     it("inserts oauth2 plugins", function()
       local s = bp.services:insert()
@@ -182,7 +178,7 @@ for _, strategy in helpers.each_strategy() do
       local co = bp.consumers:insert()
       local c = bp.oauth2_credentials:insert({
         consumer  = { id = co.id },
-        redirect_uris = { "http://foo.com" },
+        redirect_uris = { "http://foo.test" },
       })
       assert.equals("oauth2 credential", c.name)
       assert.equals("secret", c.client_secret)
@@ -193,7 +189,7 @@ for _, strategy in helpers.each_strategy() do
       local co = bp.consumers:insert()
       local cr = bp.oauth2_credentials:insert({
         consumer  = { id = co.id },
-        redirect_uris = { "http://foo.com" },
+        redirect_uris = { "http://foo.test" },
       })
       local c = bp.oauth2_authorization_codes:insert({ credential = { id = cr.id } })
       assert.is_string(c.code)
@@ -205,7 +201,7 @@ for _, strategy in helpers.each_strategy() do
       local co = bp.consumers:insert()
       local cr = bp.oauth2_credentials:insert({
         consumer = { id = co.id },
-        redirect_uris = { "http://foo.com" },
+        redirect_uris = { "http://foo.test" },
       })
       local t = bp.oauth2_tokens:insert({ credential = { id = cr.id } })
       assert.equals("bearer", t.token_type)
