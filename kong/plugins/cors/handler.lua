@@ -96,6 +96,11 @@ local function configure_origin(conf, header_filter)
       cached_domains = {}
 
       for _, entry in ipairs(conf.origins) do
+        if entry == "*" then
+          set_header("Access-Control-Allow-Origin", "*")
+          return true
+        end
+
         local domain
         local maybe_regex, _, err = re_find(entry, "[^A-Za-z0-9.:/-]", "jo")
         if err then
@@ -226,6 +231,11 @@ function CorsHandler:access(conf)
 
   if conf.max_age then
     set_header("Access-Control-Max-Age", tostring(conf.max_age))
+  end
+
+  if conf.private_network and
+    kong.request.get_header("Access-Control-Request-Private-Network") == 'true' then
+      set_header("Access-Control-Allow-Private-Network", 'true')
   end
 
   return kong.response.exit(HTTP_OK)

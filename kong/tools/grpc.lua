@@ -26,7 +26,7 @@ local _MT = { __index = _M, }
 
 local function safe_set_type_hook(typ, dec, enc)
   if not pcall(pb.hook, typ) then
-    ngx_log(ngx_DEBUG, "no type '" .. typ .. "' defined")
+    ngx_log(ngx_DEBUG, "no type '", typ, "' defined")
     return
   end
 
@@ -41,6 +41,7 @@ end
 
 local function set_hooks()
   pb.option("enable_hooks")
+  pb.option("enable_enchooks")
 
   safe_set_type_hook(".google.protobuf.Timestamp", function (t)
     if type(t) ~= "table" then
@@ -140,6 +141,9 @@ end
 
 --- wraps a binary payload into a grpc stream frame.
 function _M.frame(ftype, msg)
+  -- byte 0: frame type
+  -- byte 1-4: frame size in big endian (could be zero)
+  -- byte 5-: frame content
   return bpack("C>I", ftype, #msg) .. msg
 end
 
@@ -148,7 +152,8 @@ end
 --- If heading frame isn't complete, returns `nil, body`,
 --- try again with more data.
 function _M.unframe(body)
-  if not body or #body <= 5 then
+  -- must be at least 5 bytes(frame header)
+  if not body or #body < 5 then
     return nil, body
   end
 

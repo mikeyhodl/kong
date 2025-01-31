@@ -2,7 +2,7 @@ local math = require "math"
 local utils = require("spec.helpers.perf.utils")
 local logger = require("spec.helpers.perf.logger")
 local cjson = require "cjson"
-local tablex = require "pl.tablex"
+local cycle_aware_deep_copy = require("kong.tools.table").cycle_aware_deep_copy
 
 local fmt = string.format
 local my_logger = logger.new_logger("[charts]")
@@ -16,6 +16,7 @@ local unsaved_results_lookup = {}
 local unsaved_results = {}
 
 local function gen_plots(results, fname, opts)
+  local shell = require "resty.shell"
   opts = opts or options
 
   if not results or not next(results) then
@@ -23,7 +24,7 @@ local function gen_plots(results, fname, opts)
     return
   end
 
-  os.execute("mkdir -p output")
+  shell.run("mkdir -p output", nil, 0)
 
   local output_data = {
     options = opts,
@@ -83,7 +84,7 @@ local function ingest_combined_results(ver, results, suite_name)
     return false
   end
 
-  local row = tablex.deepcopy(results)
+  local row = cycle_aware_deep_copy(results)
   row.version = ver
   row.suite = suite_name
 

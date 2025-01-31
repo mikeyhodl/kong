@@ -1,8 +1,8 @@
 local helpers = require "spec.helpers"
-local pl_utils = require "pl.utils"
-local utils = require "kong.tools.utils"
 local DB = require "kong.db.init"
 local tb_clone = require "table.clone"
+local shell = require "resty.shell"
+local strip = require("kong.tools.string").strip
 
 
 -- Current number of migrations to execute in a new install
@@ -44,7 +44,11 @@ for _, strategy in helpers.each_strategy() do
 
     local db = assert(DB.new(tmp_conf, strategy))
     assert(db:init_connector())
+    -- in spec/helpers.lua, db has already been init'ed
+    -- the stored connection will be reused here,
+    -- so we need to set schema explicitly to 'kong_migrations_tests'
     assert(db:connect())
+    assert(db.connector:query("SET SCHEMA 'kong_migrations_tests';\n"))
     finally(function()
       db.connector:close()
     end)
@@ -69,7 +73,7 @@ for _, strategy in helpers.each_strategy() do
         local cmd = string.format(helpers.unindent [[
           echo y | %s KONG_DATABASE=%s %s migrations reset --v -c %s
         ]], lua_path, strategy, helpers.bin_path, helpers.test_conf_path)
-        local ok, code, _, stderr = pl_utils.executeex(cmd)
+        local ok, _, stderr, _, code = shell.run(cmd, nil, 0)
         assert.falsy(ok)
         assert.same(1, code)
         assert.match("not a tty", stderr, 1, true)
@@ -185,7 +189,17 @@ for _, strategy in helpers.each_strategy() do
         assert.match("Executed migrations:", stdout, 1, true)
 
         if strategy ~= "off" then
-          local db = init_db()
+          -- to avoid postgresql error:
+          -- [PostgreSQL error] failed to retrieve PostgreSQL server_version_num: receive_message:
+          -- failed to get type: timeout
+          -- when testing on ARM64 platform which has low single-core performance
+
+          local pok, db
+          helpers.wait_until(function()
+            pok, db = pcall(init_db)
+            return pok
+          end, 10)
+
           -- valid CQL and SQL; don't expect to go over one page in CQL here
           local rows = db.connector:query([[SELECT * FROM schema_meta;]])
           local n = 0
@@ -341,48 +355,30 @@ for _, strategy in helpers.each_strategy() do
           plugins = "bundled"
         }, true)
         assert.equal(0, code)
-        if strategy ~= "cassandra" then
-          -- cassandra outputs some warnings on duplicate
-          -- columns which can safely be ignored
-          assert.equal("", stderr)
-        end
+        assert.equal("", stderr)
 
         code, stdout, stderr = run_kong("migrations up", {
           plugins = "bundled"
         }, true)
         assert.equal(0, code)
-        assert.equal("Database is already up-to-date", utils.strip(stdout))
-        if strategy ~= "cassandra" then
-          -- cassandra outputs some warnings on duplicate
-          -- columns which can safely be ignored
-          assert.equal("", stderr)
-        end
+        assert.equal("Database is already up-to-date", strip(stdout))
+        assert.equal("", stderr)
 
         code, stdout, stderr = run_kong("migrations up -f", {
           plugins = "bundled"
         }, true)
         assert.equal(0, code)
-        if strategy ~= "cassandra" then
-          -- cassandra outputs some warnings on duplicate
-          -- columns which can safely be ignored
-          assert.equal("", stderr)
-        end
+        assert.equal("", stderr)
 
         local code2, stdout2, stderr2 = run_kong("migrations up -f", {
           plugins = "bundled"
         }, true)
         assert.equal(0, code)
-        if strategy ~= "cassandra" then
-          -- cassandra outputs some warnings on duplicate
-          -- columns which can safely be ignored
-          assert.equal("", stderr)
-        end
+        assert.equal("", stderr)
 
         assert.equal(code, code2)
         assert.equal(stdout, stdout2)
-        if strategy ~= "cassandra" then
-          assert.equal(stderr, stderr2)
-        end
+        assert.equal(stderr, stderr2)
       end)
 
       it("#db is reentrant with migrations finish -f", function()
@@ -397,57 +393,55 @@ for _, strategy in helpers.each_strategy() do
           plugins = "bundled"
         }, true)
         assert.equal(0, code)
-        if strategy ~= "cassandra" then
-          -- cassandra outputs some warnings on duplicate
-          -- columns which can safely be ignored
-          assert.equal("", stderr)
-        end
+        assert.equal("", stderr)
 
         code, stdout, stderr = run_kong("migrations up", {
           plugins = "bundled"
         }, true)
 
         assert.equal(0, code)
-        assert.equal("Database is already up-to-date", utils.strip(stdout))
-        if strategy ~= "cassandra" then
-          -- cassandra outputs some warnings on duplicate
-          -- columns which can safely be ignored
-          assert.equal("", stderr)
-        end
+        assert.equal("Database is already up-to-date", strip(stdout))
+        assert.equal("", stderr)
 
         code, stdout, stderr = run_kong("migrations finish", {
           plugins = "bundled"
         }, true)
         assert.equal(0, code)
-        assert.equal("No pending migrations to finish", utils.strip(stdout))
+        assert.equal("No pending migrations to finish", strip(stdout))
         assert.equal("", stderr)
 
         code, stdout, stderr = run_kong("migrations finish -f", {
           plugins = "bundled"
         }, true)
         assert.equal(0, code)
-        if strategy ~= "cassandra" then
-          -- cassandra outputs some warnings on duplicate
-          -- columns which can safely be ignored
-          assert.equal("", stderr)
-        end
+        assert.equal("", stderr)
 
         local code2, stdout2, stderr2 = run_kong("migrations finish -f", {
           plugins = "bundled"
         }, true)
         assert.equal(0, code)
-        if strategy ~= "cassandra" then
-          -- cassandra outputs some warnings on duplicate
-          -- columns which can safely be ignored
-          assert.equal("", stderr)
-        end
+        assert.equal("", stderr)
 
         assert.equal(code, code2)
         assert.equal(stdout, stdout2)
-        if strategy ~= "cassandra" then
-          assert.equal(stderr, stderr2)
-        end
+        assert.equal(stderr, stderr2)
       end)
     end)
   end)
+
+  describe("sanity: make sure postgres server is not overloaded", function()
+    local do_it = strategy == "off" and pending or it
+
+    do_it("", function()
+      helpers.wait_until(function()
+        local ok, err = pcall(init_db)
+        if err then
+          print(err)
+        end
+        return ok
+      end, 30, 1)
+    end)
+
+  end)
+
 end

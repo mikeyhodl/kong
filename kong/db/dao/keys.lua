@@ -1,10 +1,3 @@
--- This software is copyright Kong Inc. and its licensors.
--- Use of the software is subject to the agreement between your organization
--- and Kong Inc. If there is no such agreement, use is governed by and
--- subject to the terms of the Kong Master Software License Agreement found
--- at https://konghq.com/enterprisesoftwarelicense/.
--- [ END OF LICENSE 0867164ffc95e54f04670b5169c09574bdbd9bba ]
-
 local pkey = require("resty.openssl.pkey")
 local fmt = string.format
 local type = type
@@ -63,7 +56,7 @@ function keys:cache_key(key)
   assert(type(key), "table")
   local kid, set_id
   kid = key.kid
-  if key.set then
+  if type(key.set) == "table" then
     set_id = key.set.id
   end
   if not set_id then
@@ -83,14 +76,20 @@ local function _load_pkey(key, part)
     pk, err = pkey.new(key.jwk, { format = "JWK" })
   end
   if key.pem then
-    if not key.pem[part] then
-      return nil, fmt("%s key not found.", part)
+    -- public key can be derived from private key, but not vice versa
+    if part == "private_key" and not key.pem[part] then
+      return nil, "could not load a private key from public key material"
     end
     pk, err = pkey.new(key.pem[part], { format = "PEM" })
   end
   if not pk then
     return nil, "could not load pkey. " .. err
   end
+
+  if part == "private_key" and not pk:is_private() then
+    return nil, "could not load a private key from public key material"
+  end
+
   return pk
 end
 

@@ -3,20 +3,28 @@ _G.ngx.config.debug = true
 
 local helpers             = require "spec.helpers"
 local kong_cluster_events = require "kong.cluster_events"
+local match               = require "luassert.match"
 
 
 for _, strategy in helpers.each_strategy() do
   describe("cluster_events with db [#" .. strategy .. "]", function()
-    local db
+    local db, log_spy, orig_ngx_log
 
     lazy_setup(function()
       local _
       _, db = helpers.get_db_utils(strategy, {})
+
+      orig_ngx_log = ngx.log
+      local logged = { level = function() end }
+      log_spy = spy.on(logged, "level")
+      _G.ngx.log = function(l) logged.level(l) end   -- luacheck: ignore
     end)
 
     lazy_teardown(function()
       local cluster_events = assert(kong_cluster_events.new { db = db })
       cluster_events.strategy:truncate_events()
+
+      _G.ngx.log = orig_ngx_log   -- luacheck: ignore
     end)
 
     before_each(function()
@@ -83,6 +91,9 @@ for _, strategy in helpers.each_strategy() do
 
       before_each(function()
         spy_func = spy.new(function() end)
+        -- time sensitive tests should have accurate time at the start
+        -- and for the later `ngx.sleep()` calls the time will be updated automatically
+        ngx.update_time()
       end)
 
       it("broadcasts on a given channel", function()
@@ -118,6 +129,7 @@ for _, strategy in helpers.each_strategy() do
 
         assert(cluster_events_1:poll())
         assert.spy(spy_func).was_called(3)
+        assert.spy(log_spy).was_not_called_with(match.is_not.gt(ngx.ERR))
       end)
 
       it("broadcasts data to subscribers", function()
@@ -141,6 +153,7 @@ for _, strategy in helpers.each_strategy() do
         assert(cluster_events_1:poll())
         assert.spy(spy_func).was_called(1)
         assert.spy(spy_func).was_called_with("hello world")
+        assert.spy(log_spy).was_not_called_with(match.is_not.gt(ngx.ERR))
       end)
 
       it("does not broadcast events on the same node", function()
@@ -162,6 +175,7 @@ for _, strategy in helpers.each_strategy() do
 
         assert(cluster_events_1:poll())
         assert.spy(spy_func).was_not_called()
+        assert.spy(log_spy).was_not_called_with(match.is_not.gt(ngx.ERR))
       end)
 
       it("starts interval polling when subscribing", function()
@@ -196,6 +210,7 @@ for _, strategy in helpers.each_strategy() do
         helpers.wait_until(function()
           return called == 2
         end, 10)
+        assert.spy(log_spy).was_not_called_with(match.is_not.gt(ngx.ERR))
       end)
 
       it("applies a poll_offset to lookback potentially missed events", function()
@@ -237,6 +252,7 @@ for _, strategy in helpers.each_strategy() do
 
         assert(cluster_events_1:poll())
         assert.spy(spy_func).was_called(2) -- not called again this time
+        assert.spy(log_spy).was_not_called_with(match.is_not.gt(ngx.ERR))
       end)
 
       it("handles more than <PAGE_SIZE> events at once", function()
@@ -260,6 +276,7 @@ for _, strategy in helpers.each_strategy() do
 
         assert(cluster_events_1:poll())
         assert.spy(spy_func).was_called(201)
+        assert.spy(log_spy).was_not_called_with(match.is_not.gt(ngx.ERR))
       end)
 
       it("runs callbacks in protected mode", function()
@@ -282,9 +299,11 @@ for _, strategy in helpers.each_strategy() do
         assert.has_no_error(function()
           cluster_events_1:poll()
         end)
+        assert.spy(log_spy).was_not_called_with(match.is_not.gt(ngx.ERR))
       end)
 
       it("broadcasts an event with a delay", function()
+        ngx.update_time()
         local cluster_events_1 = assert(kong_cluster_events.new {
           db = db,
           node_id = uuid_1,
@@ -311,8 +330,11 @@ for _, strategy in helpers.each_strategy() do
 
         ngx.sleep(delay) -- go past our desired `nbf` delay
 
-        assert(cluster_events_1:poll())
-        assert.spy(spy_func).was_called(1) -- called
+        helpers.wait_until(function()
+          assert(cluster_events_1:poll())
+          return pcall(assert.spy(spy_func).was_called, 1) -- called
+        end, 1) -- note that we have already waited for `delay` seconds
+        assert.spy(log_spy).was_not_called_with(match.is_not.gt(ngx.ERR))
       end)
 
       it("broadcasts an event with a polling delay for subscribers", function()
@@ -332,6 +354,8 @@ for _, strategy in helpers.each_strategy() do
 
         assert(cluster_events_1:subscribe("nbf_channel", cb, false)) -- false to not start auto polling
 
+        -- we need accurate time, otherwise the test would be flaky
+        ngx.update_time()
         assert(cluster_events_2:broadcast("nbf_channel", "hello world"))
 
         assert(cluster_events_1:poll())
@@ -344,8 +368,11 @@ for _, strategy in helpers.each_strategy() do
 
         ngx.sleep(delay) -- go past our desired `nbf` delay
 
-        assert(cluster_events_1:poll())
-        assert.spy(spy_func).was_called(1) -- called
+        helpers.wait_until(function()
+          assert(cluster_events_1:poll())
+          return pcall(assert.spy(spy_func).was_called, 1) -- called
+        end, 1) -- note that we have already waited for `delay` seconds
+        assert.spy(log_spy).was_not_called_with(match.is_not.gt(ngx.ERR))
       end)
     end)
   end)

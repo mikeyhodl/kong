@@ -1,12 +1,14 @@
 local helpers = require "spec.helpers"
 local cjson   = require "cjson"
-
+local http_mock = require "spec.helpers.http_mock"
 
 local md5 = ngx.md5
+local TCP_PORT = helpers.get_available_port()
 
 
+for _, client_protocol in ipairs({ "http", "https", "http2" }) do
 for _, strategy in helpers.each_strategy() do
-  describe("Buffered Proxying [#" .. strategy .. "]", function()
+  describe("Buffered Proxying [#" .. strategy .. "] [#" .. client_protocol .. "]", function()
 
     -- TODO: http2 / grpc does not currently work with
     -- ngx.location.capture that buffered proxying uses
@@ -23,6 +25,29 @@ for _, strategy in helpers.each_strategy() do
           "enable-buffering",
           "enable-buffering-response",
         })
+
+        -- the test using this service requires the error handler to be
+        -- triggered, which does not happen when using the mock upstream
+        local s0 = bp.services:insert {
+          name = "service0",
+          url = "http://127.0.0.1:" .. TCP_PORT,
+        }
+
+        local r0 = bp.routes:insert {
+          paths = { "/0" },
+          service = s0,
+        }
+
+        bp.plugins:insert {
+          name = "enable-buffering",
+          route = r0,
+          protocols = {
+            "http",
+            "https",
+          },
+          config = {},
+          service = s0,
+        }
 
         local r1 = bp.routes:insert {
           paths = { "/1" },
@@ -131,7 +156,13 @@ for _, strategy in helpers.each_strategy() do
       end)
 
       before_each(function()
-        proxy_client = helpers.proxy_client()
+        if client_protocol == "http" then
+          proxy_client = helpers.proxy_client()
+        elseif client_protocol == "https" then
+          proxy_client = helpers.proxy_ssl_client()
+        elseif client_protocol == "http2" then
+          proxy_client = helpers.proxy_ssl_client(nil, nil, 2)
+        end
         proxy_ssl_client = helpers.proxy_ssl_client()
       end)
 
@@ -227,6 +258,25 @@ for _, strategy in helpers.each_strategy() do
         assert.equal(nil, res.headers["MD5"])
       end)
 
+      -- this test sends an intentionally mismatched if-match header
+      -- to produce an nginx output filter error and status code 412
+      -- the response has to go through kong_error_handler (via error_page)
+      it("remains healthy when if-match header is used with buffering", function()
+        local mock = http_mock.new(TCP_PORT)
+        mock:start()
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/0",
+          headers = {
+            ["if-match"] = 1
+          }
+        })
+
+        assert.response(res).has_status(412)
+        assert.logfile().has.no.line("exited on signal 11")
+        mock:stop(true)
+      end)
     end)
   end)
 end
+end -- for _, client_protocol

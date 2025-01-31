@@ -17,7 +17,7 @@ local fixtures = {
           ssl_certificate ${{SSL_CERT}};
           ssl_certificate_key ${{SSL_CERT_KEY}};
 > end
-          ssl_protocols TLSv1.1 TLSv1.2 TLSv1.3;
+          ssl_protocols TLSv1.2 TLSv1.3;
 
           location ~ "/2015-03-31/functions/(?:[^/])*/invocations" {
               content_by_lua_block {
@@ -40,19 +40,39 @@ local fixtures = {
                       ngx.header["Content-Length"] = 0
 
                     elseif string.match(ngx.var.uri, "functionWithBase64EncodedResponse") then
+                      ngx.header["Content-Type"] = "application/json"
                       ngx.say("{\"statusCode\": 200, \"body\": \"dGVzdA==\", \"isBase64Encoded\": true}")
 
                     elseif string.match(ngx.var.uri, "functionWithNotBase64EncodedResponse") then
+                      ngx.header["Content-Type"] = "application/json"
                       ngx.say("{\"statusCode\": 200, \"body\": \"dGVzdA=\", \"isBase64Encoded\": false}")
 
                     elseif string.match(ngx.var.uri, "functionWithIllegalBase64EncodedResponse") then
                       ngx.say("{\"statusCode\": 200, \"body\": \"dGVzdA=\", \"isBase64Encoded\": \"abc\"}")
 
                     elseif string.match(ngx.var.uri, "functionWithMultiValueHeadersResponse") then
+                      ngx.header["Content-Type"] = "application/json"
                       ngx.say("{\"statusCode\": 200, \"headers\": { \"Age\": \"3600\"}, \"multiValueHeaders\": {\"Access-Control-Allow-Origin\": [\"site1.com\", \"site2.com\"]}}")
 
                     elseif string.match(ngx.var.uri, "functionEcho") then
                       require("spec.fixtures.mock_upstream").send_default_json_response()
+
+                    elseif string.match(ngx.var.uri, "functionWithTransferEncodingHeader") then
+                      ngx.say("{\"statusCode\": 200, \"headers\": { \"Transfer-Encoding\": \"chunked\", \"transfer-encoding\": \"chunked\"}}")
+
+                    elseif string.match(ngx.var.uri, "functionWithLatency") then
+                      -- additional latency
+                      ngx.sleep(2)
+                      ngx.say("{\"statusCodge\": 200, \"body\": \"dGVzdA=\", \"isBase64Encoded\": false}")
+
+                    elseif string.match(ngx.var.uri, "functionWithEmptyArray") then
+                      ngx.header["Content-Type"] = "application/json"
+                      local str = "{\"statusCode\": 200, \"testbody\": [], \"isBase64Encoded\": false}"
+                      ngx.say(str)
+
+                    elseif string.match(ngx.var.uri, "functionWithArrayCTypeInMVHAndEmptyArray") then
+                      ngx.header["Content-Type"] = "application/json"
+                      ngx.say("{\"statusCode\": 200, \"isBase64Encoded\": true, \"body\": \"eyJrZXkiOiAidmFsdWUiLCAia2V5MiI6IFtdfQ==\", \"headers\": {}, \"multiValueHeaders\": {\"Content-Type\": [\"application/json+test\"]}}")
 
                     elseif type(res) == 'string' then
                       ngx.header["Content-Length"] = #res + 1

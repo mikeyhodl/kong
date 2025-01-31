@@ -1,6 +1,9 @@
-local BatchQueue = require "kong.tools.batch_queue"
+local Queue = require "kong.tools.queue"
 local statsd_logger = require "kong.plugins.datadog.statsd_logger"
 local kong_meta = require "kong.meta"
+
+
+local replace_dashes = require("kong.tools.string").replace_dashes
 
 
 local kong     = kong
@@ -12,12 +15,9 @@ local pairs    = pairs
 local ipairs   = ipairs
 
 
-local queues = {}
-
-
 local get_consumer_id = {
   consumer_id = function(consumer)
-    return consumer and gsub(consumer.id, "-", "_")
+    return consumer and replace_dashes(consumer.id)
   end,
   custom_id = function(consumer)
     return consumer and consumer.custom_id
@@ -48,23 +48,14 @@ local function compose_tags(service_name, status, consumer_id, tags, conf)
 end
 
 
-local function get_queue_id(conf)
-  return conf.__key__
-end
-
-
-local function log(conf, messages)
+local function send_entries_to_datadog(conf, messages)
   local logger, err = statsd_logger:new(conf)
   if err then
     kong.log.err("failed to create Statsd logger: ", err)
-    return
+    return false, err
   end
 
   for _, message in ipairs(messages) do
-    local name = gsub(message.service.name ~= null and
-                      message.service.name or message.service.host,
-                      "%.", "_")
-
     local stat_name  = {
       request_size     = "request.size",
       response_size    = "response.size",
@@ -92,8 +83,10 @@ local function log(conf, messages)
       local get_consumer_id = get_consumer_id[metric_config.consumer_identifier]
       local consumer_id     = get_consumer_id and get_consumer_id(message.consumer) or nil
       local tags            = compose_tags(
-              name, message.response and message.response.status or "-",
-              consumer_id, metric_config.tags, conf)
+                                message.service and gsub(message.service.name ~= null and
+                                message.service.name or message.service.host, "%.", "_") or "",
+                                message.response and message.response.status or "-",
+                                consumer_id, metric_config.tags, conf)
 
       logger:send_statsd(stat_name, stat_value,
                          logger.stat_types[metric_config.stat_type],
@@ -103,6 +96,7 @@ local function log(conf, messages)
   end
 
   logger:close_socket()
+  return true
 end
 
 
@@ -111,38 +105,16 @@ local DatadogHandler = {
   VERSION = kong_meta.version,
 }
 
-
 function DatadogHandler:log(conf)
-  if not ngx.ctx.service then
-    return
+  local ok, err = Queue.enqueue(
+    Queue.get_plugin_params("datadog", conf),
+    send_entries_to_datadog,
+    conf,
+    kong.log.serialize()
+  )
+  if not ok then
+    kong.log.err("failed to enqueue log entry to Datadog: ", err)
   end
-
-  local queue_id = get_queue_id(conf)
-  local q = queues[queue_id]
-  if not q then
-    local batch_max_size = conf.queue_size or 1
-    local process = function (entries)
-      return log(conf, entries)
-    end
-
-    local opts = {
-      retry_count    = conf.retry_count or 10,
-      flush_timeout  = conf.flush_timeout or 2,
-      batch_max_size = batch_max_size,
-      process_delay  = 0,
-    }
-
-    local err
-    q, err = BatchQueue.new(process, opts)
-    if not q then
-      kong.log.err("could not create queue: ", err)
-      return
-    end
-    queues[queue_id] = q
-  end
-
-  local message = kong.log.serialize()
-  q:add(message)
 end
 
 

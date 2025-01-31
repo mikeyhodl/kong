@@ -1,7 +1,8 @@
 local helpers  = require "spec.helpers"
 local cjson    = require "cjson"
 local fixtures = require "spec.03-plugins.16-jwt.fixtures"
-local utils    = require "kong.tools.utils"
+local random_string = require("kong.tools.rand").random_string
+local uuid = require("kong.tools.uuid").uuid
 
 for _, strategy in helpers.each_strategy() do
   describe("Plugin: jwt (API) [#" .. strategy .. "]", function()
@@ -248,7 +249,7 @@ for _, strategy in helpers.each_strategy() do
             path = "/consumers/bob/jwt/",
           })
           local body = cjson.decode(assert.res_status(200, res))
-          assert.equal(7, #(body.data))
+          assert.equal(6, #(body.data))
         end)
       end)
     end)
@@ -428,10 +429,7 @@ for _, strategy in helpers.each_strategy() do
           assert.equal(1, #json_2.data)
 
           assert.not_same(json_1.data, json_2.data)
-          -- Disabled: on Cassandra, the last page still returns a
-          -- next_page token, and thus, an offset proprty in the
-          -- response of the Admin API.
-          --assert.is_nil(json_2.offset) -- last page
+          assert.is_nil(json_2.offset) -- last page
         end)
       end)
 
@@ -547,14 +545,14 @@ for _, strategy in helpers.each_strategy() do
         it("returns 404 for a random non-existing JWT id", function()
           local res = assert(admin_client:send {
             method = "GET",
-            path = "/jwts/" .. utils.uuid()  .. "/consumer"
+            path = "/jwts/" .. uuid()  .. "/consumer"
           })
           assert.res_status(404, res)
         end)
         it("returns 404 for a random non-existing JWT key", function()
           local res = assert(admin_client:send {
             method = "GET",
-            path = "/jwts/" .. utils.random_string()  .. "/consumer"
+            path = "/jwts/" .. random_string()  .. "/consumer"
           })
           assert.res_status(404, res)
         end)

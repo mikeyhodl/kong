@@ -4,7 +4,7 @@ use Test::Nginx::Socket::Lua;
 use Test::Nginx::Socket::Lua::Stream;
 do "./t/Util.pm";
 
-plan tests => repeat_each() * (blocks() * 4) + 11;
+plan tests => repeat_each() * (blocks() * 4) + 12;
 
 run_tests();
 
@@ -173,7 +173,7 @@ headers have already been sent
             local pdk = PDK.new()
 
             pdk.response.exit(200)
-            ngx.ctx.rewite = true
+            ngx.ctx.rewrite = true
         }
 
         access_by_lua_block {
@@ -1128,7 +1128,7 @@ finalize stream session: 200
 
 
 
-=== TEST 18: response.exit() does not set transfer-encoding from headers
+=== TEST 44: response.exit() does not set transfer-encoding from headers
 --- http_config eval: $t::Util::HttpConfig
 --- config
     location = /t {
@@ -1148,9 +1148,33 @@ GET /t
 --- response_body
 test
 --- response_headers
+! Transfer-Encoding
 Content-Length: 5
 X-test: test
 --- error_log
 manually setting Transfer-Encoding. Ignored.
 
 
+
+=== TEST 45: response.exit() json encoding of numbers with a precision of 16 decimals
+--- http_config eval: $t::Util::HttpConfig
+--- config
+    location = /t {
+        default_type 'text/test';
+        access_by_lua_block {
+            require("kong.globalpatches")()
+            local PDK = require "kong.pdk"
+            local pdk = PDK.new()
+
+            pdk.response.exit(200, { n = 9007199254740992 })
+        }
+    }
+--- request
+GET /t
+--- error_code: 200
+--- response_headers_like
+Content-Type: application/json; charset=utf-8
+--- response_body chop
+{"n":9007199254740992}
+--- no_error_log
+[error]

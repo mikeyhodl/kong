@@ -1,4 +1,5 @@
 local helpers   = require "spec.helpers"
+local http_mock = require "spec.helpers.http_mock"
 local cjson     = require "cjson"
 
 
@@ -44,11 +45,11 @@ for _, strategy in helpers.each_strategy() do
         insert_routes {
           {
             protocols     = { "http" },
-            hosts         = { "headers-inspect.com" },
+            hosts         = { "headers-inspect.test" },
           },
           {
             protocols     = { "http" },
-            hosts         = { "preserved.com" },
+            hosts         = { "preserved.test" },
             preserve_host = true,
           },
           {
@@ -126,7 +127,7 @@ for _, strategy in helpers.each_strategy() do
       it("are removed from request", function()
         local headers = request_headers({
           ["Connection"]          = "X-Foo, X-Bar",
-          ["Host"]                = "headers-inspect.com",
+          ["Host"]                = "headers-inspect.test",
           ["Keep-Alive"]          = "timeout=5, max=1000",
           ["Proxy"]               = "Remove-Me", -- See: https://httpoxy.org/
           ["Proxy-Connection"]    = "close",
@@ -163,7 +164,7 @@ for _, strategy in helpers.each_strategy() do
         local res = assert(proxy_client:send {
           method  = "GET",
           headers = {
-            ["Host"] = "headers-inspect.com",
+            ["Host"] = "headers-inspect.test",
           },
           path = "/hop-by-hop",
         })
@@ -192,7 +193,7 @@ for _, strategy in helpers.each_strategy() do
         local res = assert(proxy_client:send {
           method  = "GET",
           headers = {
-            ["Host"] = "headers-inspect.com",
+            ["Host"] = "headers-inspect.test",
             ["TE"]   = "trailers"
           },
           path = "/hop-by-hop",
@@ -209,7 +210,7 @@ for _, strategy in helpers.each_strategy() do
         local res = assert(proxy_client:send {
           method  = "GET",
           headers = {
-            ["Host"] = "headers-inspect.com",
+            ["Host"] = "headers-inspect.test",
             ["Connection"] = "keep-alive, Upgrade",
             ["Upgrade"] = "websocket"
           },
@@ -242,6 +243,84 @@ for _, strategy in helpers.each_strategy() do
       end)
     end)
 
+    describe("(response from upstream)", function()
+      local mock
+      lazy_setup(function()
+        assert(db:truncate("routes"))
+        assert(db:truncate("services"))
+        local port = helpers.get_available_port()
+        mock = http_mock.new("localhost:" .. port, {
+          ["/nocharset"] = {
+            content = [[
+              ngx.header.content_type = "text/plain"
+              ngx.say("Hello World!")
+            ]]
+          },
+          ["/charset"] = {
+            content = [[
+              ngx.header.content_type = "text/plain; charset=utf-8"
+              ngx.say("Hello World!")
+            ]]
+          }
+        }, {
+          record_opts = {
+            req = false,
+          }
+        })
+
+        assert(mock:start())
+
+        local service = assert(bp.services:insert {
+          protocol = "http",
+          host = "127.0.0.1",
+          port = port,
+        })
+
+        assert(bp.routes:insert {
+          hosts = { "headers-charset.test" },
+          service = service,
+        })
+
+        assert(helpers.start_kong({
+          database           = strategy,
+          nginx_http_charset = "off",
+        }))
+      end)
+
+      lazy_teardown(function()
+        stop_kong()
+        mock:stop()
+      end)
+
+      describe("Content-Type", function()
+        it("does not add charset if the response from upstream contains no charset when charset is turned off", function()
+          local res = assert(proxy_client:send {
+            method  = "GET",
+            path    = "/nocharset",
+            headers = {
+              ["Host"] = "headers-charset.test",
+            }
+          })
+
+          assert.res_status(200, res)
+          assert.equal("text/plain", res.headers["Content-Type"])
+        end)
+
+        it("charset remain unchanged if the response from upstream contains charset when charset is turned off", function()
+          local res = assert(proxy_client:send {
+            method  = "GET",
+            path    = "/charset",
+            headers = {
+              ["Host"] = "headers-charset.test",
+            }
+          })
+
+          assert.res_status(200, res)
+          assert.equal("text/plain; charset=utf-8", res.headers["Content-Type"])
+        end)
+      end)
+    end)
+
     describe("(using the default configuration values)", function()
       lazy_setup(start_kong {
         database         = strategy,
@@ -254,7 +333,7 @@ for _, strategy in helpers.each_strategy() do
       describe("X-Real-IP", function()
         it("should be added if not present in request", function()
           local headers = request_headers {
-            ["Host"] = "headers-inspect.com",
+            ["Host"] = "headers-inspect.test",
           }
 
           assert.equal("127.0.0.1", headers["x-real-ip"])
@@ -262,7 +341,7 @@ for _, strategy in helpers.each_strategy() do
 
         it("should be replaced if present in request", function()
           local headers = request_headers {
-            ["Host"]      = "headers-inspect.com",
+            ["Host"]      = "headers-inspect.test",
             ["X-Real-IP"] = "10.0.0.1",
           }
 
@@ -273,7 +352,7 @@ for _, strategy in helpers.each_strategy() do
       describe("X-Forwarded-For", function()
         it("should be added if not present in request", function()
           local headers = request_headers {
-            ["Host"] = "headers-inspect.com",
+            ["Host"] = "headers-inspect.test",
           }
 
           assert.equal("127.0.0.1", headers["x-forwarded-for"])
@@ -281,7 +360,7 @@ for _, strategy in helpers.each_strategy() do
 
         it("should be appended if present in request", function()
           local headers = request_headers {
-            ["Host"]            = "headers-inspect.com",
+            ["Host"]            = "headers-inspect.test",
             ["X-Forwarded-For"] = "10.0.0.1",
           }
 
@@ -292,7 +371,7 @@ for _, strategy in helpers.each_strategy() do
       describe("X-Forwarded-Proto", function()
         it("should be added if not present in request", function()
           local headers = request_headers {
-            ["Host"] = "headers-inspect.com",
+            ["Host"] = "headers-inspect.test",
           }
 
           assert.equal("http", headers["x-forwarded-proto"])
@@ -300,7 +379,7 @@ for _, strategy in helpers.each_strategy() do
 
         it("should be replaced if present in request", function()
           local headers = request_headers {
-            ["Host"]              = "headers-inspect.com",
+            ["Host"]              = "headers-inspect.test",
             ["X-Forwarded-Proto"] = "https",
           }
 
@@ -311,26 +390,26 @@ for _, strategy in helpers.each_strategy() do
       describe("X-Forwarded-Host", function()
         it("should be added if not present in request", function()
           local headers = request_headers {
-            ["Host"] = "headers-inspect.com",
+            ["Host"] = "headers-inspect.test",
           }
 
-          assert.equal("headers-inspect.com", headers["x-forwarded-host"])
+          assert.equal("headers-inspect.test", headers["x-forwarded-host"])
         end)
 
         it("should be replaced if present in request", function()
           local headers = request_headers {
-            ["Host"]             = "headers-inspect.com",
-            ["X-Forwarded-Host"] = "example.com",
+            ["Host"]             = "headers-inspect.test",
+            ["X-Forwarded-Host"] = "example.test",
           }
 
-          assert.equal("headers-inspect.com", headers["x-forwarded-host"])
+          assert.equal("headers-inspect.test", headers["x-forwarded-host"])
         end)
       end)
 
       describe("X-Forwarded-Port", function()
         it("should be added if not present in request", function()
           local headers = request_headers {
-            ["Host"] = "headers-inspect.com",
+            ["Host"] = "headers-inspect.test",
           }
 
           assert.equal(helpers.get_proxy_port(false), tonumber(headers["x-forwarded-port"]))
@@ -338,7 +417,7 @@ for _, strategy in helpers.each_strategy() do
 
         it("should be replaced if present in request", function()
           local headers = request_headers {
-            ["Host"]             = "headers-inspect.com",
+            ["Host"]             = "headers-inspect.test",
             ["X-Forwarded-Port"] = "80",
           }
 
@@ -349,7 +428,7 @@ for _, strategy in helpers.each_strategy() do
       describe("X-Forwarded-Path", function()
         it("should be added if not present in request", function()
           local headers = request_headers {
-            ["Host"] = "headers-inspect.com",
+            ["Host"] = "headers-inspect.test",
           }
 
           assert.equal("/", headers["x-forwarded-path"])
@@ -357,7 +436,7 @@ for _, strategy in helpers.each_strategy() do
 
         it("should be replaced if present in request", function()
           local headers = request_headers {
-            ["Host"]             = "headers-inspect.com",
+            ["Host"]             = "headers-inspect.test",
             ["X-Forwarded-Path"] = "/replaced",
           }
 
@@ -396,33 +475,33 @@ for _, strategy in helpers.each_strategy() do
       describe("with the downstream host preserved", function()
         it("should be added if not present in request while preserving the downstream host", function()
           local headers = request_headers {
-            ["Host"] = "preserved.com",
+            ["Host"] = "preserved.test",
           }
 
-          assert.equal("preserved.com", headers["host"])
+          assert.equal("preserved.test", headers["host"])
           assert.equal("127.0.0.1", headers["x-real-ip"])
           assert.equal("127.0.0.1", headers["x-forwarded-for"])
           assert.equal("http", headers["x-forwarded-proto"])
-          assert.equal("preserved.com", headers["x-forwarded-host"])
+          assert.equal("preserved.test", headers["x-forwarded-host"])
           assert.equal("/", headers["x-forwarded-path"])
           assert.equal(helpers.get_proxy_port(false), tonumber(headers["x-forwarded-port"]))
         end)
 
         it("should be added if present in request while preserving the downstream host", function()
           local headers = request_headers {
-            ["Host"]              = "preserved.com",
+            ["Host"]              = "preserved.test",
             ["X-Real-IP"]         = "10.0.0.1",
             ["X-Forwarded-For"]   = "10.0.0.1",
             ["X-Forwarded-Proto"] = "https",
-            ["X-Forwarded-Host"]  = "example.com",
+            ["X-Forwarded-Host"]  = "example.test",
             ["X-Forwarded-Port"]  = "80",
           }
 
-          assert.equal("preserved.com", headers["host"])
+          assert.equal("preserved.test", headers["host"])
           assert.equal("127.0.0.1", headers["x-real-ip"])
           assert.equal("10.0.0.1, 127.0.0.1", headers["x-forwarded-for"])
           assert.equal("http", headers["x-forwarded-proto"])
-          assert.equal("preserved.com", headers["x-forwarded-host"])
+          assert.equal("preserved.test", headers["x-forwarded-host"])
           assert.equal(helpers.get_proxy_port(false), tonumber(headers["x-forwarded-port"]))
           assert.equal("/", headers["x-forwarded-path"])
         end)
@@ -431,7 +510,7 @@ for _, strategy in helpers.each_strategy() do
       describe("with the downstream host discarded", function()
         it("should be added if not present in request while discarding the downstream host", function()
           local headers = request_headers {
-            ["Host"] = "headers-inspect.com",
+            ["Host"] = "headers-inspect.test",
           }
 
           assert.equal(helpers.mock_upstream_host .. ":" ..
@@ -440,18 +519,18 @@ for _, strategy in helpers.each_strategy() do
           assert.equal(helpers.mock_upstream_host, headers["x-real-ip"])
           assert.equal(helpers.mock_upstream_host, headers["x-forwarded-for"])
           assert.equal("http", headers["x-forwarded-proto"])
-          assert.equal("headers-inspect.com", headers["x-forwarded-host"])
+          assert.equal("headers-inspect.test", headers["x-forwarded-host"])
           assert.equal(helpers.get_proxy_port(false), tonumber(headers["x-forwarded-port"]))
           assert.equal("/", headers["x-forwarded-path"])
         end)
 
         it("if present in request while discarding the downstream host", function()
           local headers = request_headers {
-            ["Host"]              = "headers-inspect.com",
+            ["Host"]              = "headers-inspect.test",
             ["X-Real-IP"]         = "10.0.0.1",
             ["X-Forwarded-For"]   = "10.0.0.1",
             ["X-Forwarded-Proto"] = "https",
-            ["X-Forwarded-Host"]  = "example.com",
+            ["X-Forwarded-Host"]  = "example.test",
             ["X-Forwarded-Port"]  = "80",
           }
 
@@ -461,7 +540,7 @@ for _, strategy in helpers.each_strategy() do
           assert.equal("127.0.0.1", headers["x-real-ip"])
           assert.equal("10.0.0.1, 127.0.0.1", headers["x-forwarded-for"])
           assert.equal("http", headers["x-forwarded-proto"])
-          assert.equal("headers-inspect.com", headers["x-forwarded-host"])
+          assert.equal("headers-inspect.test", headers["x-forwarded-host"])
           assert.equal(helpers.get_proxy_port(false), tonumber(headers["x-forwarded-port"]))
           assert.equal("/", headers["x-forwarded-path"])
         end)
@@ -482,7 +561,7 @@ for _, strategy in helpers.each_strategy() do
       describe("X-Real-IP", function()
         it("should be added if not present in request", function()
           local headers = request_headers {
-            ["Host"] = "headers-inspect.com",
+            ["Host"] = "headers-inspect.test",
           }
 
           assert.equal("127.0.0.1", headers["x-real-ip"])
@@ -490,7 +569,7 @@ for _, strategy in helpers.each_strategy() do
 
         it("should be forwarded if present in request", function()
           local headers = request_headers {
-            ["Host"]      = "headers-inspect.com",
+            ["Host"]      = "headers-inspect.test",
             ["X-Real-IP"] = "10.0.0.1",
           }
 
@@ -502,7 +581,7 @@ for _, strategy in helpers.each_strategy() do
 
         it("should be added if not present in request", function()
           local headers = request_headers {
-            ["Host"] = "headers-inspect.com",
+            ["Host"] = "headers-inspect.test",
           }
 
           assert.equal("127.0.0.1", headers["x-forwarded-for"])
@@ -510,7 +589,7 @@ for _, strategy in helpers.each_strategy() do
 
         it("should be appended if present in request", function()
           local headers = request_headers {
-            ["Host"] = "headers-inspect.com",
+            ["Host"] = "headers-inspect.test",
             ["X-Forwarded-For"] = "10.0.0.1",
           }
 
@@ -522,7 +601,7 @@ for _, strategy in helpers.each_strategy() do
       describe("X-Forwarded-Proto", function()
         it("should be added if not present in request", function()
           local headers = request_headers {
-            ["Host"] = "headers-inspect.com",
+            ["Host"] = "headers-inspect.test",
           }
 
           assert.equal("http", headers["x-forwarded-proto"])
@@ -530,7 +609,7 @@ for _, strategy in helpers.each_strategy() do
 
         it("should be forwarded if present in request", function()
           local headers = request_headers {
-            ["Host"]              = "headers-inspect.com",
+            ["Host"]              = "headers-inspect.test",
             ["X-Forwarded-Proto"] = "https",
           }
 
@@ -541,26 +620,26 @@ for _, strategy in helpers.each_strategy() do
       describe("X-Forwarded-Host", function()
         it("should be added if not present in request", function()
           local headers = request_headers {
-            ["Host"] = "headers-inspect.com",
+            ["Host"] = "headers-inspect.test",
           }
 
-          assert.equal("headers-inspect.com", headers["x-forwarded-host"])
+          assert.equal("headers-inspect.test", headers["x-forwarded-host"])
         end)
 
         it("should be forwarded if present in request", function()
           local headers = request_headers {
-            ["Host"]             = "headers-inspect.com",
-            ["X-Forwarded-Host"] = "example.com",
+            ["Host"]             = "headers-inspect.test",
+            ["X-Forwarded-Host"] = "example.test",
           }
 
-          assert.equal("example.com", headers["x-forwarded-host"])
+          assert.equal("example.test", headers["x-forwarded-host"])
         end)
       end)
 
       describe("X-Forwarded-Port", function()
         it("should be added if not present in request", function()
           local headers = request_headers {
-            ["Host"] = "headers-inspect.com",
+            ["Host"] = "headers-inspect.test",
           }
 
           assert.equal(helpers.get_proxy_port(false), tonumber(headers["x-forwarded-port"]))
@@ -568,7 +647,7 @@ for _, strategy in helpers.each_strategy() do
 
         it("should be forwarded if present in request", function()
           local headers = request_headers {
-            ["Host"]             = "headers-inspect.com",
+            ["Host"]             = "headers-inspect.test",
             ["X-Forwarded-Port"] = "80",
           }
 
@@ -579,7 +658,7 @@ for _, strategy in helpers.each_strategy() do
       describe("X-Forwarded-Path", function()
         it("should be added if not present in request", function()
           local headers = request_headers {
-            ["Host"] = "headers-inspect.com",
+            ["Host"] = "headers-inspect.test",
           }
 
           assert.equal("/", headers["x-forwarded-path"])
@@ -587,7 +666,7 @@ for _, strategy in helpers.each_strategy() do
 
         it("should be forwarded if present in request", function()
           local headers = request_headers {
-            ["Host"]             = "headers-inspect.com",
+            ["Host"]             = "headers-inspect.test",
             ["X-Forwarded-Path"] = "/original-path",
           }
 
@@ -627,7 +706,7 @@ for _, strategy in helpers.each_strategy() do
       describe("X-Real-IP", function()
         it("should be added if not present in request", function()
           local headers = request_headers {
-            ["Host"] = "headers-inspect.com",
+            ["Host"] = "headers-inspect.test",
           }
 
           assert.equal("127.0.0.1", headers["x-real-ip"])
@@ -635,7 +714,7 @@ for _, strategy in helpers.each_strategy() do
 
         it("should be replaced if present in request", function()
           local headers = request_headers {
-            ["Host"]      = "headers-inspect.com",
+            ["Host"]      = "headers-inspect.test",
             ["X-Real-IP"] = "10.0.0.1",
           }
 
@@ -647,7 +726,7 @@ for _, strategy in helpers.each_strategy() do
 
         it("should be added if not present in request", function()
           local headers = request_headers {
-            ["Host"] = "headers-inspect.com",
+            ["Host"] = "headers-inspect.test",
           }
 
           assert.equal("127.0.0.1", headers["x-forwarded-for"])
@@ -655,7 +734,7 @@ for _, strategy in helpers.each_strategy() do
 
         it("should be appended if present in request", function()
           local headers = request_headers {
-            ["Host"]            = "headers-inspect.com",
+            ["Host"]            = "headers-inspect.test",
             ["X-Forwarded-For"] = "10.0.0.1",
           }
 
@@ -667,7 +746,7 @@ for _, strategy in helpers.each_strategy() do
       describe("X-Forwarded-Proto", function()
         it("should be added if not present in request", function()
           local headers = request_headers {
-            ["Host"] = "headers-inspect.com",
+            ["Host"] = "headers-inspect.test",
           }
 
           assert.equal("http", headers["x-forwarded-proto"])
@@ -675,7 +754,7 @@ for _, strategy in helpers.each_strategy() do
 
         it("should be replaced if present in request", function()
           local headers = request_headers {
-            ["Host"]              = "headers-inspect.com",
+            ["Host"]              = "headers-inspect.test",
             ["X-Forwarded-Proto"] = "https",
           }
 
@@ -686,26 +765,26 @@ for _, strategy in helpers.each_strategy() do
       describe("X-Forwarded-Host", function()
         it("should be added if not present in request", function()
           local headers = request_headers {
-            ["Host"] = "headers-inspect.com",
+            ["Host"] = "headers-inspect.test",
           }
 
-          assert.equal("headers-inspect.com", headers["x-forwarded-host"])
+          assert.equal("headers-inspect.test", headers["x-forwarded-host"])
         end)
 
         it("should be replaced if present in request", function()
           local headers = request_headers {
-            ["Host"]             = "headers-inspect.com",
-            ["X-Forwarded-Host"] = "example.com",
+            ["Host"]             = "headers-inspect.test",
+            ["X-Forwarded-Host"] = "example.test",
           }
 
-          assert.equal("headers-inspect.com", headers["x-forwarded-host"])
+          assert.equal("headers-inspect.test", headers["x-forwarded-host"])
         end)
       end)
 
       describe("X-Forwarded-Port", function()
         it("should be added if not present in request", function()
           local headers = request_headers {
-            ["Host"] = "headers-inspect.com",
+            ["Host"] = "headers-inspect.test",
           }
 
           assert.equal(helpers.get_proxy_port(false), tonumber(headers["x-forwarded-port"]))
@@ -713,7 +792,7 @@ for _, strategy in helpers.each_strategy() do
 
         it("should be replaced if present in request", function()
           local headers = request_headers {
-            ["Host"]             = "headers-inspect.com",
+            ["Host"]             = "headers-inspect.test",
             ["X-Forwarded-Port"] = "80",
           }
 
@@ -724,7 +803,7 @@ for _, strategy in helpers.each_strategy() do
       describe("X-Forwarded-Path", function()
         it("should be added if not present in request", function()
           local headers = request_headers {
-            ["Host"] = "headers-inspect.com",
+            ["Host"] = "headers-inspect.test",
           }
 
           assert.equal("/", headers["x-forwarded-path"])
@@ -732,7 +811,7 @@ for _, strategy in helpers.each_strategy() do
 
         it("should be replaced if present in request", function()
           local headers = request_headers {
-            ["Host"]             = "headers-inspect.com",
+            ["Host"]             = "headers-inspect.test",
             ["X-Forwarded-Path"] = "/untrusted",
           }
 
@@ -784,7 +863,7 @@ for _, strategy in helpers.each_strategy() do
       describe("X-Real-IP and X-Forwarded-For", function()
         it("should be added if not present in request", function()
           local headers = request_headers {
-            ["Host"] = "headers-inspect.com",
+            ["Host"] = "headers-inspect.test",
           }
 
           assert.equal("127.0.0.1", headers["x-real-ip"])
@@ -793,7 +872,7 @@ for _, strategy in helpers.each_strategy() do
 
         it("should be changed according to rules if present in request", function()
           local headers = request_headers {
-            ["Host"]            = "headers-inspect.com",
+            ["Host"]            = "headers-inspect.test",
             ["X-Forwarded-For"] = "127.0.0.1, 10.0.0.1, 192.168.0.1, 127.0.0.1, 172.16.0.1",
             ["X-Real-IP"]       = "10.0.0.2",
           }
@@ -806,7 +885,7 @@ for _, strategy in helpers.each_strategy() do
       describe("X-Forwarded-Port", function()
         it("should be forwarded even if X-Forwarded-For header has a port in it", function()
           local headers = request_headers {
-            ["Host"]             = "headers-inspect.com",
+            ["Host"]             = "headers-inspect.test",
             ["X-Forwarded-For"]  = "127.0.0.1:14, 10.0.0.1:15, 192.168.0.1:16, 127.0.0.1:17, 172.16.0.1:18",
             ["X-Real-IP"]        = "10.0.0.2",
             ["X-Forwarded-Port"] = "14",
@@ -819,7 +898,7 @@ for _, strategy in helpers.each_strategy() do
 
         pending("should take a port from X-Forwarded-For header if it has a port in it", function()
   --        local headers = request_headers {
-  --          ["Host"]             = "headers-inspect.com",
+  --          ["Host"]             = "headers-inspect.test",
   --          ["X-Forwarded-For"]  = "127.0.0.1:14, 10.0.0.1:15, 192.168.0.1:16, 127.0.0.1:17, 172.16.0.1:18",
   --          ["X-Real-IP"]        = "10.0.0.2",
   --        }
@@ -846,7 +925,7 @@ for _, strategy in helpers.each_strategy() do
       describe("X-Real-IP and X-Forwarded-For", function()
         it("should be added if not present in request", function()
           local headers = request_headers {
-            ["Host"] = "headers-inspect.com",
+            ["Host"] = "headers-inspect.test",
           }
 
           assert.equal("127.0.0.1", headers["x-real-ip"])
@@ -855,7 +934,7 @@ for _, strategy in helpers.each_strategy() do
 
         it("should be changed according to rules if present in request", function()
           local headers = request_headers {
-            ["Host"]            = "headers-inspect.com",
+            ["Host"]            = "headers-inspect.test",
             ["X-Forwarded-For"] = "10.0.0.1, 127.0.0.2, 10.0.0.1, 192.168.0.1, 172.16.0.1",
             ["X-Real-IP"]       = "10.0.0.2",
           }
@@ -868,7 +947,7 @@ for _, strategy in helpers.each_strategy() do
       describe("X-Forwarded-Port", function()
         it("should be replaced even if X-Forwarded-Port and X-Forwarded-For headers have a port in it", function()
           local headers = request_headers {
-            ["Host"]             = "headers-inspect.com",
+            ["Host"]             = "headers-inspect.test",
             ["X-Forwarded-For"]  = "127.0.0.1:14, 10.0.0.1:15, 192.168.0.1:16, 127.0.0.1:17, 172.16.0.1:18",
             ["X-Real-IP"]        = "10.0.0.2",
             ["X-Forwarded-Port"] = "14",
@@ -881,7 +960,7 @@ for _, strategy in helpers.each_strategy() do
 
         it("should not take a port from X-Forwarded-For header if it has a port in it", function()
           local headers = request_headers {
-            ["Host"]             = "headers-inspect.com",
+            ["Host"]             = "headers-inspect.test",
             ["X-Forwarded-For"]  = "127.0.0.1:14, 10.0.0.1:15, 192.168.0.1:16, 127.0.0.1:17, 172.16.0.1:18",
             ["X-Real-IP"]        = "10.0.0.2",
           }
@@ -915,7 +994,7 @@ for _, strategy in helpers.each_strategy() do
           local sock = ngx.socket.tcp()
           local request = "PROXY TCP4 192.168.0.1 " .. helpers.get_proxy_ip(false) .. " 56324 " .. helpers.get_proxy_port(false) .. "\r\n" ..
                           "GET / HTTP/1.1\r\n" ..
-                          "Host: headers-inspect.com\r\n" ..
+                          "Host: headers-inspect.test\r\n" ..
                           "Connection: close\r\n" ..
                           "\r\n"
 
@@ -942,7 +1021,7 @@ for _, strategy in helpers.each_strategy() do
           local sock = ngx.socket.tcp()
           local request = "PROXY TCP4 192.168.0.1 " .. helpers.get_proxy_ip(false) .. " 56324 " .. helpers.get_proxy_port(false) .. "\r\n" ..
                           "GET / HTTP/1.1\r\n" ..
-                          "Host: headers-inspect.com\r\n" ..
+                          "Host: headers-inspect.test\r\n" ..
                           "Connection: close\r\n" ..
                           "X-Real-IP: 10.0.0.2\r\n" ..
                           "X-Forwarded-For: 10.0.0.1, 127.0.0.2, 10.0.0.1, 192.168.0.1, 172.16.0.1\r\n" ..
@@ -972,7 +1051,7 @@ for _, strategy in helpers.each_strategy() do
           local sock = ngx.socket.tcp()
           local request = "PROXY TCP4 192.168.0.1 " .. helpers.get_proxy_ip(false) .. " 56324 " .. helpers.get_proxy_port(false) .. "\r\n" ..
                           "GET / HTTP/1.1\r\n" ..
-                          "Host: headers-inspect.com\r\n" ..
+                          "Host: headers-inspect.test\r\n" ..
                           "Connection: close\r\n" ..
                           "X-Real-IP: 10.0.0.2\r\n" ..
                           "X-Forwarded-For: 127.0.0.1:14, 10.0.0.1:15, 192.168.0.1:16, 127.0.0.1:17, 172.16.0.1:18\r\n" ..
@@ -1021,7 +1100,7 @@ for _, strategy in helpers.each_strategy() do
           local sock = ngx.socket.tcp()
           local request = "PROXY TCP4 192.168.0.1 " .. proxy_ip .. " 56324 " .. proxy_port .. "\r\n" ..
                           "GET / HTTP/1.1\r\n" ..
-                          "Host: headers-inspect.com\r\n" ..
+                          "Host: headers-inspect.test\r\n" ..
                           "Connection: close\r\n" ..
                           "\r\n"
 
@@ -1048,7 +1127,7 @@ for _, strategy in helpers.each_strategy() do
           local sock = ngx.socket.tcp()
           local request = "PROXY TCP4 192.168.0.1 " .. proxy_ip .. " 56324 " .. proxy_port .. "\r\n" ..
                           "GET / HTTP/1.1\r\n" ..
-                          "Host: headers-inspect.com\r\n" ..
+                          "Host: headers-inspect.test\r\n" ..
                           "Connection: close\r\n" ..
                           "X-Real-IP: 10.0.0.2\r\n" ..
                           "X-Forwarded-For: 10.0.0.1, 127.0.0.2, 10.0.0.1, 192.168.0.1, 172.16.0.1\r\n" ..
@@ -1078,7 +1157,7 @@ for _, strategy in helpers.each_strategy() do
           local sock = ngx.socket.tcp()
           local request = "PROXY TCP4 192.168.0.1 " .. proxy_ip .. " 56324 " .. proxy_port .. "\r\n" ..
                           "GET / HTTP/1.1\r\n" ..
-                          "Host: headers-inspect.com\r\n" ..
+                          "Host: headers-inspect.test\r\n" ..
                           "Connection: close\r\n" ..
                           "X-Real-IP: 10.0.0.2\r\n" ..
                           "X-Forwarded-For: 127.0.0.1:14, 10.0.0.1:15, 192.168.0.1:16, 127.0.0.1:17, 172.16.0.1:18\r\n" ..
@@ -1121,7 +1200,7 @@ for _, strategy in helpers.each_strategy() do
       describe("X-Forwarded-Port", function()
         it("should be added if not present in request", function()
           local headers = request_headers {
-            ["Host"] = "headers-inspect.com",
+            ["Host"] = "headers-inspect.test",
           }
 
           assert.equal(80, tonumber(headers["x-forwarded-port"]))
@@ -1129,13 +1208,87 @@ for _, strategy in helpers.each_strategy() do
 
         it("should be replaced if present in request", function()
           local headers = request_headers {
-            ["Host"]             = "headers-inspect.com",
+            ["Host"]             = "headers-inspect.test",
             ["X-Forwarded-Port"] = "81",
           }
 
           assert.equal(80, tonumber(headers["x-forwarded-port"]))
         end)
       end)
+    end)
+  end)
+
+  describe("host_header should be set correctly", function()
+    lazy_setup(function()
+      local bp = helpers.get_db_utils(strategy, {
+        "routes",
+        "services",
+      })
+
+      local upstream = assert(bp.upstreams:insert {
+        name               = "foo",
+        host_header        = "foo.com",
+      })
+
+      assert(bp.targets:insert {
+        target   = "127.0.0.1:62351",
+        upstream = upstream,
+        weight   = 50,
+      })
+
+      local service = bp.services:insert {
+        name            = "retry_service",
+        host            = "foo",
+        retries         = 5,
+      }
+
+      bp.routes:insert {
+        service    = service,
+        paths      = { "/hello" },
+        strip_path = false,
+      }
+
+      local fixtures = {
+        http_mock = {}
+      }
+
+      fixtures.http_mock.my_server_block = [[
+        server {
+          listen 0.0.0.0:62351;
+          location /hello {
+            content_by_lua_block {
+              local shd = ngx.shared.request_counter
+              local request_counter = shd:incr("counter", 1, 0)
+              if request_counter % 2 ~= 0 then
+                ngx.exit(ngx.HTTP_CLOSE)
+              else
+                ngx.say(ngx.var.host)
+              end
+            }
+          }
+        }
+      ]]
+
+      assert(helpers.start_kong({
+        database   = strategy,
+        nginx_conf = "spec/fixtures/custom_nginx.template",
+        nginx_http_lua_shared_dict = "request_counter 1m",
+      }, nil, nil, fixtures))
+    end)
+
+    lazy_teardown(function()
+      assert(helpers.stop_kong())
+    end)
+
+    it("when retries to upstream happen", function()
+      local proxy_client = helpers.proxy_client()
+      local res = assert(proxy_client:send {
+        method = "GET",
+        path = "/hello",
+      })
+
+      local body = assert.res_status(200, res)
+      assert.equal("foo.com", body)
     end)
   end)
 end

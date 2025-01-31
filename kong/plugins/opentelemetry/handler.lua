@@ -1,171 +1,71 @@
-local BatchQueue = require "kong.tools.batch_queue"
-local http = require "resty.http"
-local clone = require "table.clone"
-local otlp = require "kong.plugins.opentelemetry.otlp"
-local propagation = require "kong.tracing.propagation"
 
-local pairs = pairs
+local otel_traces = require "kong.plugins.opentelemetry.traces"
+local otel_logs = require "kong.plugins.opentelemetry.logs"
+local otel_utils = require "kong.plugins.opentelemetry.utils"
+local dynamic_hook = require "kong.dynamic_hook"
+local o11y_logs = require "kong.observability.logs"
+local kong_meta = require "kong.meta"
 
-local ngx = ngx
-local kong = kong
+local _log_prefix = otel_utils._log_prefix
 local ngx_log = ngx.log
-local ngx_ERR = ngx.ERR
-local ngx_DEBUG = ngx.DEBUG
-local ngx_now = ngx.now
-local ngx_update_time = ngx.update_time
-local ngx_req = ngx.req
-local ngx_get_headers = ngx_req.get_headers
-local propagation_parse = propagation.parse
-local propagation_set = propagation.set
-local null = ngx.null
-local encode_traces = otlp.encode_traces
-local transform_span = otlp.transform_span
+local ngx_WARN = ngx.WARN
 
-local _log_prefix = "[otel] "
 
 local OpenTelemetryHandler = {
-  VERSION = "0.1.0",
+  VERSION = kong_meta.version,
   PRIORITY = 14,
 }
 
-local default_headers = {
-  ["Content-Type"] = "application/x-protobuf",
-}
 
--- worker-level spans queue
-local queues = {} -- one queue per unique plugin config
-local headers_cache = setmetatable({}, { __mode = "k" })
-
-local function get_cached_headers(conf_headers)
-  if not conf_headers then
-    return default_headers
-  end
-
-  -- cache http headers
-  local headers = headers_cache[conf_headers]
-
-  if not headers then
-    headers = clone(default_headers)
-    if conf_headers and conf_headers ~= null then
-      for k, v in pairs(conf_headers) do
-        headers[k] = v
+function OpenTelemetryHandler:configure(configs)
+  if configs then
+    for _, config in ipairs(configs) do
+      if config.logs_endpoint then
+        dynamic_hook.hook("observability_logs", "push", o11y_logs.maybe_push)
+        dynamic_hook.enable_by_default("observability_logs")
       end
     end
-
-    headers_cache[conf_headers] = headers
-  end
-
-  return headers
-end
-
-
-local function http_export_request(conf, pb_data, headers)
-  local httpc = http.new()
-  httpc:set_timeouts(conf.connect_timeout, conf.send_timeout, conf.read_timeout)
-  local res, err = httpc:request_uri(conf.endpoint, {
-    method = "POST",
-    body = pb_data,
-    headers = headers,
-  })
-  if not res then
-    ngx_log(ngx_ERR, _log_prefix, "failed to send request: ", err)
-  end
-
-  if res and res.status ~= 200 then
-    ngx_log(ngx_ERR, _log_prefix, "response error: ", res.status, ", body: ", res.body)
   end
 end
 
-local function http_export(conf, spans)
-  local start = ngx_now()
-  local headers = get_cached_headers(conf.headers)
-  local payload = encode_traces(spans, conf.resource_attributes)
 
-  http_export_request(conf, payload, headers)
-
-  ngx_update_time()
-  local duration = ngx_now() - start
-  ngx_log(ngx_DEBUG, _log_prefix, "exporter sent " .. #spans ..
-    " traces to " .. conf.endpoint .. " in " .. duration .. " seconds")
+function OpenTelemetryHandler:access(conf)
+  -- Traces
+  if conf.traces_endpoint then
+    otel_traces.access(conf)
+  end
 end
 
-local function process_span(span, queue)
-  if span.should_sample == false or kong.ctx.plugin.should_sample == false then
-    -- ignore
-    return
+
+function OpenTelemetryHandler:header_filter(conf)
+  -- Traces
+  if conf.traces_endpoint then
+    otel_traces.header_filter(conf)
   end
-
-  -- overwrite
-  local trace_id = kong.ctx.plugin.trace_id
-  if trace_id then
-    span.trace_id = trace_id
-  end
-
-  local pb_span = transform_span(span)
-
-  queue:add(pb_span)
 end
 
-function OpenTelemetryHandler:rewrite()
-  local headers = ngx_get_headers()
-  local root_span = ngx.ctx.KONG_SPANS and ngx.ctx.KONG_SPANS[1]
-
-  -- make propagation running with tracing instrumetation not enabled
-  if not root_span then
-    local tracer = kong.tracing.new("otel")
-    root_span = tracer.start_span("root")
-
-    -- the span created only for the propagation and will be bypassed to the exporter
-    kong.ctx.plugin.should_sample = false
-  end
-
-  local header_type, trace_id, span_id, parent_id, should_sample, _ = propagation_parse(headers)
-  if should_sample == false then
-    root_span.should_sample = should_sample
-  end
-
-  -- overwrite trace id
-  if trace_id then
-    root_span.trace_id = trace_id
-    kong.ctx.plugin.trace_id = trace_id
-  end
-
-  -- overwrite root span's parent_id
-  if span_id then
-    root_span.parent_id = span_id
-
-  elseif parent_id then
-    root_span.parent_id = parent_id
-  end
-
-  propagation_set("preserve", header_type, root_span, "w3c")
-end
 
 function OpenTelemetryHandler:log(conf)
-  ngx_log(ngx_DEBUG, _log_prefix, "total spans in current request: ", ngx.ctx.KONG_SPANS and #ngx.ctx.KONG_SPANS)
-
-  local queue_id = conf.__key__
-  local q = queues[queue_id]
-  if not q then
-    local process = function(entries)
-      return http_export(conf, entries)
+  -- Read resource attributes variable
+  local options = {}
+  if conf.resource_attributes then
+    local compiled, err = otel_utils.compile_resource_attributes(conf.resource_attributes)
+    if not compiled then
+      ngx_log(ngx_WARN, _log_prefix, "resource attributes template failed to compile: ", err)
     end
-
-    local opts = {
-      batch_max_size = conf.batch_span_count,
-      process_delay  = conf.batch_flush_delay,
-    }
-
-    local err
-    q, err = BatchQueue.new(process, opts)
-    if not q then
-      kong.log.err("could not create queue: ", err)
-      return
-    end
-    queues[queue_id] = q
+    options.compiled_resource_attributes = compiled
   end
 
-  kong.tracing.process_span(process_span, q)
+  -- Traces
+  if conf.traces_endpoint then
+    otel_traces.log(conf, options)
+  end
+
+  -- Logs
+  if conf.logs_endpoint then
+    otel_logs.log(conf, options)
+  end
 end
+
 
 return OpenTelemetryHandler

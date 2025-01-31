@@ -6,10 +6,11 @@
 -- @see https://github.com/x25/luajwt
 
 local json = require "cjson"
+local b64 = require "ngx.base64"
+local buffer = require "string.buffer"
 local openssl_digest = require "resty.openssl.digest"
-local openssl_hmac = require "resty.openssl.hmac"
+local openssl_mac = require "resty.openssl.mac"
 local openssl_pkey = require "resty.openssl.pkey"
-local asn_sequence = require "kong.plugins.jwt.asn_sequence"
 
 
 local rep = string.rep
@@ -20,22 +21,21 @@ local time = ngx.time
 local pairs = pairs
 local error = error
 local pcall = pcall
-local concat = table.concat
 local insert = table.insert
 local unpack = unpack
 local assert = assert
 local tostring = tostring
 local setmetatable = setmetatable
 local getmetatable = getmetatable
-local encode_base64 = ngx.encode_base64
-local decode_base64 = ngx.decode_base64
+local encode_base64url = b64.encode_base64url
+local decode_base64url = b64.decode_base64url
 
 
 --- Supported algorithms for signing tokens.
 local alg_sign = {
-  HS256 = function(data, key) return openssl_hmac.new(key, "sha256"):final(data) end,
-  HS384 = function(data, key) return openssl_hmac.new(key, "sha384"):final(data) end,
-  HS512 = function(data, key) return openssl_hmac.new(key, "sha512"):final(data) end,
+  HS256 = function(data, key) return openssl_mac.new(key, "HMAC", nil, "sha256"):final(data) end,
+  HS384 = function(data, key) return openssl_mac.new(key, "HMAC", nil, "sha384"):final(data) end,
+  HS512 = function(data, key) return openssl_mac.new(key, "HMAC", nil, "sha512"):final(data) end,
   RS256 = function(data, key)
     local digest = openssl_digest.new("sha256")
     assert(digest:update(data))
@@ -53,29 +53,56 @@ local alg_sign = {
   end,
   ES256 = function(data, key)
     local pkey = openssl_pkey.new(key)
-    local digest = openssl_digest.new("sha256")
-    assert(digest:update(data))
-    local signature = assert(pkey:sign(digest))
-
-    local derSequence = asn_sequence.parse_simple_sequence(signature)
-    local r = asn_sequence.unsign_integer(derSequence[1], 32)
-    local s = asn_sequence.unsign_integer(derSequence[2], 32)
-    assert(#r == 32)
-    assert(#s == 32)
-    return r .. s
+    local sig = assert(pkey:sign(data, "sha256", nil, { ecdsa_use_raw = true }))
+    if not sig then
+      return nil
+    end
+    return sig
   end,
   ES384 = function(data, key)
     local pkey = openssl_pkey.new(key)
-    local digest = openssl_digest.new("sha384")
-    assert(digest:update(data))
-    local signature = assert(pkey:sign(digest))
+    local sig = assert(pkey:sign(data, "sha384", nil, { ecdsa_use_raw = true }))
+    if not sig then
+      return nil
+    end
+    return sig
+  end,
+  ES512 = function(data, key)
+    local pkey = openssl_pkey.new(key)
+    local sig = assert(pkey:sign(data, "sha512", nil, { ecdsa_use_raw = true }))
+    if not sig then
+      return nil
+    end
+    return sig
+  end,
 
-    local derSequence = asn_sequence.parse_simple_sequence(signature)
-    local r = asn_sequence.unsign_integer(derSequence[1], 48)
-    local s = asn_sequence.unsign_integer(derSequence[2], 48)
-    assert(#r == 48)
-    assert(#s == 48)
-    return r .. s
+  PS256 = function(data, key)
+    local pkey = openssl_pkey.new(key)
+    local sig = assert(pkey:sign(data, "sha256", openssl_pkey.PADDINGS.RSA_PKCS1_PSS_PADDING))
+    if not sig then
+      return nil
+    end
+    return sig
+  end,
+  PS384 = function(data, key)
+    local pkey = openssl_pkey.new(key)
+    local sig = assert(pkey:sign(data, "sha384", openssl_pkey.PADDINGS.RSA_PKCS1_PSS_PADDING))
+    if not sig then
+      return nil
+    end
+    return sig
+  end,
+  PS512 = function(data, key)
+    local pkey = openssl_pkey.new(key)
+    local sig = assert(pkey:sign(data, "sha512", openssl_pkey.PADDINGS.RSA_PKCS1_PSS_PADDING))
+    if not sig then
+      return nil
+    end
+    return sig
+  end,
+  EdDSA = function(data, key)
+    local pkey = assert(openssl_pkey.new(key))
+    return assert(pkey:sign(data))
   end
 }
 
@@ -88,46 +115,82 @@ local alg_verify = {
   RS256 = function(data, signature, key)
     local pkey, _ = openssl_pkey.new(key)
     assert(pkey, "Consumer Public Key is Invalid")
-    local digest = openssl_digest.new("sha256")
-    assert(digest:update(data))
-    return pkey:verify(signature, digest)
+    return pkey:verify(signature, data, "sha256")
   end,
   RS384 = function(data, signature, key)
     local pkey, _ = openssl_pkey.new(key)
     assert(pkey, "Consumer Public Key is Invalid")
-    local digest = openssl_digest.new("sha384")
-    assert(digest:update(data))
-    return pkey:verify(signature, digest)
+    return pkey:verify(signature, data, "sha384")
   end,
   RS512 = function(data, signature, key)
     local pkey, _ = openssl_pkey.new(key)
     assert(pkey, "Consumer Public Key is Invalid")
-    local digest = openssl_digest.new("sha512")
-    assert(digest:update(data))
-    return pkey:verify(signature, digest)
+    return pkey:verify(signature, data, "sha512")
   end,
+  -- https://www.rfc-editor.org/rfc/rfc7518#section-3.4
   ES256 = function(data, signature, key)
     local pkey, _ = openssl_pkey.new(key)
     assert(pkey, "Consumer Public Key is Invalid")
+    --  The ECDSA P-256 SHA-256 digital signature for a JWS is validated as
+    --  follows:
+
+    --  1.  The JWS Signature value MUST be a 64-octet sequence.  If it is
+    --      not a 64-octet sequence, the validation has failed.
     assert(#signature == 64, "Signature must be 64 bytes.")
-    local asn = {}
-    asn[1] = asn_sequence.resign_integer(sub(signature, 1, 32))
-    asn[2] = asn_sequence.resign_integer(sub(signature, 33, 64))
-    local signatureAsn = asn_sequence.create_simple_sequence(asn)
-    local digest = openssl_digest.new("sha256")
-    assert(digest:update(data))
-    return pkey:verify(signatureAsn, digest)
+    return pkey:verify(signature, data, "sha256", nil, { ecdsa_use_raw = true })
   end,
   ES384 = function(data, signature, key)
+    --  Signing and validation with the ECDSA P-384 SHA-384 and ECDSA P-521
+    --  SHA-512 algorithms is performed identically to the procedure for
+    --  ECDSA P-256 SHA-256 -- just using the corresponding hash algorithms
+    --  with correspondingly larger result values.  For ECDSA P-384 SHA-384,
+    --  R and S will be 384 bits each, resulting in a 96-octet sequence.  For
+    --  ECDSA P-521 SHA-512, R and S will be 521 bits each, resulting in a
+    --  132-octet sequence.
     local pkey, _ = openssl_pkey.new(key)
+    assert(pkey, "Consumer Public Key is Invalid")
     assert(#signature == 96, "Signature must be 96 bytes.")
-    local asn = {}
-    asn[1] = asn_sequence.resign_integer(sub(signature, 1, 48))
-    asn[2] = asn_sequence.resign_integer(sub(signature, 49, 96))
-    local signatureAsn = asn_sequence.create_simple_sequence(asn)
-    local digest = openssl_digest.new("sha384")
-    assert(digest:update(data))
-    return pkey:verify(signatureAsn, digest)
+    return pkey:verify(signature, data, "sha384", nil, { ecdsa_use_raw = true })
+  end,
+
+  ES512 = function(data, signature, key)
+    --  Signing and validation with the ECDSA P-384 SHA-384 and ECDSA P-521
+    --  SHA-512 algorithms is performed identically to the procedure for
+    --  ECDSA P-256 SHA-256 -- just using the corresponding hash algorithms
+    --  with correspondingly larger result values.  For ECDSA P-384 SHA-384,
+    --  R and S will be 384 bits each, resulting in a 96-octet sequence.  For
+    --  ECDSA P-521 SHA-512, R and S will be 521 bits each, resulting in a
+    --  132-octet sequence.
+    local pkey, _ = openssl_pkey.new(key)
+    assert(pkey, "Consumer Public Key is Invalid")
+    assert(#signature == 132, "Signature must be 132 bytes.")
+    return pkey:verify(signature, data, "sha512", nil, { ecdsa_use_raw = true })
+  end,
+
+  PS256 = function(data, signature, key)
+    local pkey, _ = openssl_pkey.new(key)
+    assert(pkey, "Consumer Public Key is Invalid")
+    assert(#signature == 256, "Signature must be 256 bytes")
+    return pkey:verify(signature, data, "sha256", openssl_pkey.PADDINGS.RSA_PKCS1_PSS_PADDING)
+  end,
+  PS384 = function(data, signature, key)
+    local pkey, _ = openssl_pkey.new(key)
+    assert(pkey, "Consumer Public Key is Invalid")
+    assert(#signature == 256, "Signature must be 256 bytes")
+    return pkey:verify(signature, data, "sha384", openssl_pkey.PADDINGS.RSA_PKCS1_PSS_PADDING)
+  end,
+  PS512 = function(data, signature, key)
+    local pkey, _ = openssl_pkey.new(key)
+    assert(pkey, "Consumer Public Key is Invalid")
+    assert(#signature == 256, "Signature must be 256 bytes")
+    return pkey:verify(signature, data, "sha512", openssl_pkey.PADDINGS.RSA_PKCS1_PSS_PADDING)
+  end,
+  EdDSA = function(data, signature, key)
+    -- Support of EdDSA alg typ according to RFC 8037
+    -- https://www.rfc-editor.org/rfc/rfc8037
+    local pkey, _ = openssl_pkey.new(key)
+    assert(pkey, "Consumer Public Key is Invalid")
+    return pkey:verify(signature, data)
   end
 }
 
@@ -136,8 +199,7 @@ local alg_verify = {
 -- @param input String to base64 encode
 -- @return Base64 encoded string
 local function base64_encode(input)
-  local result = encode_base64(input, true)
-  result = result:gsub("+", "-"):gsub("/", "_")
+  local result = encode_base64url(input)
   return result
 end
 
@@ -153,8 +215,7 @@ local function base64_decode(input)
     input = input .. rep("=", padlen)
   end
 
-  input = input:gsub("-", "+"):gsub("_", "/")
-  return decode_base64(input)
+  return decode_base64url(input)
 end
 
 
@@ -165,14 +226,15 @@ end
 -- @param len Number of parts to retrieve
 -- @return A table of strings
 local function tokenize(str, div, len)
-  local result, pos = {}, 0
+  local result, idx, pos = {}, 1, 0
 
   local iter = function()
     return find(str, div, pos, true)
   end
 
   for st, sp in iter do
-    result[#result + 1] = sub(str, pos, st-1)
+    result[idx] = sub(str, pos, st - 1)
+    idx = idx + 1
     pos = sp + 1
     len = len - 1
     if len <= 1 then
@@ -180,7 +242,7 @@ local function tokenize(str, div, len)
     end
   end
 
-  result[#result + 1] = sub(str, pos)
+  result[idx] = sub(str, pos)
   return result
 end
 
@@ -247,17 +309,17 @@ local function encode_token(data, key, alg, header)
   end
 
   local header = header or { typ = "JWT", alg = alg }
-  local segments = {
-    base64_encode(json.encode(header)),
-    base64_encode(json.encode(data))
-  }
+  local buf = buffer.new()
 
-  local signing_input = concat(segments, ".")
-  local signature = alg_sign[alg](signing_input, key)
+  buf:put(base64_encode(json.encode(header))):put(".")
+     :put(base64_encode(json.encode(data)))
 
-  segments[#segments+1] = base64_encode(signature)
+  local signature = alg_sign[alg](buf:tostring(), key)
 
-  return concat(segments, ".")
+  buf:put(".")
+     :put(base64_encode(signature))
+
+  return buf:get()
 end
 
 

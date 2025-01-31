@@ -42,7 +42,7 @@ for _, strategy in helpers.each_strategy() do
     end)
 
     lazy_teardown(function()
-      helpers.stop_kong(nil, true)
+      helpers.stop_kong()
     end)
 
     local function open_socket(uri)
@@ -90,7 +90,7 @@ for _, strategy in helpers.each_strategy() do
       assert.equal(true, string.find(header, "Upgrade: websocket") ~= nil, 1, true)
 
       if is_kong then
-        assert.equal(true, string.find(header, "Via: kong") ~= nil, 1, true)
+        assert.equal(true, string.find(header, "Via: 1.1 kong") ~= nil, 1, true)
       end
     end
 

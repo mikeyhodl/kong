@@ -1,13 +1,14 @@
 local calculate_config_hash = require("kong.clustering.config_helper").calculate_config_hash
 local version = require("kong.clustering.compat.version")
 
-
 describe("kong.clustering.compat.version", function()
   it("correctly parses 3 or 4 digit version numbers", function()
     assert.equal(3000000000, version.string_to_number("3.0.0"))
     assert.equal(3000001000, version.string_to_number("3.0.1"))
     assert.equal(3000000000, version.string_to_number("3.0.0.0"))
     assert.equal(3000000001, version.string_to_number("3.0.0.1"))
+    assert.equal(3009000000, version.string_to_number("3.9.0.0"))
+    assert.equal(3010000000, version.string_to_number("3.10.0.0"))
     assert.equal(333333333001, version.string_to_number("333.333.333.1"))
     assert.equal(333333333333, version.string_to_number("333.333.333.333"))
   end)

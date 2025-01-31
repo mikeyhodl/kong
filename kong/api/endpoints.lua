@@ -1,5 +1,5 @@
 local Errors       = require "kong.db.errors"
-local utils        = require "kong.tools.utils"
+local uuid         = require "kong.tools.uuid"
 local arguments    = require "kong.api.arguments"
 local workspaces   = require "kong.workspaces"
 local app_helpers  = require "lapis.application"
@@ -17,7 +17,8 @@ local type         = type
 local fmt          = string.format
 local concat       = table.concat
 local re_match     = ngx.re.match
-local split        = utils.split
+local split        = require("kong.tools.string").split
+local get_default_exit_body = require("kong.tools.http").get_default_exit_body
 
 
 -- error codes http status codes
@@ -35,6 +36,7 @@ local ERRORS_HTTP_CODES = {
   [Errors.codes.INVALID_OPTIONS]         = 400,
   [Errors.codes.OPERATION_UNSUPPORTED]   = 405,
   [Errors.codes.FOREIGN_KEYS_UNRESOLVED] = 400,
+  [Errors.codes.REFERENCED_BY_OTHERS]    = 400,
 }
 
 local TAGS_AND_REGEX
@@ -131,11 +133,11 @@ local function handle_error(err_t)
     return kong.response.exit(status, err_t)
   end
 
-  return kong.response.exit(status, utils.get_default_exit_body(status, err_t))
+  return kong.response.exit(status, get_default_exit_body(status, err_t))
 end
 
 
-local function extract_options(args, schema, context)
+local function extract_options(db, args, schema, context)
   local options = {
     nulls = true,
     pagination = {
@@ -154,6 +156,11 @@ local function extract_options(args, schema, context)
     end
 
     if schema.fields.tags and args.tags ~= nil and context == "page" then
+      if args.tags == null or #args.tags == 0 then
+        local error_message = "cannot be null"
+        return nil, error_message, db[schema.name].errors:invalid_options({tags = error_message})
+      end
+
       local tags = args.tags
       if type(tags) == "table" then
         tags = tags[1]
@@ -205,7 +212,11 @@ local function query_entity(context, self, db, schema, method)
     args = self.args.uri
   end
 
-  local opts = extract_options(args, schema, context)
+  local opts, err, err_t = extract_options(db, args, schema, context)
+  if err then
+    return nil, err, err_t
+  end
+
   local schema_name = schema.name
   local dao = db[schema_name]
 
@@ -240,7 +251,7 @@ local function query_entity(context, self, db, schema, method)
       end
     end
 
-    if key.id and not utils.is_valid_uuid(key.id) then
+    if key.id and not uuid.is_valid_uuid(key.id) then
       local endpoint_key = schema.endpoint_key
       if endpoint_key then
         local field = schema.fields[endpoint_key]
@@ -525,7 +536,7 @@ local function put_entity_endpoint(schema, foreign_schema, foreign_field_name, m
         self.params[foreign_schema.name] = pk
       else
         associate = true
-        self.params[foreign_schema.name] = utils.uuid()
+        self.params[foreign_schema.name] = uuid.uuid()
       end
 
     else

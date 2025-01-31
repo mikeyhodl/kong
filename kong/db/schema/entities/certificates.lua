@@ -15,11 +15,13 @@ return {
   fields = {
     { id         = typedefs.uuid, },
     { created_at = typedefs.auto_timestamp_s },
+    { updated_at = typedefs.auto_timestamp_s },
     { cert       = typedefs.certificate { required = true,  referenceable = true }, },
     { key        = typedefs.key         { required = true,  referenceable = true, encrypted = true }, },
     { cert_alt   = typedefs.certificate { required = false, referenceable = true }, },
     { key_alt    = typedefs.key         { required = false, referenceable = true, encrypted = true }, },
     { tags       = typedefs.tags },
+    { snis       = { type = "array", elements = typedefs.wildcard_host, required = false, transient = true }, },
   },
 
   entity_checks = {

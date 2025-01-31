@@ -1,11 +1,12 @@
 local Schema = require "kong.db.schema"
 local typedefs = require "kong.db.schema.typedefs"
-local utils = require "kong.tools.utils"
+local normalize_ip = require("kong.tools.ip").normalize_ip
+local validate_utf8 = require("kong.tools.string").validate_utf8
 local null = ngx.null
 
 
 local function get_name_for_error(name)
-  local ok = utils.validate_utf8(name)
+  local ok = validate_utf8(name)
   if not ok then
     return "Invalid name"
   end
@@ -15,7 +16,7 @@ end
 
 
 local validate_name = function(name)
-  local p = utils.normalize_ip(name)
+  local p = normalize_ip(name)
   if not p then
     return nil, get_name_for_error(name) .. "; must be a valid hostname"
   end
@@ -179,30 +180,31 @@ local r =  {
   fields = {
     { id = typedefs.uuid, },
     { created_at = typedefs.auto_timestamp_s },
-    { name = { type = "string", required = true, unique = true, custom_validator = validate_name }, },
-    { algorithm = { type = "string",
+    { name = { description = "This is a hostname, which must be equal to the host of a Service.",type = "string", required = true, unique = true, custom_validator = validate_name }, },
+    { updated_at = typedefs.auto_timestamp_s },
+    { algorithm = { description = "Which load balancing algorithm to use.", type = "string",
         default = "round-robin",
-        one_of = { "consistent-hashing", "least-connections", "round-robin" },
+        one_of = { "consistent-hashing", "least-connections", "round-robin", "latency" },
     }, },
     { hash_on = hash_on },
     { hash_fallback = hash_on },
     { hash_on_header = typedefs.header_name, },
     { hash_fallback_header = typedefs.header_name, },
-    { hash_on_cookie = { type = "string",  custom_validator = utils.validate_cookie_name }, },
+    { hash_on_cookie = typedefs.cookie_name{ description = "The cookie name to take the value from as hash input."}, },
     { hash_on_cookie_path = typedefs.path{ default = "/", }, },
     { hash_on_query_arg = simple_param },
     { hash_fallback_query_arg = simple_param },
     { hash_on_uri_capture = simple_param },
     { hash_fallback_uri_capture = simple_param },
-    { slots = { type = "integer", default = 10000, between = { 10, 2^16 }, }, },
-    { healthchecks = { type = "record",
+    { slots = { description = "The number of slots in the load balancer algorithm.", type = "integer", default = 10000, between = { 10, 2^16 }, }, },
+    { healthchecks = { description = "The array of healthchecks.", type = "record",
         default = healthchecks_defaults,
         fields = healthchecks_fields,
     }, },
     { tags = typedefs.tags },
     { host_header = typedefs.host_with_optional_port },
-    { client_certificate = { type = "foreign", reference = "certificates" }, },
-    { use_srv_name =  { type = "boolean", default = false, }, },
+    { client_certificate = { description = "If set, the certificate to be used as client certificate while TLS handshaking to the upstream server.", type = "foreign", reference = "certificates" }, },
+    { use_srv_name =  { description = "If set, the balancer will use SRV hostname.", type = "boolean", default = false, }, },
   },
   entity_checks = {
     -- hash_on_header must be present when hashing on header
@@ -307,6 +309,11 @@ local r =  {
             algorithm = value,
             hash_on = null,
           }
+         elseif value == "latency" then
+            return {
+              algorithm = value,
+              hash_on = null,
+            }
         else
           return {
             algorithm = value,

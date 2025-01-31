@@ -1,7 +1,8 @@
 local multipart = require "multipart"
 local cjson = require("cjson.safe").new()
 local pl_template = require "pl.template"
-local pl_tablex = require "pl.tablex"
+local sandbox = require "kong.tools.sandbox"
+local cycle_aware_deep_copy = require("kong.tools.table").cycle_aware_deep_copy
 
 local table_insert = table.insert
 local get_uri_args = kong.request.get_query
@@ -22,18 +23,18 @@ local str_find = string.find
 local pairs = pairs
 local error = error
 local rawset = rawset
-local pl_copy_table = pl_tablex.deepcopy
+local lua_enabled = sandbox.configuration.enabled
+local sandbox_enabled = sandbox.configuration.sandbox_enabled
 
 local _M = {}
 local template_cache = setmetatable( {}, { __mode = "k" })
-local template_environment
 
 local DEBUG = ngx.DEBUG
 local CONTENT_LENGTH = "content-length"
 local CONTENT_TYPE = "content-type"
 local HOST = "host"
 local JSON, MULTI, ENCODED = "json", "multi_part", "form_encoded"
-local EMPTY = pl_tablex.readonly({})
+local EMPTY = require("kong.tools.table").EMPTY
 
 
 local compile_opts = {
@@ -70,56 +71,20 @@ local function get_content_type(content_type)
   end
 end
 
--- meta table for the sandbox, exposing lazily loaded values
-local __meta_environment = {
-  __index = function(self, key)
-    local lazy_loaders = {
-      headers = function(self)
-        return get_headers() or EMPTY
-      end,
-      query_params = function(self)
-        return get_uri_args() or EMPTY
-      end,
-      uri_captures = function(self)
-        return (ngx.ctx.router_matches or EMPTY).uri_captures or EMPTY
-      end,
-      shared = function(self)
-        return ((kong or EMPTY).ctx or EMPTY).shared or EMPTY
-      end,
-    }
-    local loader = lazy_loaders[key]
-    if not loader then
-      -- we don't have a loader, so just return nothing
-      return
-    end
-    -- set the result on the table to not load again
-    local value = loader()
-    rawset(self, key, value)
-    return value
-  end,
-  __newindex = function(self)
-    error("This environment is read-only.")
-  end,
-}
-
-template_environment = setmetatable({
-  -- here we can optionally add functions to expose to the sandbox, eg:
-  -- tostring = tostring,  -- for example
-  -- because headers may contain array elements such as duplicated headers
-  -- type is a useful function in these cases. See issue #25.
-  type = type,
-}, __meta_environment)
-
-local function clear_environment(conf)
-  rawset(template_environment, "headers", nil)
-  rawset(template_environment, "query_params", nil)
-  rawset(template_environment, "uri_captures", nil)
-  rawset(template_environment, "shared", nil)
-end
-
-local function param_value(source_template, config_array)
+local function param_value(source_template, config_array, template_env)
   if not source_template or source_template == "" then
     return nil
+  end
+
+  if not lua_enabled then
+    -- Detect expressions in the source template
+    local expr = str_find(source_template, "%$%(.*%)")
+    if expr then
+      return nil, "loading of untrusted Lua code disabled because " ..
+                  "'untrusted_lua' config option is set to 'off'"
+    end
+    -- Lua is disabled, no need to render the template
+    return source_template
   end
 
   -- find compiled templates for this plugin-configuration array
@@ -139,10 +104,10 @@ local function param_value(source_template, config_array)
     compiled_templates[source_template] = compiled_template
   end
 
-  return compiled_template:render(template_environment)
+  return compiled_template:render(template_env)
 end
 
-local function iter(config_array)
+local function iter(config_array, template_env)
   return function(config_array, i, previous_name, previous_value)
     i = i + 1
     local current_pair = config_array[i]
@@ -156,7 +121,7 @@ local function iter(config_array)
       return i, current_name
     end
 
-    local res, err = param_value(current_value, config_array)
+    local res, err = param_value(current_value, config_array, template_env)
     if err then
       return error("[request-transformer] failed to render the template " ..
                    current_value .. ", error:" .. err)
@@ -182,14 +147,27 @@ local function append_value(current_value, value)
   end
 end
 
-local function transform_headers(conf)
+local function rename(tbl, old_name, new_name)
+  if old_name == new_name then
+    return
+  end
+
+  local value = tbl[old_name]
+  if value then
+    tbl[old_name] = nil
+    tbl[new_name] = value
+    return true
+  end
+end
+
+local function transform_headers(conf, template_env)
   local headers = get_headers()
   local headers_to_remove = {}
 
   headers.host = nil
 
   -- Remove header(s)
-  for _, name, value in iter(conf.remove.headers) do
+  for _, name, value in iter(conf.remove.headers, template_env) do
     name = name:lower()
     if headers[name] then
       headers[name] = nil
@@ -198,18 +176,24 @@ local function transform_headers(conf)
   end
 
   -- Rename headers(s)
-  for _, old_name, new_name in iter(conf.rename.headers) do
-    old_name = old_name:lower()
-    local value = headers[old_name]
-    if value then
-      headers[new_name:lower()] = value
-      headers[old_name] = nil
+  for _, old_name, new_name in iter(conf.rename.headers, template_env) do
+    local lower_old_name, lower_new_name = old_name:lower(), new_name:lower()
+    -- headers by default are case-insensitive
+    -- but if we have a case change, we need to handle it as a special case
+    local need_remove
+    if lower_old_name == lower_new_name then
+      need_remove = rename(headers, old_name, new_name)
+    else
+      need_remove = rename(headers, lower_old_name, lower_new_name)
+    end
+
+    if need_remove then
       headers_to_remove[old_name] = true
     end
   end
 
   -- Replace header(s)
-  for _, name, value in iter(conf.replace.headers) do
+  for _, name, value in iter(conf.replace.headers, template_env) do
     name = name:lower()
     if headers[name] or name == HOST then
       headers[name] = value
@@ -217,14 +201,14 @@ local function transform_headers(conf)
   end
 
   -- Add header(s)
-  for _, name, value in iter(conf.add.headers) do
+  for _, name, value in iter(conf.add.headers, template_env) do
     if not headers[name] and name:lower() ~= HOST then
       headers[name] = value
     end
   end
 
   -- Append header(s)
-  for _, name, value in iter(conf.append.headers) do
+  for _, name, value in iter(conf.append.headers, template_env) do
     local name_lc = name:lower()
 
     if name_lc ~= HOST and name ~= name_lc and headers[name] ~= nil then
@@ -247,7 +231,7 @@ local function transform_headers(conf)
   set_headers(headers)
 end
 
-local function transform_querystrings(conf)
+local function transform_querystrings(conf, template_env)
 
   if not (#conf.remove.querystring > 0 or #conf.rename.querystring > 0 or
           #conf.replace.querystring > 0 or #conf.add.querystring > 0 or
@@ -255,41 +239,39 @@ local function transform_querystrings(conf)
     return
   end
 
-  local querystring = pl_copy_table(template_environment.query_params)
+  local querystring = cycle_aware_deep_copy(template_env.query_params)
 
   -- Remove querystring(s)
-  for _, name, value in iter(conf.remove.querystring) do
+  for _, name, value in iter(conf.remove.querystring, template_env) do
     querystring[name] = nil
   end
 
   -- Rename querystring(s)
-  for _, old_name, new_name in iter(conf.rename.querystring) do
-    local value = querystring[old_name]
-    querystring[new_name] = value
-    querystring[old_name] = nil
+  for _, old_name, new_name in iter(conf.rename.querystring, template_env) do
+    rename(querystring, old_name, new_name)
   end
 
-  for _, name, value in iter(conf.replace.querystring) do
+  for _, name, value in iter(conf.replace.querystring, template_env) do
     if querystring[name] then
       querystring[name] = value
     end
   end
 
   -- Add querystring(s)
-  for _, name, value in iter(conf.add.querystring) do
+  for _, name, value in iter(conf.add.querystring, template_env) do
     if not querystring[name] then
       querystring[name] = value
     end
   end
 
   -- Append querystring(s)
-  for _, name, value in iter(conf.append.querystring) do
+  for _, name, value in iter(conf.append.querystring, template_env) do
     querystring[name] = append_value(querystring[name], value)
   end
   set_uri_args(querystring)
 end
 
-local function transform_json_body(conf, body, content_length)
+local function transform_json_body(conf, body, content_length, template_env)
   local removed, renamed, replaced, added, appended = false, false, false, false, false
   local content_length = (body and #body) or 0
   local parameters = parse_json(body)
@@ -301,23 +283,20 @@ local function transform_json_body(conf, body, content_length)
   end
 
   if content_length > 0 and #conf.remove.body > 0 then
-    for _, name, value in iter(conf.remove.body) do
+    for _, name, value in iter(conf.remove.body, template_env) do
       parameters[name] = nil
       removed = true
     end
   end
 
   if content_length > 0 and #conf.rename.body > 0 then
-    for _, old_name, new_name in iter(conf.rename.body) do
-      local value = parameters[old_name]
-      parameters[new_name] = value
-      parameters[old_name] = nil
-      renamed = true
+    for _, old_name, new_name in iter(conf.rename.body, template_env) do
+      renamed = rename(parameters, old_name, new_name) or renamed
     end
   end
 
   if content_length > 0 and #conf.replace.body > 0 then
-    for _, name, value in iter(conf.replace.body) do
+    for _, name, value in iter(conf.replace.body, template_env) do
       if parameters[name] then
         parameters[name] = value
         replaced = true
@@ -326,7 +305,7 @@ local function transform_json_body(conf, body, content_length)
   end
 
   if #conf.add.body > 0 then
-    for _, name, value in iter(conf.add.body) do
+    for _, name, value in iter(conf.add.body, template_env) do
       if not parameters[name] then
         parameters[name] = value
         added = true
@@ -335,7 +314,7 @@ local function transform_json_body(conf, body, content_length)
   end
 
   if #conf.append.body > 0 then
-    for _, name, value in iter(conf.append.body) do
+    for _, name, value in iter(conf.append.body, template_env) do
       local old_value = parameters[name]
       parameters[name] = append_value(old_value, value)
       appended = true
@@ -347,28 +326,25 @@ local function transform_json_body(conf, body, content_length)
   end
 end
 
-local function transform_url_encoded_body(conf, body, content_length)
+local function transform_url_encoded_body(conf, body, content_length, template_env)
   local renamed, removed, replaced, added, appended = false, false, false, false, false
   local parameters = decode_args(body)
 
   if content_length > 0 and #conf.remove.body > 0 then
-    for _, name, value in iter(conf.remove.body) do
+    for _, name, value in iter(conf.remove.body, template_env) do
       parameters[name] = nil
       removed = true
     end
   end
 
   if content_length > 0 and #conf.rename.body > 0 then
-    for _, old_name, new_name in iter(conf.rename.body) do
-      local value = parameters[old_name]
-      parameters[new_name] = value
-      parameters[old_name] = nil
-      renamed = true
+    for _, old_name, new_name in iter(conf.rename.body, template_env) do
+      renamed = rename(parameters, old_name, new_name) or renamed
     end
   end
 
   if content_length > 0 and #conf.replace.body > 0 then
-    for _, name, value in iter(conf.replace.body) do
+    for _, name, value in iter(conf.replace.body, template_env) do
       if parameters[name] then
         parameters[name] = value
         replaced = true
@@ -377,7 +353,7 @@ local function transform_url_encoded_body(conf, body, content_length)
   end
 
   if #conf.add.body > 0 then
-    for _, name, value in iter(conf.add.body) do
+    for _, name, value in iter(conf.add.body, template_env) do
       if parameters[name] == nil then
         parameters[name] = value
         added = true
@@ -386,7 +362,7 @@ local function transform_url_encoded_body(conf, body, content_length)
   end
 
   if #conf.append.body > 0 then
-    for _, name, value in iter(conf.append.body) do
+    for _, name, value in iter(conf.append.body, template_env) do
       local old_value = parameters[name]
       parameters[name] = append_value(old_value, value)
       appended = true
@@ -398,14 +374,15 @@ local function transform_url_encoded_body(conf, body, content_length)
   end
 end
 
-local function transform_multipart_body(conf, body, content_length, content_type_value)
+local function transform_multipart_body(conf, body, content_length, content_type_value, template_env)
   local removed, renamed, replaced, added, appended = false, false, false, false, false
   local parameters = multipart(body and body or "", content_type_value)
 
   if content_length > 0 and #conf.rename.body > 0 then
-    for _, old_name, new_name in iter(conf.rename.body) do
-      if parameters:get(old_name) then
-        local value = parameters:get(old_name).value
+    for _, old_name, new_name in iter(conf.rename.body, template_env) do
+      local para = parameters:get(old_name)
+      if para and old_name ~= new_name then
+        local value = para.value
         parameters:set_simple(new_name, value)
         parameters:delete(old_name)
         renamed = true
@@ -414,14 +391,14 @@ local function transform_multipart_body(conf, body, content_length, content_type
   end
 
   if content_length > 0 and #conf.remove.body > 0 then
-    for _, name, value in iter(conf.remove.body) do
+    for _, name, value in iter(conf.remove.body, template_env) do
       parameters:delete(name)
       removed = true
     end
   end
 
   if content_length > 0 and #conf.replace.body > 0 then
-    for _, name, value in iter(conf.replace.body) do
+    for _, name, value in iter(conf.replace.body, template_env) do
       if parameters:get(name) then
         parameters:delete(name)
         parameters:set_simple(name, value)
@@ -431,7 +408,7 @@ local function transform_multipart_body(conf, body, content_length, content_type
   end
 
   if #conf.add.body > 0 then
-    for _, name, value in iter(conf.add.body) do
+    for _, name, value in iter(conf.add.body, template_env) do
       if not parameters:get(name) then
         parameters:set_simple(name, value)
         added = true
@@ -444,7 +421,7 @@ local function transform_multipart_body(conf, body, content_length, content_type
   end
 end
 
-local function transform_body(conf)
+local function transform_body(conf, template_env)
   local content_type_value = get_header(CONTENT_TYPE)
   local content_type = get_content_type(content_type_value)
   if content_type == nil or #conf.rename.body < 1 and
@@ -454,16 +431,19 @@ local function transform_body(conf)
   end
 
   -- Call req_read_body to read the request body first
-  local body = get_raw_body()
+  local body, err = get_raw_body()
+  if err then
+    kong.log.warn(err)
+  end
   local is_body_transformed = false
   local content_length = (body and #body) or 0
 
   if content_type == ENCODED then
-    is_body_transformed, body = transform_url_encoded_body(conf, body, content_length)
+    is_body_transformed, body = transform_url_encoded_body(conf, body, content_length, template_env)
   elseif content_type == MULTI then
-    is_body_transformed, body = transform_multipart_body(conf, body, content_length, content_type_value)
+    is_body_transformed, body = transform_multipart_body(conf, body, content_length, content_type_value, template_env)
   elseif content_type == JSON then
-    is_body_transformed, body = transform_json_body(conf, body, content_length)
+    is_body_transformed, body = transform_json_body(conf, body, content_length, template_env)
   end
 
   if is_body_transformed then
@@ -505,10 +485,10 @@ local function transform_method(conf)
   end
 end
 
-local function transform_uri(conf)
+local function transform_uri(conf, template_env)
   if conf.replace.uri then
 
-    local res, err = param_value(conf.replace.uri, conf.replace)
+    local res, err = param_value(conf.replace.uri, conf.replace, template_env)
     if err then
       error("[request-transformer] failed to render the template " ..
         tostring(conf.replace.uri) .. ", error:" .. err)
@@ -524,12 +504,57 @@ local function transform_uri(conf)
 end
 
 function _M.execute(conf)
-  clear_environment()
-  transform_uri(conf)
+  -- meta table for the sandbox, exposing lazily loaded values
+  local __meta_environment = {
+    __index = function(self, key)
+      local lazy_loaders = {
+        headers = function(self)
+          return get_headers() or EMPTY
+        end,
+        query_params = function(self)
+          return get_uri_args() or EMPTY
+        end,
+        uri_captures = function(self)
+          return (ngx.ctx.router_matches or EMPTY).uri_captures or EMPTY
+        end,
+        shared = function(self)
+          return ((kong or EMPTY).ctx or EMPTY).shared or EMPTY
+        end,
+      }
+      local loader = lazy_loaders[key]
+      if not loader then
+        if lua_enabled and not sandbox_enabled then
+          return _G[key]
+        end
+        return
+      end
+      -- set the result on the table to not load again
+      local value = loader()
+      rawset(self, key, value)
+      return value
+    end,
+    __newindex = function(self)
+      error("This environment is read-only.")
+    end,
+  }
+
+  local template_env = {}
+  if lua_enabled and sandbox_enabled then
+    -- load the sandbox environment to be used to render the template
+    template_env = cycle_aware_deep_copy(sandbox.configuration.environment)
+    -- here we can optionally add functions to expose to the sandbox, eg:
+    -- tostring = tostring,
+    -- because headers may contain array elements such as duplicated headers
+    -- type is a useful function in these cases. See issue #25.
+    template_env.type = type
+  end
+  setmetatable(template_env, __meta_environment)
+
+  transform_uri(conf, template_env)
   transform_method(conf)
-  transform_headers(conf)
-  transform_body(conf)
-  transform_querystrings(conf)
+  transform_headers(conf, template_env)
+  transform_body(conf, template_env)
+  transform_querystrings(conf, template_env)
 end
 
 return _M

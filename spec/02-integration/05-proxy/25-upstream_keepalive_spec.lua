@@ -27,6 +27,7 @@ local fixtures = {
 
 describe("#postgres upstream keepalive", function()
   local proxy_client
+  local ca_certificate, client_cert1, client_cert2
 
   local function start_kong(opts)
     local kopts = {
@@ -51,11 +52,53 @@ describe("#postgres upstream keepalive", function()
       "routes",
       "services",
       "certificates",
+      "ca_certificates",
     })
+
+    ca_certificate = assert(bp.ca_certificates:insert({
+      cert = ssl_fixtures.cert_ca,
+    }))
+
+    client_cert1 = bp.certificates:insert {
+      cert = ssl_fixtures.cert_client,
+      key = ssl_fixtures.key_client,
+    }
+
+    client_cert2 = bp.certificates:insert {
+      cert = ssl_fixtures.cert_client2,
+      key = ssl_fixtures.key_client2,
+    }
 
     -- upstream TLS
     bp.routes:insert {
-      hosts = { "one.com" },
+      hosts = { "one.test" },
+      preserve_host = true,
+      service = bp.services:insert {
+        protocol = helpers.mock_upstream_ssl_protocol,
+        host = helpers.mock_upstream_hostname,
+        port = helpers.mock_upstream_ssl_port,
+        tls_verify = false,
+        tls_verify_depth = 3,
+        ca_certificates = { ca_certificate.id },
+      },
+    }
+
+    bp.routes:insert {
+      hosts = { "two.test" },
+      preserve_host = true,
+      service = bp.services:insert {
+        protocol = helpers.mock_upstream_ssl_protocol,
+        host = helpers.mock_upstream_hostname,
+        port = helpers.mock_upstream_ssl_port,
+        tls_verify = false,
+        tls_verify_depth = 3,
+        ca_certificates = { ca_certificate.id },
+      },
+    }
+
+    -- crc32 collision upstream TLS
+    bp.routes:insert {
+      hosts = { "plumless.xxx" },
       preserve_host = true,
       service = bp.services:insert {
         protocol = helpers.mock_upstream_ssl_protocol,
@@ -65,7 +108,7 @@ describe("#postgres upstream keepalive", function()
     }
 
     bp.routes:insert {
-      hosts = { "two.com" },
+      hosts = { "buckeroo.xxx" },
       preserve_host = true,
       service = bp.services:insert {
         protocol = helpers.mock_upstream_ssl_protocol,
@@ -76,24 +119,24 @@ describe("#postgres upstream keepalive", function()
 
     -- upstream mTLS
     bp.routes:insert {
-      hosts = { "example.com", },
+      hosts = { "example.test", },
       service = bp.services:insert {
         url = "https://127.0.0.1:16798/",
-        client_certificate = bp.certificates:insert {
-          cert = ssl_fixtures.cert_client,
-          key = ssl_fixtures.key_client,
-        },
+        client_certificate = client_cert1,
+        tls_verify = false,
+        tls_verify_depth = 3,
+        ca_certificates = { ca_certificate.id },
       },
     }
 
     bp.routes:insert {
-      hosts = { "example2.com", },
+      hosts = { "example2.test", },
       service = bp.services:insert {
         url = "https://127.0.0.1:16798/",
-        client_certificate = bp.certificates:insert {
-          cert = ssl_fixtures.cert_client2,
-          key = ssl_fixtures.key_client2,
-        },
+        client_certificate = client_cert2,
+        tls_verify = false,
+        tls_verify_depth = 3,
+        ca_certificates = { ca_certificate.id },
       },
     }
   end)
@@ -104,7 +147,7 @@ describe("#postgres upstream keepalive", function()
       proxy_client:close()
     end
 
-    helpers.stop_kong(nil, true)
+    helpers.stop_kong()
   end)
 
 
@@ -115,27 +158,59 @@ describe("#postgres upstream keepalive", function()
       method = "GET",
       path = "/echo_sni",
       headers = {
-        Host = "one.com",
+        Host = "one.test",
       }
     })
     local body = assert.res_status(200, res)
-    assert.equal("SNI=one.com", body)
+    assert.equal("SNI=one.test", body)
     assert.errlog()
           .has
-          .line([[enabled connection keepalive \(pool=[A-F0-9.:]+\|\d+\|one.com]])
+          .line([[enabled connection keepalive \(pool=[A-F0-9.:]+\|\d+\|one.test\|0\|3\|]] ..
+                ca_certificate.id .. [[\|]])
+
+    assert.errlog()
+          .has.line([[lua balancer: keepalive no free connection, host: 127\.0\.0\.1:\d+, name: [A-F0-9.:]+\|\d+\|one.test\|0\|3\|]] ..
+                    ca_certificate.id .. [[\|]])
+    assert.errlog()
+          .has.line([[lua balancer: keepalive saving connection [A-F0-9]+, host: 127\.0\.0\.1:\d+, name: [A-F0-9.:]+\|\d+\|one.test\|0\|3\|]] ..
+                    ca_certificate.id .. [[\|]])
+    assert.errlog()
+          .not_has.line([[keepalive: free connection pool]], true)
 
     local res = assert(proxy_client:send {
       method = "GET",
       path = "/echo_sni",
       headers = {
-        Host = "two.com",
+        Host = "two.test",
       }
     })
     local body = assert.res_status(200, res)
-    assert.equal("SNI=two.com", body)
+    assert.equal("SNI=two.test", body)
     assert.errlog()
           .has
-          .line([[enabled connection keepalive \(pool=[A-F0-9.:]+\|\d+\|two.com]])
+          .line([[enabled connection keepalive \(pool=[A-F0-9.:]+\|\d+\|two.test\|0\|3\|]] ..
+                ca_certificate.id .. "|")
+
+    assert.errlog()
+          .has.line([[lua balancer: keepalive no free connection, host: 127\.0\.0\.1:\d+, name: [A-F0-9.:]+\|\d+\|two.test\|0\|3\|]] ..
+                    ca_certificate.id .. [[\|]])
+    assert.errlog()
+          .has.line([[lua balancer: keepalive saving connection [A-F0-9]+, host: 127\.0\.0\.1:\d+, name: [A-F0-9.:]+\|\d+\|two.test\|0\|3\|]] ..
+                    ca_certificate.id .. [[\|]])
+    assert.errlog()
+          .not_has.line([[keepalive: free connection pool]], true)
+
+    local handle, result
+
+    handle = io.popen([[grep 'lua balancer: keepalive no free connection' servroot/logs/error.log|wc -l]])
+    result = handle:read("*l")
+    handle:close()
+    assert(tonumber(result) == 2)
+
+    handle = io.popen([[grep 'lua balancer: keepalive saving connection' servroot/logs/error.log|wc -l]])
+    result = handle:read("*l")
+    handle:close()
+    assert(tonumber(result) == 2)
   end)
 
 
@@ -146,7 +221,7 @@ describe("#postgres upstream keepalive", function()
       method = "GET",
       path = "/",
       headers = {
-        Host = "example.com",
+        Host = "example.test",
       }
     })
     local fingerprint_1 = assert.res_status(200, res)
@@ -156,7 +231,7 @@ describe("#postgres upstream keepalive", function()
       method = "GET",
       path = "/",
       headers = {
-        Host = "example2.com",
+        Host = "example2.test",
       }
     })
     local fingerprint_2 = assert.res_status(200, res)
@@ -165,8 +240,17 @@ describe("#postgres upstream keepalive", function()
     assert.not_equal(fingerprint_1, fingerprint_2)
 
     assert.errlog()
-              .has
-              .line([[enabled connection keepalive \(pool=[0-9.]+|\d+|[0-9.]+:\d+|[a-f0-9-]+]])
+          .has.line([[enabled connection keepalive \(pool=[0-9.]+|\d+|[0-9.]+:\d+|[a-f0-9-]+\|0\|3\|]] ..
+                    ca_certificate.id .. [[\|]] .. client_cert1.id)
+    assert.errlog()
+          .has.line([[lua balancer: keepalive no free connection, host: 127\.0\.0\.1:\d+, name: [0-9.]+|\d+|[0-9.]+:\d+|[a-f0-9-]+\|0\|3\|]] ..
+                    ca_certificate.id .. [[\|]].. client_cert1.id)
+    assert.errlog()
+          .has.line([[lua balancer: keepalive saving connection [A-F0-9]+, host: 127\.0\.0\.1:\d+, name: [0-9.]+|\d+|[0-9.]+:\d+|[a-f0-9-]+\|0\|3\|]] ..
+                    ca_certificate.id .. [[\|]] .. client_cert1.id)
+
+    assert.errlog()
+          .not_has.line([[keepalive: free connection pool]], true)
   end)
 
 
@@ -179,11 +263,11 @@ describe("#postgres upstream keepalive", function()
       method = "GET",
       path = "/echo_sni",
       headers = {
-        Host = "one.com",
+        Host = "one.test",
       }
     })
     local body = assert.res_status(200, res)
-    assert.equal("SNI=one.com", body)
+    assert.equal("SNI=one.test", body)
     assert.errlog()
           .not_has
           .line("enabled connection keepalive", true)
@@ -192,14 +276,163 @@ describe("#postgres upstream keepalive", function()
       method = "GET",
       path = "/echo_sni",
       headers = {
-        Host = "two.com",
+        Host = "two.test",
       }
     })
     local body = assert.res_status(200, res)
-    assert.equal("SNI=two.com", body)
+    assert.equal("SNI=two.test", body)
     assert.errlog()
           .not_has
           .line("enabled connection keepalive", true)
+
+    assert.errlog()
+          .not_has.line([[keepalive: free connection pool]], true)
   end)
+
+
+  it("reuse upstream keepalive pool", function()
+    start_kong()
+
+    local res = assert(proxy_client:send {
+      method = "GET",
+      path = "/echo_sni",
+      headers = {
+        Host = "one.test",
+      }
+    })
+    local body = assert.res_status(200, res)
+    assert.equal("SNI=one.test", body)
+    assert.errlog()
+          .has
+          .line([[enabled connection keepalive \(pool=[A-F0-9.:]+\|\d+\|one.test\|0\|3\|]] ..
+                ca_certificate.id .. "|")
+
+    assert.errlog()
+          .has.line([[lua balancer: keepalive no free connection, host: 127\.0\.0\.1:\d+, name: [A-F0-9.:]+\|\d+\|one.test\|0\|3\|]] ..
+                    ca_certificate.id .. [[\|]])
+    assert.errlog()
+          .has.line([[lua balancer: keepalive saving connection [A-F0-9]+, host: 127\.0\.0\.1:\d+, name: [A-F0-9.:]+\|\d+\|one.test\|0\|3\|]] ..
+                    ca_certificate.id .. [[\|]])
+    assert.errlog()
+          .not_has.line([[keepalive: free connection pool]], true)
+
+    local handle, upool_ptr
+
+    handle = io.popen([[grep 'lua balancer: keepalive saving connection' servroot/logs/error.log]] .. "|" ..
+                      [[grep -Eo 'host: [A-F0-9]+']])
+    upool_ptr = handle:read("*l")
+    handle:close()
+
+    local res = assert(proxy_client:send {
+      method = "GET",
+      path = "/echo_sni",
+      headers = {
+        Host = "one.test",
+      }
+    })
+    local body = assert.res_status(200, res)
+    assert.equal("SNI=one.test", body)
+    assert.errlog()
+          .has
+          .line([[enabled connection keepalive \(pool=[A-F0-9.:]+\|\d+\|one.test\|0\|3\|]] ..
+                ca_certificate.id .. "|")
+
+    assert.errlog()
+          .has.line([[lua balancer: keepalive reusing connection [A-F0-9]+, host: 127\.0\.0\.1:\d+, name: 127\.0\.0\.1\|\d+|[A-F0-9.:]+\|\d+\|one.test\|0\|3\|]] ..
+                    ca_certificate.id .. [[|, ]] .. upool_ptr)
+    assert.errlog()
+          .has.line([[lua balancer: keepalive saving connection [A-F0-9]+, host: 127\.0\.0\.1:\d+, name: 127\.0\.0\.1\|\d+|[A-F0-9.:]+\|\d+\|one.test\|0\|3\|]] ..
+                    ca_certificate.id .. [[|, ]] .. upool_ptr)
+    assert.errlog()
+          .not_has.line([[keepalive: free connection pool]], true)
+  end)
+
+
+  it("free upstream keepalive pool", function()
+    start_kong({ upstream_keepalive_max_requests = 1, })
+
+    local res = assert(proxy_client:send {
+      method = "GET",
+      path = "/echo_sni",
+      headers = {
+        Host = "one.test",
+      }
+    })
+    local body = assert.res_status(200, res)
+    assert.equal("SNI=one.test", body)
+    assert.errlog()
+          .has
+          .line([[enabled connection keepalive \(pool=[A-F0-9.:]+\|\d+\|one.test\|0\|3\|]] ..
+                ca_certificate.id .. [[\|]])
+
+    assert.errlog()
+          .has.line([[lua balancer: keepalive no free connection, host: 127\.0\.0\.1:\d+, name: 127\.0\.0\.1|\d+\|one.test\|0\|3\|]] ..
+                    ca_certificate.id .. [[\|]])
+    assert.errlog()
+          .has.line([[lua balancer: keepalive not saving connection [A-F0-9]+]])
+    assert.errlog()
+          .has.line([[keepalive: free connection pool [A-F0-9.:]+ for \"127\.0\.0\.1|\d+|[A-F0-9.:]+\|\d+\|one.test\|0\|3\|]] ..
+                    ca_certificate.id .. [[\|\"]])
+
+    assert.errlog()
+          .not_has.line([[keepalive saving connection]], true)
+  end)
+
+
+  -- ensure same crc32 names don't hit same keepalive pool
+  it("pools with crc32 collision", function()
+    start_kong()
+
+    local res = assert(proxy_client:send {
+      method = "GET",
+      path = "/echo_sni",
+      headers = {
+        Host = "plumless.xxx",
+      }
+    })
+    local body = assert.res_status(200, res)
+    assert.equal("SNI=plumless.xxx", body)
+    assert.errlog()
+          .has
+          .line([[enabled connection keepalive \(pool=[A-F0-9.:]+\|\d+\|plumless.xxx]])
+
+    local res = assert(proxy_client:send {
+      method = "GET",
+      path = "/echo_sni",
+      headers = {
+        Host = "buckeroo.xxx",
+      }
+    })
+    local body = assert.res_status(200, res)
+    assert.equal("SNI=buckeroo.xxx", body)
+    assert.errlog()
+          .has
+          .line([[enabled connection keepalive \(pool=[A-F0-9.:]+\|\d+\|buckeroo.xxx]])
+
+    local handle
+
+    handle = io.popen([[grep 'enabled connection keepalive' servroot/logs/error.log]] .. "|" ..
+                      [[grep -Eo 'pool=[A-F0-9.:]+\|\d+\|plumless.xxx']])
+    local name1 = handle:read("*l")
+    handle:close()
+
+    handle = io.popen([[grep 'enabled connection keepalive' servroot/logs/error.log]] .. "|" ..
+                      [[grep -Eo 'pool=[A-F0-9.:]+\|\d+\|buckeroo.xxx']])
+    local name2 = handle:read("*l")
+    handle:close()
+
+    local crc1 = ngx.crc32_long(name1)
+    local crc2 = ngx.crc32_long(name2)
+    assert.equal(crc1, crc2)
+
+    handle = io.popen([[grep 'lua balancer: keepalive saving connection' servroot/logs/error.log]] .. "|" ..
+                      [[grep -Eo 'name: .*']])
+    local upool_ptr1 = handle:read("*l")
+    local upool_ptr2 = handle:read("*l")
+    handle:close()
+
+    assert.not_equal(upool_ptr1, upool_ptr2)
+  end)
+
 
 end)

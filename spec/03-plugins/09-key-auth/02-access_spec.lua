@@ -1,14 +1,19 @@
-local helpers = require "spec.helpers"
-local cjson   = require "cjson"
-local meta    = require "kong.meta"
-local utils   = require "kong.tools.utils"
+local helpers   = require "spec.helpers"
+local cjson     = require "cjson"
+local uuid      = require "kong.tools.uuid"
+local http_mock = require "spec.helpers.http_mock"
+
+local MOCK_PORT = helpers.get_available_port()
 
 for _, strategy in helpers.each_strategy() do
   describe("Plugin: key-auth (access) [#" .. strategy .. "]", function()
-    local proxy_client
+    local mock, proxy_client
     local kong_cred
+    local nonexisting_anonymous = uuid.uuid()  -- a nonexisting consumer id
 
     lazy_setup(function()
+      mock = http_mock.new(MOCK_PORT)
+      mock:start()
       local bp = helpers.get_db_utils(strategy, {
         "routes",
         "services",
@@ -26,51 +31,51 @@ for _, strategy in helpers.each_strategy() do
       }
 
       local route1 = bp.routes:insert {
-        hosts = { "key-auth1.com" },
+        hosts = { "key-auth1.test" },
       }
 
       local route2 = bp.routes:insert {
-        hosts = { "key-auth2.com" },
+        hosts = { "key-auth2.test" },
       }
 
       local route3 = bp.routes:insert {
-        hosts = { "key-auth3.com" },
+        hosts = { "key-auth3.test" },
       }
 
       local route4 = bp.routes:insert {
-        hosts = { "key-auth4.com" },
+        hosts = { "key-auth4.test" },
       }
 
       local route5 = bp.routes:insert {
-        hosts = { "key-auth5.com" },
+        hosts = { "key-auth5.test" },
       }
 
       local route6 = bp.routes:insert {
-        hosts = { "key-auth6.com" },
+        hosts = { "key-auth6.test" },
       }
 
       local service7 = bp.services:insert{
         protocol = "http",
-        port     = 80,
-        host     = "mockbin.com",
+        port     = MOCK_PORT,
+        host     = "localhost",
       }
 
       local route7 = bp.routes:insert {
-        hosts      = { "key-auth7.com" },
+        hosts      = { "key-auth7.test" },
         service    = service7,
         strip_path = true,
       }
 
       local route8 = bp.routes:insert {
-        hosts = { "key-auth8.com" },
+        hosts = { "key-auth8.test" },
       }
 
       local route9 = bp.routes:insert {
-        hosts = { "key-auth9.com" },
+        hosts = { "key-auth9.test" },
       }
 
       local route10 = bp.routes:insert {
-        hosts = { "key-auth10.com" },
+        hosts = { "key-auth10.test" },
       }
 
       local route_grpc = assert(bp.routes:insert {
@@ -92,6 +97,7 @@ for _, strategy in helpers.each_strategy() do
         route = { id = route2.id },
         config   = {
           hide_credentials = true,
+          realm = "test-realm"
         },
       }
 
@@ -112,7 +118,7 @@ for _, strategy in helpers.each_strategy() do
         name     = "key-auth",
         route = { id = route4.id },
         config   = {
-          anonymous = utils.uuid(),  -- unknown consumer
+          anonymous = nonexisting_anonymous,  -- a nonexisting consumer id
         },
       }
 
@@ -183,6 +189,7 @@ for _, strategy in helpers.each_strategy() do
       end
 
       helpers.stop_kong()
+      mock:stop()
     end)
 
     describe("Unauthorized", function()
@@ -191,7 +198,7 @@ for _, strategy in helpers.each_strategy() do
           method  = "OPTIONS",
           path    = "/status/200",
           headers = {
-            ["Host"] = "key-auth7.com"
+            ["Host"] = "key-auth7.test"
           }
         })
         assert.res_status(200, res)
@@ -201,60 +208,101 @@ for _, strategy in helpers.each_strategy() do
           method  = "OPTIONS",
           path    = "/status/200",
           headers = {
-            ["Host"] = "key-auth1.com"
+            ["Host"] = "key-auth1.test"
           }
         })
         assert.res_status(401, res)
         local body = assert.res_status(401, res)
-        assert.same({message = "No API key found in request"}, cjson.decode(body))
+        local json = cjson.decode(body)
+        assert.not_nil(json)
+        assert.matches("No API key found in request", json.message)
       end)
       it("returns Unauthorized on missing credentials", function()
         local res = assert(proxy_client:send {
           method  = "GET",
           path    = "/status/200",
           headers = {
-            ["Host"] = "key-auth1.com"
+            ["Host"] = "key-auth1.test"
           }
         })
         local body = assert.res_status(401, res)
         local json = cjson.decode(body)
-        assert.same({ message = "No API key found in request" }, json)
+        assert.not_nil(json)
+        assert.matches("No API key found in request", json.message)
       end)
       it("returns Unauthorized on empty key header", function()
         local res = assert(proxy_client:send {
           method  = "GET",
           path    = "/status/200",
           headers = {
-            ["Host"] = "key-auth1.com",
+            ["Host"] = "key-auth1.test",
             ["apikey"] = "",
           }
         })
         local body = assert.res_status(401, res)
         local json = cjson.decode(body)
-        assert.same({ message = "No API key found in request" }, json)
+        assert.not_nil(json)
+        assert.matches("No API key found in request", json.message)
       end)
+      describe("when realm is not configured", function()
+        it("returns Unauthorized on empty key header with no realm", function()
+          local res = assert(proxy_client:send {
+            method  = "GET",
+            path    = "/status/200",
+            headers = {
+              ["Host"] = "key-auth1.test",
+              ["apikey"] = "",
+            }
+          })
+          local body = assert.res_status(401, res)
+          local json = cjson.decode(body)
+          assert.not_nil(json)
+          assert.matches("No API key found in request", json.message)
+          assert.equal('Key', res.headers["WWW-Authenticate"])
+        end)
+      end)
+      describe("when realm is configured", function()
+        it("returns Unauthorized on empty key header with conifgured realm", function()
+          local res = assert(proxy_client:send {
+            method  = "GET",
+            path    = "/status/200",
+            headers = {
+              ["Host"] = "key-auth2.test",
+              ["apikey"] = "",
+            }
+          })
+          local body = assert.res_status(401, res)
+          local json = cjson.decode(body)
+          assert.not_nil(json)
+          assert.matches("No API key found in request", json.message)
+          assert.equal('Key realm="test-realm"', res.headers["WWW-Authenticate"])
+        end)
+      end)
+
       it("returns Unauthorized on empty key querystring", function()
         local res = assert(proxy_client:send {
           method  = "GET",
           path    = "/status/200?apikey",
           headers = {
-            ["Host"] = "key-auth1.com",
+            ["Host"] = "key-auth1.test",
           }
         })
         local body = assert.res_status(401, res)
         local json = cjson.decode(body)
-        assert.same({ message = "No API key found in request" }, json)
+        assert.not_nil(json)
+        assert.matches("No API key found in request", json.message)
+        assert.equal('Key', res.headers["WWW-Authenticate"])
       end)
       it("returns WWW-Authenticate header on missing credentials", function()
         local res = assert(proxy_client:send {
           method  = "GET",
           path    = "/status/200",
           headers = {
-            ["Host"] = "key-auth1.com"
+            ["Host"] = "key-auth1.test"
           }
         })
         res:read_body()
-        assert.equal('Key realm="' .. meta._NAME .. '"', res.headers["WWW-Authenticate"])
+        assert.equal('Key', res.headers["WWW-Authenticate"])
       end)
     end)
 
@@ -264,7 +312,7 @@ for _, strategy in helpers.each_strategy() do
           method  = "GET",
           path    = "/request?apikey=kong",
           headers = {
-            ["Host"] = "key-auth1.com",
+            ["Host"] = "key-auth1.test",
           }
         })
         assert.res_status(200, res)
@@ -274,24 +322,28 @@ for _, strategy in helpers.each_strategy() do
           method  = "GET",
           path    = "/status/200?apikey=123",
           headers = {
-            ["Host"] = "key-auth1.com"
+            ["Host"] = "key-auth1.test"
           }
         })
         local body = assert.res_status(401, res)
         local json = cjson.decode(body)
-        assert.same({ message = "Invalid authentication credentials" }, json)
+        assert.not_nil(json)
+        assert.matches("Unauthorized", json.message)
+        assert.equal('Key', res.headers["WWW-Authenticate"])
       end)
       it("handles duplicated key in querystring", function()
         local res = assert(proxy_client:send {
           method  = "GET",
           path    = "/status/200?apikey=kong&apikey=kong",
           headers = {
-            ["Host"] = "key-auth1.com"
+            ["Host"] = "key-auth1.test"
           }
         })
         local body = assert.res_status(401, res)
         local json = cjson.decode(body)
-        assert.same({ message = "Duplicate API key found" }, json)
+        assert.not_nil(json)
+        assert.matches("Duplicate API key found", json.message)
+        assert.equal('Key', res.headers["WWW-Authenticate"])
       end)
     end)
 
@@ -302,7 +354,7 @@ for _, strategy in helpers.each_strategy() do
             local res = assert(proxy_client:send {
               path    = "/request",
               headers = {
-                ["Host"]         = "key-auth5.com",
+                ["Host"]         = "key-auth5.test",
                 ["Content-Type"] = type,
               },
               body    = {
@@ -315,7 +367,7 @@ for _, strategy in helpers.each_strategy() do
             local res = assert(proxy_client:send {
               path    = "/request?apikey=kong",
               headers = {
-                ["Host"]         = "key-auth5.com",
+                ["Host"]         = "key-auth5.test",
                 ["Content-Type"] = type,
               },
               body    = {
@@ -328,7 +380,7 @@ for _, strategy in helpers.each_strategy() do
             local res = assert(proxy_client:send {
               path    = "/request?apikey=kong",
               headers = {
-                ["Host"]         = "key-auth5.com",
+                ["Host"]         = "key-auth5.test",
                 ["Content-Type"] = type,
                 ["apikey"]       = "kong",
               },
@@ -342,7 +394,7 @@ for _, strategy in helpers.each_strategy() do
             local res = assert(proxy_client:send {
               path    = "/status/200",
               headers = {
-                ["Host"]         = "key-auth5.com",
+                ["Host"]         = "key-auth5.test",
                 ["Content-Type"] = type,
               },
               body    = {
@@ -351,7 +403,9 @@ for _, strategy in helpers.each_strategy() do
             })
             local body = assert.res_status(401, res)
             local json = cjson.decode(body)
-            assert.same({ message = "Invalid authentication credentials" }, json)
+            assert.not_nil(json)
+            assert.matches("Unauthorized", json.message)
+            assert.equal('Key', res.headers["WWW-Authenticate"])
           end)
 
           -- lua-multipart doesn't currently handle duplicates at all.
@@ -362,7 +416,7 @@ for _, strategy in helpers.each_strategy() do
                 method  = "POST",
                 path    = "/status/200",
                 headers = {
-                  ["Host"]         = "key-auth5.com",
+                  ["Host"]         = "key-auth5.test",
                   ["Content-Type"] = type,
                 },
                 body = {
@@ -371,7 +425,9 @@ for _, strategy in helpers.each_strategy() do
               })
               local body = assert.res_status(401, res)
               local json = cjson.decode(body)
-              assert.same({ message = "Duplicate API key found" }, json)
+              assert.not_nil(json)
+              assert.matches("Duplicate API key found", json.message)
+              assert.equal('Key', res.headers["WWW-Authenticate"])
             end)
           end
 
@@ -380,39 +436,45 @@ for _, strategy in helpers.each_strategy() do
               local res = proxy_client:post("/status/200", {
                 body = "apikey=kong&apikey=kong",
                 headers = {
-                  ["Host"]         = "key-auth5.com",
+                  ["Host"]         = "key-auth5.test",
                   ["Content-Type"] = type,
                 },
               })
               local body = assert.res_status(401, res)
               local json = cjson.decode(body)
-              assert.same({ message = "Duplicate API key found" }, json)
+              assert.not_nil(json)
+              assert.matches("Duplicate API key found", json.message)
+              assert.equal('Key', res.headers["WWW-Authenticate"])
             end)
 
             it("does not identify apikey[] as api keys", function()
               local res = proxy_client:post("/status/200", {
                 body = "apikey[]=kong&apikey[]=kong",
                 headers = {
-                  ["Host"]         = "key-auth5.com",
+                  ["Host"]         = "key-auth5.test",
                   ["Content-Type"] = type,
                 },
               })
               local body = assert.res_status(401, res)
               local json = cjson.decode(body)
-              assert.same({ message = "No API key found in request" }, json)
+              assert.not_nil(json)
+              assert.matches("No API key found in request", json.message)
+              assert.equal('Key', res.headers["WWW-Authenticate"])
             end)
 
             it("does not identify apikey[1] as api keys", function()
               local res = proxy_client:post("/status/200", {
                 body = "apikey[1]=kong&apikey[1]=kong",
                 headers = {
-                  ["Host"]         = "key-auth5.com",
+                  ["Host"]         = "key-auth5.test",
                   ["Content-Type"] = type,
                 },
               })
               local body = assert.res_status(401, res)
               local json = cjson.decode(body)
-              assert.same({ message = "No API key found in request" }, json)
+              assert.not_nil(json)
+              assert.matches("No API key found in request", json.message)
+              assert.equal('Key', res.headers["WWW-Authenticate"])
             end)
           end
         end)
@@ -425,7 +487,7 @@ for _, strategy in helpers.each_strategy() do
           method  = "GET",
           path    = "/request",
           headers = {
-            ["Host"]   = "key-auth1.com",
+            ["Host"]   = "key-auth1.test",
             ["apikey"] = "kong"
           }
         })
@@ -436,13 +498,14 @@ for _, strategy in helpers.each_strategy() do
           method  = "GET",
           path    = "/status/200",
           headers = {
-            ["Host"]   = "key-auth1.com",
+            ["Host"]   = "key-auth1.test",
             ["apikey"] = "123"
           }
         })
         local body = assert.res_status(401, res)
         local json = cjson.decode(body)
-        assert.same({ message = "Invalid authentication credentials" }, json)
+        assert.not_nil(json)
+        assert.matches("Unauthorized", json.message)
       end)
     end)
 
@@ -473,7 +536,7 @@ for _, strategy in helpers.each_strategy() do
           method  = "GET",
           path    = "/request",
           headers = {
-            ["Host"]   = "key-auth8.com",
+            ["Host"]   = "key-auth8.test",
             ["api_key"] = "kong"
           }
         })
@@ -483,7 +546,7 @@ for _, strategy in helpers.each_strategy() do
           method  = "GET",
           path    = "/request",
           headers = {
-            ["Host"]   = "key-auth8.com",
+            ["Host"]   = "key-auth8.test",
             ["api-key"] = "kong"
           }
         })
@@ -495,25 +558,29 @@ for _, strategy in helpers.each_strategy() do
           method  = "GET",
           path    = "/status/200",
           headers = {
-            ["Host"]   = "key-auth8.com",
+            ["Host"]   = "key-auth8.test",
             ["api_key"] = "123"
           }
         })
         local body = assert.res_status(401, res)
         local json = cjson.decode(body)
-        assert.same({ message = "Invalid authentication credentials" }, json)
+        assert.not_nil(json)
+        assert.matches("Unauthorized", json.message)
+        assert.equal('Key', res.headers["WWW-Authenticate"])
 
         res = assert(proxy_client:send {
           method  = "GET",
           path    = "/status/200",
           headers = {
-            ["Host"]   = "key-auth8.com",
+            ["Host"]   = "key-auth8.test",
             ["api-key"] = "123"
           }
         })
         body = assert.res_status(401, res)
         json = cjson.decode(body)
-        assert.same({ message = "Invalid authentication credentials" }, json)
+        assert.not_nil(json)
+        assert.matches("Unauthorized", json.message)
+        assert.equal('Key', res.headers["WWW-Authenticate"])
       end)
     end)
 
@@ -523,7 +590,7 @@ for _, strategy in helpers.each_strategy() do
           method  = "GET",
           path    = "/request?apikey=kong",
           headers = {
-            ["Host"] = "key-auth1.com",
+            ["Host"] = "key-auth1.test",
           }
         })
         local body = assert.res_status(200, res)
@@ -545,37 +612,37 @@ for _, strategy in helpers.each_strategy() do
         local harness = {
           uri_args = { -- query string
             {
-              headers = { Host = "key-auth1.com" },
+              headers = { Host = "key-auth1.test" },
               path    = "/request?apikey=kong",
               method  = "GET",
             },
             {
-              headers = { Host = "key-auth2.com" },
+              headers = { Host = "key-auth2.test" },
               path    = "/request?apikey=kong",
               method  = "GET",
             }
           },
           headers = {
             {
-              headers = { Host = "key-auth1.com", apikey = "kong" },
+              headers = { Host = "key-auth1.test", apikey = "kong" },
               path    = "/request",
               method  = "GET",
             },
             {
-              headers = { Host = "key-auth2.com", apikey = "kong" },
+              headers = { Host = "key-auth2.test", apikey = "kong" },
               path    = "/request",
               method  = "GET",
             },
           },
           ["post_data.params"] = {
             {
-              headers = { Host = "key-auth5.com" },
+              headers = { Host = "key-auth5.test" },
               body    = { apikey = "kong" },
               method  = "POST",
               path    = "/request",
             },
             {
-              headers = { Host = "key-auth6.com" },
+              headers = { Host = "key-auth6.test" },
               body    = { apikey = "kong" },
               method  = "POST",
               path    = "/request",
@@ -619,7 +686,7 @@ for _, strategy in helpers.each_strategy() do
             method = "POST",
             path = "/request",
             headers = {
-              Host = "key-auth6.com",
+              Host = "key-auth6.test",
               ["Content-Type"] = content_type,
             },
             body = { apikey = "kong", foo = "bar" },
@@ -634,7 +701,7 @@ for _, strategy in helpers.each_strategy() do
         local res = assert(proxy_client:send {
           path = "/status/200",
           headers = {
-            ["Host"] = "key-auth6.com",
+            ["Host"] = "key-auth6.test",
             ["Content-Type"] = "text/plain",
           },
           body = "foobar",
@@ -642,7 +709,51 @@ for _, strategy in helpers.each_strategy() do
 
         local body = assert.res_status(401, res)
         local json = cjson.decode(body)
-        assert.same({ message = "No API key found in request" }, json)
+        assert.not_nil(json)
+        assert.matches("No API key found in request", json.message)
+        assert.equal('Key', res.headers["WWW-Authenticate"])
+      end)
+
+      it("does not remove apikey and preserves order of query parameters", function()
+        local res = assert(proxy_client:send {
+          method = "GET",
+          path = "/request?c=value1&b=value2&apikey=kong&a=value3",
+          headers = {
+            ["Host"] = "key-auth1.test"
+          }
+        })
+        local body = assert.res_status(200, res)
+        local json = cjson.decode(body)
+
+        assert.equal("/request?c=value1&b=value2&apikey=kong&a=value3", json.vars.request_uri)
+      end)
+
+      it("removes apikey and preserves order of query parameters", function()
+        local res = assert(proxy_client:send{
+          method = "GET",
+          path = "/request?c=value1&b=value2&apikey=kong&a=value3",
+          headers = {
+            ["Host"] = "key-auth2.test"
+          }
+        })
+        local body = assert.res_status(200, res)
+        local json = cjson.decode(body)
+
+        assert.equal("/request?c=value1&b=value2&a=value3", json.vars.request_uri)
+      end)
+
+      it("removes apikey in encoded query and preserves order of query parameters", function()
+        local res = assert(proxy_client:send {
+          method = "GET",
+          path = "/request?c=valu%651&b=value2&api%6B%65%79=kong&a=valu%653",
+          headers = {
+            ["Host"] = "key-auth2.test"
+          }
+        })
+        local body = assert.res_status(200, res)
+        local json = cjson.decode(body)
+
+        assert.equal("/request?c=value1&b=value2&a=value3", json.vars.request_uri)
       end)
     end)
 
@@ -652,7 +763,7 @@ for _, strategy in helpers.each_strategy() do
           method  = "GET",
           path    = "/request?apikey=kong",
           headers = {
-            ["Host"] = "key-auth3.com",
+            ["Host"] = "key-auth3.test",
           }
         })
         local body = cjson.decode(assert.res_status(200, res))
@@ -665,7 +776,7 @@ for _, strategy in helpers.each_strategy() do
           method  = "GET",
           path    = "/request",
           headers = {
-            ["Host"] = "key-auth3.com"
+            ["Host"] = "key-auth3.test"
           }
         })
         local body = cjson.decode(assert.res_status(200, res))
@@ -678,7 +789,7 @@ for _, strategy in helpers.each_strategy() do
           method  = "GET",
           path    = "/request",
           headers = {
-            ["Host"] = "key-auth10.com"
+            ["Host"] = "key-auth10.test"
           }
         })
         local body = cjson.decode(assert.res_status(200, res))
@@ -690,10 +801,11 @@ for _, strategy in helpers.each_strategy() do
           method  = "GET",
           path    = "/request",
           headers = {
-            ["Host"] = "key-auth4.com"
+            ["Host"] = "key-auth4.test"
           }
         })
-        assert.response(res).has.status(500)
+        local body = cjson.decode(assert.res_status(500, res))
+        assert.same("anonymous consumer " .. nonexisting_anonymous .. " is configured but doesn't exist", body.message)
       end)
     end)
   end)
@@ -716,7 +828,7 @@ for _, strategy in helpers.each_strategy() do
       })
 
       local route1 = bp.routes:insert {
-        hosts = { "logical-and.com" },
+        hosts = { "logical-and.test" },
       }
 
       local service = bp.services:insert {
@@ -724,7 +836,7 @@ for _, strategy in helpers.each_strategy() do
       }
 
       local route2 = bp.routes:insert {
-        hosts   = { "logical-or.com" },
+        hosts   = { "logical-or.test" },
         service = service,
       }
 
@@ -800,7 +912,7 @@ for _, strategy in helpers.each_strategy() do
           method = "GET",
           path = "/request",
           headers = {
-            ["Host"] = "logical-and.com",
+            ["Host"] = "logical-and.test",
             ["apikey"] = "Mouse",
             ["Authorization"] = "Basic QWxhZGRpbjpPcGVuU2VzYW1l",
           }
@@ -817,11 +929,12 @@ for _, strategy in helpers.each_strategy() do
           method  = "GET",
           path    = "/request",
           headers = {
-            ["Host"]   = "logical-and.com",
+            ["Host"]   = "logical-and.test",
             ["apikey"] = "Mouse",
           }
         })
         assert.response(res).has.status(401)
+        assert.equal('Basic realm="service"', res.headers["WWW-Authenticate"])
       end)
 
       it("fails 401, with only the second credential provided", function()
@@ -829,11 +942,12 @@ for _, strategy in helpers.each_strategy() do
           method  = "GET",
           path    = "/request",
           headers = {
-            ["Host"]          = "logical-and.com",
+            ["Host"]          = "logical-and.test",
             ["Authorization"] = "Basic QWxhZGRpbjpPcGVuU2VzYW1l",
           }
         })
         assert.response(res).has.status(401)
+        assert.equal('Key', res.headers["WWW-Authenticate"])
       end)
 
       it("fails 401, with no credential provided", function()
@@ -841,7 +955,7 @@ for _, strategy in helpers.each_strategy() do
           method  = "GET",
           path    = "/request",
           headers = {
-            ["Host"] = "logical-and.com",
+            ["Host"] = "logical-and.test",
           }
         })
         assert.response(res).has.status(401)
@@ -855,7 +969,7 @@ for _, strategy in helpers.each_strategy() do
           method  = "GET",
           path    = "/request",
           headers = {
-            ["Host"]          = "logical-or.com",
+            ["Host"]          = "logical-or.test",
             ["apikey"]        = "Mouse",
             ["Authorization"] = "Basic QWxhZGRpbjpPcGVuU2VzYW1l",
           }
@@ -872,7 +986,7 @@ for _, strategy in helpers.each_strategy() do
           method  = "GET",
           path    = "/request",
           headers = {
-            ["Host"]   = "logical-or.com",
+            ["Host"]   = "logical-or.test",
             ["apikey"] = "Mouse",
           }
         })
@@ -888,7 +1002,7 @@ for _, strategy in helpers.each_strategy() do
           method  = "GET",
           path    = "/request",
           headers = {
-            ["Host"]          = "logical-or.com",
+            ["Host"]          = "logical-or.test",
             ["Authorization"] = "Basic QWxhZGRpbjpPcGVuU2VzYW1l",
           }
         })
@@ -904,7 +1018,7 @@ for _, strategy in helpers.each_strategy() do
           method  = "GET",
           path    = "/request",
           headers = {
-            ["Host"] = "logical-or.com",
+            ["Host"] = "logical-or.test",
           }
         })
         assert.response(res).has.status(200)
@@ -919,6 +1033,7 @@ for _, strategy in helpers.each_strategy() do
       -- Give a bit of time to reduce test flakyness on slow setups
       local ttl = 10
       local inserted_at
+      local proxy_client
 
       lazy_setup(function()
         helpers.stop_kong()
@@ -932,7 +1047,7 @@ for _, strategy in helpers.each_strategy() do
         })
 
         local r = bp.routes:insert {
-          hosts = { "key-ttl.com" },
+          hosts = { "key-ttl.test" },
         }
 
         bp.plugins:insert {
@@ -956,8 +1071,6 @@ for _, strategy in helpers.each_strategy() do
           database   = strategy,
           nginx_conf = "spec/fixtures/custom_nginx.template",
         }))
-
-        proxy_client = helpers.proxy_client()
       end)
 
       lazy_teardown(function()
@@ -969,29 +1082,35 @@ for _, strategy in helpers.each_strategy() do
       end)
 
       it("authenticate for up to 'ttl'", function()
+        proxy_client = helpers.proxy_client()
         local res = assert(proxy_client:send {
           method  = "GET",
           path    = "/status/200",
           headers = {
-            ["Host"] = "key-ttl.com",
+            ["Host"] = "key-ttl.test",
             ["apikey"] = "kong",
           }
         })
         assert.res_status(200, res)
+        proxy_client:close()
 
         ngx.update_time()
         local elapsed = ngx.now() - inserted_at
-        ngx.sleep(ttl - elapsed + 1) -- 1: jitter
 
-        res = assert(proxy_client:send {
-          method  = "GET",
-          path    = "/status/200",
-          headers = {
-            ["Host"] = "key-ttl.com",
-            ["apikey"] = "kong",
-          }
-        })
-        assert.res_status(401, res)
+        helpers.wait_until(function()
+          proxy_client = helpers.proxy_client()
+          res = assert(proxy_client:send {
+            method  = "GET",
+            path    = "/status/200",
+            headers = {
+              ["Host"] = "key-ttl.test",
+              ["apikey"] = "kong",
+            }
+          })
+
+          proxy_client:close()
+          return res and res.status == 401
+        end, ttl - elapsed + 1)
       end)
     end)
   end)
@@ -1253,6 +1372,9 @@ for _, strategy in helpers.each_strategy() do
           },
         })
         assert.res_status(test[5], res)
+        if test[5] == 401 then
+          assert.equal('Key', res.headers["WWW-Authenticate"])
+        end
         proxy_client:close()
       end)
     end

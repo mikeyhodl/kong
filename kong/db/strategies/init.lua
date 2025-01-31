@@ -1,4 +1,4 @@
-local utils = require("kong.tools.utils")
+local load_module_if_exists = require "kong.tools.module".load_module_if_exists
 
 
 local fmt = string.format
@@ -9,7 +9,6 @@ local _M = {}
 
 _M.STRATEGIES   = {
   ["postgres"]  = true,
-  ["cassandra"] = true,
   ["off"] = true,
 }
 
@@ -34,6 +33,12 @@ function _M.new(kong_config, database, schemas, errors)
 
   do
     local base_connector = require "kong.db.strategies.connector"
+
+    -- lmdb will not support huge page size
+    if database == "off" then
+      base_connector.defaults.pagination.max_page_size = 2048
+    end
+
     local mt = getmetatable(connector)
     setmetatable(mt, {
       __index = function(t, k)
@@ -56,7 +61,7 @@ function _M.new(kong_config, database, schemas, errors)
     end
 
     local custom_strat = fmt("kong.db.strategies.%s.%s", database, schema.name)
-    local exists, mod = utils.load_module_if_exists(custom_strat)
+    local exists, mod = load_module_if_exists(custom_strat)
     if exists and mod then
       local parent_mt = getmetatable(strategy)
       local mt = {

@@ -36,6 +36,14 @@ local plugins = {
   "azure-functions",
   "zipkin",
   "opentelemetry",
+  "ai-proxy",
+  "ai-prompt-decorator",
+  "ai-prompt-template",
+  "ai-prompt-guard",
+  "ai-request-transformer",
+  "ai-response-transformer",
+  "standard-webhooks",
+  "redirect"
 }
 
 local plugin_map = {}
@@ -92,6 +100,7 @@ for k in pairs(key_formats_map) do
 end
 
 local constants = {
+  CJSON_MAX_PRECISION = 16,
   BUNDLED_PLUGINS = plugin_map,
   DEPRECATED_PLUGINS = deprecated_plugin_map,
   BUNDLED_VAULTS = vault_map,
@@ -116,6 +125,7 @@ local constants = {
     FORWARDED_PATH = "X-Forwarded-Path",
     FORWARDED_PREFIX = "X-Forwarded-Prefix",
     ANONYMOUS = "X-Anonymous-Consumer",
+    REQUEST_ID = "X-Kong-Request-Id",
     VIA = "Via",
     SERVER = "Server"
   },
@@ -141,6 +151,7 @@ local constants = {
     "vaults",
     "key_sets",
     "keys",
+    "filter_chains",
   },
   ENTITY_CACHE_STORE = setmetatable({
     consumers = "cache",
@@ -180,25 +191,29 @@ local constants = {
     "kong_locks",
     "kong_db_cache",
     "kong_db_cache_miss",
-    "kong_process_events",
     "kong_cluster_events",
     "kong_healthchecks",
     "kong_rate_limiting_counters",
+    "kong_secrets",
   },
   DATABASE = {
     POSTGRES = {
       MIN = "9.5",
     },
-    CASSANDRA = {
-      MIN = "3.0",
-      DEPRECATED = "2.2",
-    }
+    -- a bit over three years maximum to make it more safe against
+    -- integer overflow (time() + ttl)
+    DAO_MAX_TTL = 1e8,
   },
   PROTOCOLS = protocols,
   PROTOCOLS_WITH_SUBSYSTEM = protocols_with_subsystem,
 
+  DECLARATIVE_DEFAULT_WORKSPACE_ID = "0dc6f45b-8f8d-40d2-a504-473544ee190b",
+
   DECLARATIVE_LOAD_KEY = "declarative_config:loaded",
   DECLARATIVE_HASH_KEY = "declarative_config:hash",
+  DECLARATIVE_DEFAULT_WORKSPACE_KEY = "declarative_config:default_workspace",
+  PLUGINS_REBUILD_COUNTER_KEY = "readiness_probe_config:plugins_rebuild_counter",
+  ROUTERS_REBUILD_COUNTER_KEY = "readiness_probe_config:routers_rebuild_counter",
   DECLARATIVE_EMPTY_CONFIG_HASH = string.rep("0", 32),
 
   CLUSTER_ID_PARAM_KEY = "cluster_id",
@@ -209,10 +224,17 @@ local constants = {
     { KONG_VERSION_INCOMPATIBLE   = "kong_version_incompatible", },
     { PLUGIN_SET_INCOMPATIBLE     = "plugin_set_incompatible", },
     { PLUGIN_VERSION_INCOMPATIBLE = "plugin_version_incompatible", },
+    { FILTER_SET_INCOMPATIBLE     = "filter_set_incompatible", },
   },
   CLUSTERING_TIMEOUT = 5000, -- 5 seconds
   CLUSTERING_PING_INTERVAL = 30, -- 30 seconds
   CLUSTERING_OCSP_TIMEOUT = 5000, -- 5 seconds
+  CLUSTERING_DATA_PLANE_ERROR = {
+    CONFIG_PARSE     = "declarative configuration parse failure",
+    RELOAD           = "configuration reload failed",
+    GENERIC          = "generic or unknown error",
+  },
+  CLUSTERING_DATA_PLANES_LATEST_VERSION_KEY = "clustering_data_planes:latest_version",
 
   CLEAR_HEALTH_STATUS_DELAY = 300, -- 300 seconds
 
@@ -236,6 +258,43 @@ local constants = {
     [ngx.CRIT] = "crit",
     [ngx.ALERT] = "alert",
     [ngx.EMERG] = "emerg",
+  },
+
+  DYN_LOG_LEVEL_KEY = "kong:dyn_log_level",
+  DYN_LOG_LEVEL_TIMEOUT_AT_KEY = "kong:dyn_log_level_timeout_at",
+  DYN_LOG_LEVEL_DEFAULT_TIMEOUT = 60,
+
+  ADMIN_GUI_KCONFIG_CACHE_KEY = "admin:gui:kconfig",
+
+  REQUEST_DEBUG_TOKEN_FILE = ".request_debug_token",
+  REQUEST_DEBUG_LOG_PREFIX = "[request-debug]",
+
+  SCHEMA_NAMESPACES = {
+    PROXY_WASM_FILTERS = "proxy-wasm-filters",
+  },
+
+  RESPONSE_SOURCE = {
+    TYPES = {
+      ERROR = "error",
+      EXIT = "exit",
+      SERVICE = "service",
+    },
+    NAMES = {
+      error = "kong",
+      exit = "kong",
+      service = "upstream",
+    }
+  },
+
+  SOCKET_DIRECTORY = "sockets",
+  SOCKETS = {
+    WORKER_EVENTS = "we",
+    STREAM_WORKER_EVENTS = "sw",
+    CLUSTER_PROXY_SSL_TERMINATOR = "cp",
+    STREAM_CONFIG = "sc",
+    STREAM_TLS_TERMINATE = "st",
+    STREAM_TLS_PASSTHROUGH = "sp",
+    STREAM_RPC = "rp",
   },
 }
 

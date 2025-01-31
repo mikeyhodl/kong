@@ -6,7 +6,7 @@ local null = ngx.null
 
 local helpers = require "spec.helpers"
 local tablex = require "pl.tablex"
-local utils = require "kong.tools.utils"
+local uuid = require "kong.tools.uuid"
 
 local function sort_by_key(t)
   return function(a, b)
@@ -48,7 +48,7 @@ local function idempotent(tbl, err)
   local function recurse_fields(t)
     helpers.deep_sort(t)
     for k,v in sortedpairs(t) do
-      if k == "id" and utils.is_valid_uuid(v) then
+      if k == "id" and uuid.is_valid_uuid(v) then
         t[k] = "UUID"
       end
       if k == "client_id" or k == "client_secret" or k == "access_token" then
@@ -70,12 +70,12 @@ end
 
 
 describe("declarative config: on the fly migration", function()
-  for _, format_verion in ipairs{"1.1", "2.1", "3.0"} do
-    it("routes handling for format version " .. format_verion, function()
+  for _, format_version in ipairs{ "1.1", "2.1", "3.0"} do
+    it("routes handling for format version " .. format_version, function()
       local dc = assert(declarative.new_config(conf_loader()))
       local configs = {
       [[
-        _format_version: "]] .. format_verion .. [["
+        _format_version: "]] .. format_version .. [["
         services:
         - name: foo
           host: example.com
@@ -101,7 +101,7 @@ describe("declarative config: on the fly migration", function()
           service: foo
       ]],
       [[
-        _format_version: "]] .. format_verion .. [["
+        _format_version: "]] .. format_version .. [["
         services:
         - name: foo
           host: example.com
@@ -145,7 +145,7 @@ describe("declarative config: on the fly migration", function()
 
       assert.same("foo", sorted.routes[1].name)
       assert.same({"https"}, sorted.routes[1].protocols)
-      if format_verion == "3.0" then
+      if format_version == "3.0" then
         assert.same({ "/prefix", "/regex.+", }, sorted.routes[1].paths)
       else
         assert.same({ "/prefix", "~/regex.+", }, sorted.routes[1].paths)
@@ -153,4 +153,36 @@ describe("declarative config: on the fly migration", function()
       end
     end)
   end
+end)
+
+it("validation should happens after migration", function ()
+  local dc = assert(declarative.new_config(conf_loader()))
+  local config =
+    [[
+      _format_version: "2.1"
+      services:
+      - name: foo
+        host: example.com
+        protocol: https
+        enabled: false
+        _comment: my comment
+      - name: bar
+        host: example.test
+        port: 3000
+        _comment: my comment
+        routes:
+        - name: foo
+          path_handling: v0
+          protocols: ["https"]
+          paths: ["/regex.+(", "/prefix" ]
+          snis:
+          - "example.com"
+    ]]
+
+    local config_tbl, err = dc:parse_string(config)
+
+    assert.falsy(config_tbl)
+    assert.matches("invalid regex:", err, nil, true)
+    assert.matches("/regex.+(", err, nil, true)
+    assert.matches("missing closing parenthesis", err, nil, true)
 end)

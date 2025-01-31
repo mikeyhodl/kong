@@ -1,6 +1,11 @@
 local default_nginx_template = require "kong.templates.nginx"
 local kong_nginx_template = require "kong.templates.nginx_kong"
+local kong_nginx_gui_include_template = require "kong.templates.nginx_kong_gui_include"
 local kong_nginx_stream_template = require "kong.templates.nginx_kong_stream"
+local nginx_main_inject_template = require "kong.templates.nginx_inject"
+local nginx_http_inject_template = require "kong.templates.nginx_kong_inject"
+local nginx_stream_inject_template = require "kong.templates.nginx_kong_stream_inject"
+local wasmtime_cache_template = require "kong.templates.wasmtime_cache_config"
 local system_constants = require "lua_system_constants"
 local process_secrets = require "kong.cmd.utils.process_secrets"
 local openssl_bignum = require "resty.openssl.bn"
@@ -10,7 +15,6 @@ local x509 = require "resty.openssl.x509"
 local x509_extension = require "resty.openssl.x509.extension"
 local x509_name = require "resty.openssl.x509.name"
 local pl_template = require "pl.template"
-local pl_stringx = require "pl.stringx"
 local pl_tablex = require "pl.tablex"
 local pl_utils = require "pl.utils"
 local pl_file = require "pl.file"
@@ -20,6 +24,11 @@ local log = require "kong.cmd.utils.log"
 local ffi = require "ffi"
 local bit = require "bit"
 local nginx_signals = require "kong.cmd.utils.nginx_signals"
+
+
+local strip = require("kong.tools.string").strip
+local split = require("kong.tools.string").split
+local shallow_copy = require("kong.tools.table").shallow_copy
 
 
 local getmetatable = getmetatable
@@ -37,6 +46,7 @@ local math = math
 local join = pl_path.join
 local io = io
 local os = os
+local fmt = string.format
 
 
 local function pre_create_private_file(file)
@@ -103,6 +113,10 @@ local function gen_default_ssl_cert(kong_config, target)
       ssl_cert = kong_config["admin_ssl_cert_default" .. suffix]
       ssl_cert_key = kong_config["admin_ssl_cert_key_default" .. suffix]
 
+    elseif target == "admin_gui" then
+      ssl_cert = kong_config["admin_gui_ssl_cert_default" .. suffix]
+      ssl_cert_key = kong_config["admin_gui_ssl_cert_key_default" .. suffix]
+
     elseif target == "status" then
       ssl_cert = kong_config["status_ssl_cert_default" .. suffix]
       ssl_cert_key = kong_config["status_ssl_cert_key_default" .. suffix]
@@ -113,7 +127,8 @@ local function gen_default_ssl_cert(kong_config, target)
     end
 
     if not exists(ssl_cert) and not exists(ssl_cert_key) then
-      log.verbose("generating %s SSL certificate (", ssl_cert, ") and key (", ssl_cert_key, ") for ", target or "proxy", " listener")
+      log.verbose("generating %s SSL certificate (%s) and key (%s) for listener",
+                  target or "proxy", ssl_cert, ssl_cert_key)
 
       local key
       if suffix == "_ecdsa" then
@@ -199,7 +214,7 @@ end
 
 
 local function gen_trusted_certs_combined_file(combined_filepath, paths)
-  log.verbose("generating trusted certs combined file in ",
+  log.verbose("generating trusted certs combined file in %s",
               combined_filepath)
 
   local fd = assert(io.open(combined_filepath, "w"))
@@ -218,7 +233,7 @@ local function get_ulimit()
   if not ok then
     return nil, stderr
   end
-  local sanitized_limit = pl_stringx.strip(stdout)
+  local sanitized_limit = strip(stdout)
   if sanitized_limit:lower():match("unlimited") then
     return 65536
   else
@@ -226,7 +241,11 @@ local function get_ulimit()
   end
 end
 
-local function compile_conf(kong_config, conf_template)
+local function quote(s)
+  return fmt("%q", s)
+end
+
+local function compile_conf(kong_config, conf_template, template_env_inject)
   -- computed config properties for templating
   local compile_env = {
     _escape = ">",
@@ -235,8 +254,23 @@ local function compile_conf(kong_config, conf_template)
     tostring = tostring,
     os = {
       getenv = os.getenv,
-    }
+    },
+    quote = quote,
   }
+
+  local kong_proxy_access_log = kong_config.proxy_access_log
+  if kong_proxy_access_log ~= "off" then
+    compile_env.proxy_access_log_enabled = true
+  end
+  if kong_proxy_access_log then
+    -- example: proxy_access_log = 'logs/some-file.log apigw_json'
+    local _, custom_format_name = string.match(kong_proxy_access_log, "^(%S+)%s(%S+)")
+    if custom_format_name then
+      compile_env.custom_proxy_access_log = true
+    end
+  end
+
+  compile_env = pl_tablex.merge(compile_env, template_env_inject or {}, true)
 
   do
     local worker_rlimit_nofile_auto
@@ -283,7 +317,7 @@ local function compile_conf(kong_config, conf_template)
   end
 
   compile_env = pl_tablex.merge(compile_env, kong_config, true) -- union
-  compile_env.dns_resolver = table.concat(compile_env.dns_resolver, " ")
+  compile_env.dns_resolver = table.concat(compile_env.dns_resolver or {}, " ")
   compile_env.lua_package_path = (compile_env.lua_package_path or "") .. ";" ..
                                  (os.getenv("LUA_PATH") or "")
   compile_env.lua_package_cpath = (compile_env.lua_package_cpath or "") .. ";" ..
@@ -294,10 +328,11 @@ local function compile_conf(kong_config, conf_template)
     return nil, "failed to compile nginx config template: " .. err
   end
 
-  return string.gsub(post_template, "(${%b{}})", function(w)
+  -- the second value(the count) should not be returned
+  return (string.gsub(post_template, "(${%b{}})", function(w)
     local name = w:sub(4, -3)
     return compile_env[name:lower()] or ""
-  end)
+  end))
 end
 
 local function write_env_file(path, data)
@@ -339,51 +374,77 @@ local function write_env_file(path, data)
   return true
 end
 
-local function write_process_secrets_file(path, data)
-  os.remove(path)
+local function write_process_secrets_file(kong_conf, data)
+  local path = kong_conf.kong_process_secrets
 
-  local flags = bit.bor(system_constants.O_RDONLY(),
-                        system_constants.O_CREAT())
+  local function write_single_secret_file(path, data)
+    os.remove(path)
 
-  local mode = ffi.new("int", bit.bor(system_constants.S_IRUSR(),
-                                      system_constants.S_IWUSR()))
+    local flags = bit.bor(system_constants.O_RDONLY(),
+                          system_constants.O_CREAT())
 
-  local fd = ffi.C.open(path, flags, mode)
-  if fd < 0 then
-    local errno = ffi.errno()
-    return nil, "unable to open process secrets path " .. path .. " (" ..
-                ffi.string(ffi.C.strerror(errno)) .. ")"
+    local mode = ffi.new("int", bit.bor(system_constants.S_IRUSR(),
+                                        system_constants.S_IWUSR()))
+
+    local fd = ffi.C.open(path, flags, mode)
+    if fd < 0 then
+      local errno = ffi.errno()
+      return nil, "unable to open process secrets path " .. path .. " (" ..
+                  ffi.string(ffi.C.strerror(errno)) .. ")"
+    end
+
+    local ok = ffi.C.close(fd)
+    if ok ~= 0 then
+      local errno = ffi.errno()
+      return nil, "failed to close fd (" ..
+                  ffi.string(ffi.C.strerror(errno)) .. ")"
+    end
+
+    local file, err = io.open(path, "w+b")
+    if not file then
+      return nil, "unable to open process secrets path " .. path .. " (" .. err .. ")"
+    end
+
+    local ok, err = file:write(data)
+
+    file:close()
+
+    if not ok then
+      return nil, "unable to write process secrets path " .. path .. " (" .. err .. ")"
+    end
+
+    return true
+
   end
 
-  local ok = ffi.C.close(fd)
-  if ok ~= 0 then
-    local errno = ffi.errno()
-    return nil, "failed to close fd (" ..
-                ffi.string(ffi.C.strerror(errno)) .. ")"
+  if kong_conf.role == "control_plane" or #kong_conf.proxy_listeners > 0
+    or #kong_conf.admin_listeners > 0 or #kong_conf.status_listeners > 0 then
+    local ok, err = write_single_secret_file(path .. "_http", data)
+    if not ok then
+      return nil, err
+    end
   end
 
-  local file, err = io.open(path, "w+b")
-  if not file then
-    return nil, "unable to open process secrets path " .. path .. " (" .. err .. ")"
-  end
-
-  local ok, err = file:write(data)
-
-  file:close()
-
-  if not ok then
-    return nil, "unable to write process secrets path " .. path .. " (" .. err .. ")"
+  if #kong_conf.stream_listeners > 0 then
+    local ok, err = write_single_secret_file(path .. "_stream", data)
+    if not ok then
+      return nil, err
+    end
   end
 
   return true
 end
 
-local function compile_kong_conf(kong_config)
-  return compile_conf(kong_config, kong_nginx_template)
+local function compile_kong_conf(kong_config, template_env_inject)
+  return compile_conf(kong_config, kong_nginx_template, template_env_inject)
 end
 
-local function compile_kong_stream_conf(kong_config)
-  return compile_conf(kong_config, kong_nginx_stream_template)
+local function compile_kong_gui_include_conf(kong_config)
+  return compile_conf(kong_config, kong_nginx_gui_include_template)
+end
+
+local function compile_kong_stream_conf(kong_config, template_env_inject)
+  return compile_conf(kong_config, kong_nginx_stream_template, template_env_inject)
 end
 
 local function compile_nginx_conf(kong_config, template)
@@ -391,7 +452,46 @@ local function compile_nginx_conf(kong_config, template)
   return compile_conf(kong_config, template)
 end
 
-local function prepare_prefix(kong_config, nginx_custom_template_path, skip_write, write_process_secrets)
+local function compile_wasmtime_cache_conf(kong_config)
+  return compile_conf(kong_config, wasmtime_cache_template)
+end
+
+local function prepare_prefixed_interface_dir(usr_path, interface_dir, kong_config)
+  local usr_interface_path = usr_path .. "/" .. interface_dir
+  local interface_path = kong_config.prefix .. "/" .. interface_dir
+
+  -- if the interface directory is not exist in custom prefix directory
+  -- try symlinking to the default prefix location
+  -- ensure user can access the interface appliation
+  if not pl_path.exists(interface_path)
+     and pl_path.exists(usr_interface_path) then
+
+    local ln_cmd = "ln -s " .. usr_interface_path .. " " .. interface_path
+    local ok, _, _, err_t = pl_utils.executeex(ln_cmd)
+
+    if not ok then
+      log.warn(err_t)
+    end
+  end
+end
+
+local function compile_nginx_main_inject_conf(kong_config)
+  return compile_conf(kong_config, nginx_main_inject_template)
+end
+
+local function compile_nginx_http_inject_conf(kong_config)
+  return compile_conf(kong_config, nginx_http_inject_template)
+end
+
+local function compile_nginx_stream_inject_conf(kong_config)
+  return compile_conf(kong_config, nginx_stream_inject_template)
+end
+
+local function compile_kong_test_inject_conf(kong_config, template, template_env)
+  return compile_conf(kong_config, template, template_env)
+end
+
+local function prepare_prefix(kong_config, nginx_custom_template_path, skip_write, write_process_secrets, nginx_conf_flags)
   log.verbose("preparing nginx prefix directory at %s", kong_config.prefix)
 
   if not exists(kong_config.prefix) then
@@ -402,6 +502,19 @@ local function prepare_prefix(kong_config, nginx_custom_template_path, skip_writ
     end
   elseif not pl_path.isdir(kong_config.prefix) then
     return nil, kong_config.prefix .. " is not a directory"
+  end
+
+  if not exists(kong_config.socket_path) then
+    local ok, err = makepath(kong_config.socket_path)
+    if not ok then
+      return nil, err
+    end
+
+    local ok, _, _, stderr = pl_utils.executeex("chmod 755 " .. kong_config.socket_path)
+    if not ok then
+      return nil, "can not set correct permissions for socket path: " .. kong_config.socket_path
+                  .. " (" .. stderr .. ")"
+    end
   end
 
   -- create directories in prefix
@@ -434,7 +547,7 @@ local function prepare_prefix(kong_config, nginx_custom_template_path, skip_writ
 
   -- generate default SSL certs if needed
   do
-    for _, target in ipairs({ "proxy", "admin", "status" }) do
+    for _, target in ipairs({ "proxy", "admin", "admin_gui", "status" }) do
       local ssl_enabled = kong_config[target .. "_ssl_enabled"]
       if not ssl_enabled and target == "proxy" then
         ssl_enabled = kong_config.stream_proxy_ssl_enabled
@@ -451,7 +564,7 @@ local function prepare_prefix(kong_config, nginx_custom_template_path, skip_writ
       local ssl_cert_key = kong_config[prefix .. "ssl_cert_key"]
 
       if ssl_enabled and #ssl_cert == 0 and #ssl_cert_key == 0 then
-        log.verbose("SSL enabled on ", target, ", no custom certificate set: using default certificates")
+        log.verbose("SSL enabled on %s, no custom certificate set: using default certificates", target)
         local ok, err = gen_default_ssl_cert(kong_config, target)
         if not ok then
           return nil, err
@@ -542,6 +655,7 @@ local function prepare_prefix(kong_config, nginx_custom_template_path, skip_writ
     for _, target in ipairs({
       "proxy",
       "admin",
+      "admin_gui",
       "status",
       "client",
       "cluster",
@@ -609,6 +723,23 @@ local function prepare_prefix(kong_config, nginx_custom_template_path, skip_writ
     return true
   end
 
+  if kong_config.wasm then
+    if kong_config.wasmtime_cache_directory then
+      local ok, err = makepath(kong_config.wasmtime_cache_directory)
+      if not ok then
+        return nil, err
+      end
+    end
+
+    if kong_config.wasmtime_cache_config_file  then
+      local wasmtime_conf, err = compile_wasmtime_cache_conf(kong_config)
+      if not wasmtime_conf then
+        return nil, err
+      end
+      pl_file.write(kong_config.wasmtime_cache_config_file, wasmtime_conf)
+    end
+  end
+
   -- compile Nginx configurations
   local nginx_template
   if nginx_custom_template_path then
@@ -626,31 +757,88 @@ local function prepare_prefix(kong_config, nginx_custom_template_path, skip_writ
   if kong_config.proxy_ssl_enabled or
      kong_config.stream_proxy_ssl_enabled or
      kong_config.admin_ssl_enabled or
+     kong_config.admin_gui_ssl_enabled or
      kong_config.status_ssl_enabled
   then
     gen_default_dhparams(kong_config)
   end
 
-  -- write NGINX conf
+  local template_env = {}
+  nginx_conf_flags = nginx_conf_flags and split(nginx_conf_flags, ",") or {}
+  for _, flag in ipairs(nginx_conf_flags) do
+    template_env[flag] = true
+  end
+
   local nginx_conf, err = compile_nginx_conf(kong_config, nginx_template)
   if not nginx_conf then
     return nil, err
   end
   pl_file.write(kong_config.nginx_conf, nginx_conf)
 
+  -- write Kong's GUI include NGINX conf
+  local nginx_kong_gui_include_conf, err = compile_kong_gui_include_conf(kong_config)
+  if not nginx_kong_gui_include_conf then
+    return nil, err
+  end
+  pl_file.write(kong_config.nginx_kong_gui_include_conf, nginx_kong_gui_include_conf)
+
   -- write Kong's HTTP NGINX conf
-  local nginx_kong_conf, err = compile_kong_conf(kong_config)
+  local nginx_kong_conf, err = compile_kong_conf(kong_config, template_env)
   if not nginx_kong_conf then
     return nil, err
   end
   pl_file.write(kong_config.nginx_kong_conf, nginx_kong_conf)
 
   -- write Kong's stream NGINX conf
-  local nginx_kong_stream_conf, err = compile_kong_stream_conf(kong_config)
+  local nginx_kong_stream_conf, err = compile_kong_stream_conf(kong_config, template_env)
   if not nginx_kong_stream_conf then
     return nil, err
   end
   pl_file.write(kong_config.nginx_kong_stream_conf, nginx_kong_stream_conf)
+
+  -- write NGINX MAIN inject conf
+  local nginx_main_inject_conf, err = compile_nginx_main_inject_conf(kong_config)
+  if not nginx_main_inject_conf then
+    return nil, err
+  end
+  pl_file.write(kong_config.nginx_inject_conf, nginx_main_inject_conf)
+
+  -- write NGINX HTTP inject conf
+  local nginx_http_inject_conf, err = compile_nginx_http_inject_conf(kong_config)
+  if not nginx_http_inject_conf then
+    return nil, err
+  end
+  pl_file.write(kong_config.nginx_kong_inject_conf, nginx_http_inject_conf)
+
+  -- write NGINX STREAM inject conf
+  local nginx_stream_inject_conf, err = compile_nginx_stream_inject_conf(kong_config)
+  if not nginx_stream_inject_conf then
+    return nil, err
+  end
+  pl_file.write(kong_config.nginx_kong_stream_inject_conf, nginx_stream_inject_conf)
+
+  -- write Kong's test injected configuration files (*.test.conf)
+  -- these are included in the Kong's HTTP NGINX conf by the test template
+  local test_template_inj_path = "spec/fixtures/template_inject/"
+  if pl_path.isdir(test_template_inj_path) then
+    for _, file in ipairs(pl_dir.getfiles(test_template_inj_path, "*.lua")) do
+      local t_path = pl_path.splitext(file)
+      local t_module = string.gsub(t_path, "/", ".")
+      local nginx_kong_test_inject_conf, err = compile_kong_test_inject_conf(
+        kong_config,
+        require(t_module),
+        template_env
+      )
+
+      if not nginx_kong_test_inject_conf then
+        return nil, err
+      end
+
+      local t_name = pl_path.basename(t_path)
+      local output_path = kong_config.prefix .. "/" .. t_name .. ".test.conf"
+      pl_file.write(output_path, nginx_kong_test_inject_conf)
+    end
+  end
 
   -- testing written NGINX conf
   local ok, err = nginx_signals.check_conf(kong_config)
@@ -670,17 +858,32 @@ local function prepare_prefix(kong_config, nginx_custom_template_path, skip_writ
     "",
   }
 
-  local refs = kong_config["$refs"]
-  local has_refs = refs and type(refs) == "table"
-
-  local secrets
-  if write_process_secrets and has_refs then
-    secrets = process_secrets.extract(kong_config)
+  local function quote_hash(s)
+    return s:gsub("#", "\\#")
   end
 
+  local refs = kong_config["$refs"]
+  local has_refs = refs and type(refs) == "table"
+  local secrets = process_secrets.extract(kong_config)
+
   for k, v in pairs(kong_config) do
+    -- do not output secrets in .kong_env
     if has_refs and refs[k] then
-      v = refs[k]
+      local ref = refs[k]
+      if type(ref) == "table" then
+        if type(v) ~= "table" then
+          v = { v }
+        else
+          v = shallow_copy(v)
+        end
+
+        for i, r in pairs(ref) do
+          v[i] = r
+        end
+
+      elseif ref then
+        v = ref
+      end
     end
 
     if type(v) == "table" then
@@ -692,7 +895,7 @@ local function prepare_prefix(kong_config, nginx_custom_template_path, skip_writ
       end
     end
     if v ~= "" then
-      buf[#buf+1] = k .. " = " .. tostring(v)
+      buf[#buf+1] = k .. " = " .. quote_hash(tostring(v))
     end
   end
 
@@ -702,13 +905,17 @@ local function prepare_prefix(kong_config, nginx_custom_template_path, skip_writ
     return nil, err
   end
 
-  if secrets then
+  if kong_config.admin_gui_listeners then
+    prepare_prefixed_interface_dir("/usr/local/kong", "gui", kong_config)
+  end
+
+  if secrets and write_process_secrets then
     secrets, err = process_secrets.serialize(secrets, kong_config.kong_env)
     if not secrets then
       return nil, err
     end
 
-    ok, err = write_process_secrets_file(kong_config.kong_process_secrets, secrets)
+    ok, err = write_process_secrets_file(kong_config, secrets)
     if not ok then
       return nil, err
     end
@@ -723,10 +930,15 @@ end
 return {
   get_ulimit = get_ulimit,
   prepare_prefix = prepare_prefix,
+  prepare_prefixed_interface_dir = prepare_prefixed_interface_dir,
   compile_conf = compile_conf,
   compile_kong_conf = compile_kong_conf,
+  compile_kong_gui_include_conf = compile_kong_gui_include_conf,
   compile_kong_stream_conf = compile_kong_stream_conf,
   compile_nginx_conf = compile_nginx_conf,
+  compile_nginx_main_inject_conf = compile_nginx_main_inject_conf,
+  compile_nginx_http_inject_conf = compile_nginx_http_inject_conf,
+  compile_nginx_stream_inject_conf = compile_nginx_stream_inject_conf,
   gen_default_ssl_cert = gen_default_ssl_cert,
   write_env_file = write_env_file,
 }

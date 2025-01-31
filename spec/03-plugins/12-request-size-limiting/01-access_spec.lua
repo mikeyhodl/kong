@@ -9,6 +9,7 @@ local unit_multiplication_factor = handler.unit_multiplication_factor
 
 local TEST_SIZE = 2
 local MB        = 2^20
+local KB        = 2^10
 
 
 for _, strategy in helpers.each_strategy() do
@@ -23,7 +24,7 @@ for _, strategy in helpers.each_strategy() do
       })
 
       local route = bp.routes:insert {
-        hosts = { "limit.com" },
+        hosts = { "limit.test" },
       }
 
       bp.plugins:insert {
@@ -35,7 +36,7 @@ for _, strategy in helpers.each_strategy() do
       }
 
       local route2 = bp.routes:insert {
-        hosts = { "required.com" },
+        hosts = { "required.test" },
       }
 
       bp.plugins:insert {
@@ -49,7 +50,7 @@ for _, strategy in helpers.each_strategy() do
 
       for _, unit in ipairs(size_units) do
         local route = bp.routes:insert {
-          hosts = { string.format("limit_%s.com", unit) },
+          hosts = { string.format("limit_%s.test", unit) },
         }
 
         bp.plugins:insert {
@@ -86,7 +87,7 @@ for _, strategy in helpers.each_strategy() do
           path    = "/request",
           body    = body,
           headers = {
-            ["Host"]           = "limit.com",
+            ["Host"]           = "limit.test",
             ["Content-Length"] = #body
           }
         })
@@ -100,7 +101,7 @@ for _, strategy in helpers.each_strategy() do
           path    = "/request",
           body    = body,
           headers = {
-            ["Host"]           = "limit.com",
+            ["Host"]           = "limit.test",
             ["Expect"]         = "100-continue",
             ["Content-Length"] = #body
           }
@@ -115,13 +116,14 @@ for _, strategy in helpers.each_strategy() do
           path    = "/request",
           body    = body,
           headers = {
-            ["Host"]           = "limit.com",
+            ["Host"]           = "limit.test",
             ["Content-Length"] = #body
           }
         })
         local body = assert.res_status(413, res)
         local json = cjson.decode(body)
-        assert.same({ message = "Request size limit exceeded" }, json)
+        assert.not_nil(json)
+        assert.matches("Request size limit exceeded", json.message)
       end)
 
       it("blocks if size is greater than limit and Expect header", function()
@@ -131,14 +133,15 @@ for _, strategy in helpers.each_strategy() do
           path    = "/request",
           body    = body,
           headers = {
-            ["Host"]           = "limit.com",
+            ["Host"]           = "limit.test",
             ["Expect"]         = "100-continue",
             ["Content-Length"] = #body
           }
         })
         local body = assert.res_status(417, res)
         local json = cjson.decode(body)
-        assert.same({ message = "Request size limit exceeded" }, json)
+        assert.not_nil(json)
+        assert.matches("Request size limit exceeded", json.message)
       end)
 
       for _, unit in ipairs(size_units) do
@@ -149,13 +152,14 @@ for _, strategy in helpers.each_strategy() do
             path    = "/request",
             body    = body,
             headers = {
-              ["Host"]           = string.format("limit_%s.com", unit),
+              ["Host"]           = string.format("limit_%s.test", unit),
               ["Content-Length"] = #body
             }
           })
           local body = assert.res_status(413, res)
           local json = cjson.decode(body)
-          assert.same({ message = "Request size limit exceeded" }, json)
+          assert.not_nil(json)
+          assert.matches("Request size limit exceeded", json.message)
         end)
       end
 
@@ -167,7 +171,7 @@ for _, strategy in helpers.each_strategy() do
             path    = "/request",
             body    = body,
             headers = {
-              ["Host"]           = string.format("limit_%s.com", unit),
+              ["Host"]           = string.format("limit_%s.test", unit),
               ["Content-Length"] = #body
             }
           })
@@ -176,97 +180,178 @@ for _, strategy in helpers.each_strategy() do
       end
     end)
 
-    describe("without Content-Length", function()
-      it("works if size is lower than limit", function()
-        local body = string.rep("a", (TEST_SIZE * MB))
-        local res = assert(proxy_client:request {
-          dont_add_content_length = true,
-          method  = "GET", -- if POST, then lua-rsty-http adds content-length anyway
-          path    = "/request",
-          body    = body,
-          headers = {
-            ["Host"] = "limit.com"
-          }
-        })
-        assert.res_status(200, res)
-      end)
-
-      it("works if size is lower than limit and Expect header", function()
-        local body = string.rep("a", (TEST_SIZE * MB))
-        local res = assert(proxy_client:request {
-          dont_add_content_length = true,
-          method  = "GET", -- if POST, then lua-rsty-http adds content-length anyway
-          path    = "/request",
-          body    = body,
-          headers = {
-            ["Host"]   = "limit.com",
-            ["Expect"] = "100-continue"
-          }
-        })
-        assert.res_status(200, res)
-      end)
-
-      it("blocks if size is greater than limit", function()
-        local body = string.rep("a", (TEST_SIZE * MB) + 1)
-        local res = assert(proxy_client:request {
-          dont_add_content_length = true,
-          method  = "GET", -- if POST, then lua-rsty-http adds content-length anyway
-          path    = "/request",
-          body    = body,
-          headers = {
-            ["Host"] = "limit.com"
-          }
-        })
-        local body = assert.res_status(413, res)
-        local json = cjson.decode(body)
-        assert.same({ message = "Request size limit exceeded" }, json)
-      end)
-
-      it("blocks if size is greater than limit and Expect header", function()
-        local body = string.rep("a", (TEST_SIZE * MB) + 1)
-        local res = assert(proxy_client:request {
-          dont_add_content_length = true,
-          method  = "GET", -- if POST, then lua-rsty-http adds content-length anyway
-          path    = "/request",
-          body    = body,
-          headers = {
-            ["Host"]   = "limit.com",
-            ["Expect"] = "100-continue"
-          }
-        })
-        local body = assert.res_status(417, res)
-        local json = cjson.decode(body)
-        assert.same({ message = "Request size limit exceeded" }, json)
-      end)
-
-      for _, unit in ipairs(size_units) do
-        it("blocks if size is greater than limit when unit in " .. unit, function()
-          local body = string.rep("a", (TEST_SIZE * unit_multiplication_factor[unit]) + 1)
+    describe("without Content-Length(chunked request body)", function()
+      describe("[request body size > nginx_http_client_body_buffer_size]", function()
+        it("works if size is lower than limit", function()
+          local str_len = TEST_SIZE * MB
+          local body = string.format("%x", str_len) .. "\r\n" .. string.rep("a", str_len) .. "\r\n0\r\n\r\n"
           local res = assert(proxy_client:request {
-            dont_add_content_length = true,
-            method  = "GET", -- if POST, then lua-rsty-http adds content-length anyway
+            method  = "GET", -- if POST, then lua-resty-http adds content-length anyway
             path    = "/request",
             body    = body,
             headers = {
-              ["Host"]           = string.format("limit_%s.com", unit),
+              ["Host"] = "limit.test",
+              ["Transfer-Encoding"] = "chunked", -- lua-resty-http do not add content-length when client send chunked request body
+            }
+          })
+          assert.res_status(200, res)
+        end)
+
+        it("works if size is lower than limit and Expect header", function()
+          local str_len = TEST_SIZE * MB
+          local body = string.format("%x", str_len) .. "\r\n" .. string.rep("a", str_len) .. "\r\n0\r\n\r\n"
+          local res = assert(proxy_client:request {
+            method  = "GET", -- if POST, then lua-resty-http adds content-length anyway
+            path    = "/request",
+            body    = body,
+            headers = {
+              ["Host"]   = "limit.test",
+              ["Expect"] = "100-continue",
+              ["Transfer-Encoding"] = "chunked", -- lua-resty-http do not add content-length when client send chunked request body
+            }
+          })
+          assert.res_status(200, res)
+        end)
+
+        it("blocks if size is greater than limit", function()
+          local str_len = (TEST_SIZE * MB) + 1
+          local body = string.format("%x", str_len) .. "\r\n" .. string.rep("a", str_len) .. "\r\n0\r\n\r\n"
+          local res = assert(proxy_client:request {
+            method  = "GET", -- if POST, then lua-resty-http adds content-length anyway
+            path    = "/request",
+            body    = body,
+            headers = {
+              ["Host"] = "limit.test",
+              ["Transfer-Encoding"] = "chunked", -- lua-resty-http do not add content-length when client send chunked request body
             }
           })
           local body = assert.res_status(413, res)
           local json = cjson.decode(body)
-          assert.same({ message = "Request size limit exceeded" }, json)
+          assert.not_nil(json)
+          assert.matches("Request size limit exceeded", json.message)
+        end)
+
+        it("blocks if size is greater than limit and Expect header", function()
+          local str_len = (TEST_SIZE * MB) + 1
+          local body = string.format("%x", str_len) .. "\r\n" .. string.rep("a", str_len) .. "\r\n0\r\n\r\n"
+          local res = assert(proxy_client:request {
+            method  = "GET", -- if POST, then lua-resty-http adds content-length anyway
+            path    = "/request",
+            body    = body,
+            headers = {
+              ["Host"]   = "limit.test",
+              ["Expect"] = "100-continue",
+              ["Transfer-Encoding"] = "chunked", -- lua-resty-http do not add content-length when client send chunked request body
+            }
+          })
+          local body = assert.res_status(417, res)
+          local json = cjson.decode(body)
+          assert.not_nil(json)
+          assert.matches("Request size limit exceeded", json.message)
+        end)
+      end)
+
+      describe("[request body size < nginx_http_client_body_buffer_size]", function()
+        it("works if size is lower than limit", function()
+          local str_len = TEST_SIZE * KB
+          local body = string.format("%x", str_len) .. "\r\n" .. string.rep("a", str_len) .. "\r\n0\r\n\r\n"
+          local res = assert(proxy_client:request {
+            method  = "GET", -- if POST, then lua-resty-http adds content-length anyway
+            path    = "/request",
+            body    = body,
+            headers = {
+              ["Host"] = "limit_kilobytes.test",
+              ["Transfer-Encoding"] = "chunked", -- lua-resty-http do not add content-length when client send chunked request body
+            }
+          })
+          assert.res_status(200, res)
+        end)
+
+        it("works if size is lower than limit and Expect header", function()
+          local str_len = TEST_SIZE * KB
+          local body = string.format("%x", str_len) .. "\r\n" .. string.rep("a", str_len) .. "\r\n0\r\n\r\n"
+          local res = assert(proxy_client:request {
+            method  = "GET", -- if POST, then lua-resty-http adds content-length anyway
+            path    = "/request",
+            body    = body,
+            headers = {
+              ["Host"] = "limit_kilobytes.test",
+              ["Expect"] = "100-continue",
+              ["Transfer-Encoding"] = "chunked", -- lua-resty-http do not add content-length when client send chunked request body
+            }
+          })
+          assert.res_status(200, res)
+        end)
+
+        it("blocks if size is greater than limit", function()
+          local str_len = (TEST_SIZE * KB) + 1
+          local body = string.format("%x", str_len) .. "\r\n" .. string.rep("a", str_len) .. "\r\n0\r\n\r\n"
+          local res = assert(proxy_client:request {
+            method  = "GET", -- if POST, then lua-resty-http adds content-length anyway
+            path    = "/request",
+            body    = body,
+            headers = {
+              ["Host"] = "limit_kilobytes.test",
+              ["Transfer-Encoding"] = "chunked", -- lua-resty-http do not add content-length when client send chunked request body
+            }
+          })
+          local body = assert.res_status(413, res)
+          local json = cjson.decode(body)
+          assert.not_nil(json)
+          assert.matches("Request size limit exceeded", json.message)
+        end)
+
+        it("blocks if size is greater than limit and Expect header", function()
+          local str_len = (TEST_SIZE * KB) + 1
+          local body = string.format("%x", str_len) .. "\r\n" .. string.rep("a", str_len) .. "\r\n0\r\n\r\n"
+          local res = assert(proxy_client:request {
+            method  = "GET", -- if POST, then lua-resty-http adds content-length anyway
+            path    = "/request",
+            body    = body,
+            headers = {
+              ["Host"] = "limit_kilobytes.test",
+              ["Expect"] = "100-continue",
+              ["Transfer-Encoding"] = "chunked", -- lua-resty-http do not add content-length when client send chunked request body
+            }
+          })
+          local body = assert.res_status(417, res)
+          local json = cjson.decode(body)
+          assert.not_nil(json)
+          assert.matches("Request size limit exceeded", json.message)
+        end)
+      end)
+
+      for _, unit in ipairs(size_units) do
+        it("blocks if size is greater than limit when unit in " .. unit, function()
+          local str_len = (TEST_SIZE * unit_multiplication_factor[unit]) + 1
+          local body = string.format("%x", str_len) .. "\r\n" .. string.rep("a", str_len) .. "\r\n0\r\n\r\n"
+          local res = assert(proxy_client:request {
+            method  = "GET", -- if POST, then lua-resty-http adds content-length anyway
+            path    = "/request",
+            body    = body,
+            headers = {
+              ["Host"]           = string.format("limit_%s.test", unit),
+              ["Transfer-Encoding"] = "chunked", -- lua-resty-http do not add content-length when client send chunked request body
+            }
+          })
+          local body = assert.res_status(413, res)
+          local json = cjson.decode(body)
+          assert.not_nil(json)
+          assert.matches("Request size limit exceeded", json.message)
         end)
       end
 
       for _, unit in ipairs(size_units) do
         it("works if size is less than limit when unit in " .. unit, function()
-          local body = string.rep("a", (TEST_SIZE * unit_multiplication_factor[unit]))
+          local str_len = (TEST_SIZE * unit_multiplication_factor[unit])
+          local body = string.format("%x", str_len) .. "\r\n" .. string.rep("a", str_len) .. "\r\n0\r\n\r\n"
           local res = assert(proxy_client:request {
-            dont_add_content_length = true,
-            method  = "GET", -- if POST, then lua-rsty-http adds content-length anyway
+            method  = "GET", -- if POST, then lua-resty-http adds content-length anyway
             path    = "/request",
             body    = body,
             headers = {
-              ["Host"]           = string.format("limit_%s.com", unit),
+              ["Host"]           = string.format("limit_%s.test", unit),
+              ["Transfer-Encoding"] = "chunked", -- lua-resty-http do not add content-length when client send chunked request body
             }
           })
           assert.res_status(200, res)
@@ -278,10 +363,10 @@ for _, strategy in helpers.each_strategy() do
       it("blocks if header is not provided", function()
         local res = assert(proxy_client:request {
           dont_add_content_length = true,
-          method  = "GET", -- if POST, then lua-rsty-http adds content-length anyway
+          method  = "GET", -- if POST, then lua-resty-http adds content-length anyway
           path    = "/request",
           headers = {
-            ["Host"] = "required.com",
+            ["Host"] = "required.test",
           }
         })
         assert.response(res).has.status(411)

@@ -5,6 +5,21 @@ local Entity       = require "kong.db.schema.entity"
 
 local Routes
 
+local function setup_global_env()
+  _G.kong = _G.kong or {}
+  _G.kong.log = _G.kong.log or {
+    debug = function(msg)
+      ngx.log(ngx.DEBUG, msg)
+    end,
+    error = function(msg)
+      ngx.log(ngx.ERR, msg)
+    end,
+    warn = function (msg)
+      ngx.log(ngx.WARN, msg)
+    end
+  }
+end
+
 local function reload_flavor(flavor)
   _G.kong = {
     configuration = {
@@ -28,14 +43,18 @@ local function reload_flavor(flavor)
 end
 
 
-describe("routes schema (flavor = traditional/traditional_compatible)", function()
+for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions" }) do
+describe("routes schema (flavor = " .. flavor .. ")", function()
   local a_valid_uuid = "cbb297c0-a956-486d-ad1d-f9b42df9465a"
   local another_uuid = "64a8670b-900f-44e7-a900-6ec7ef5aa4d3"
   local uuid_pattern = "^" .. ("%x"):rep(8) .. "%-" .. ("%x"):rep(4) .. "%-"
                            .. ("%x"):rep(4) .. "%-" .. ("%x"):rep(4) .. "%-"
                            .. ("%x"):rep(12) .. "$"
 
-  reload_flavor("traditional")
+  local it_trad_only = (flavor == "traditional") and it or pending
+
+  reload_flavor(flavor)
+  setup_global_env()
 
   it("validates a valid route", function()
     local route = {
@@ -279,7 +298,7 @@ describe("routes schema (flavor = traditional/traditional_compatible)", function
         local ok, err = Routes:validate(route)
         assert.falsy(ok)
         assert.equal(u([[invalid regex: '/users/(foo/profile' (PCRE returned:
-                         pcre_compile() failed: missing ) in
+                         pcre2_compile() failed: missing closing parenthesis in
                          "/users/(foo/profile")]], true, true), err.paths[1])
       end
     end)
@@ -338,7 +357,8 @@ describe("routes schema (flavor = traditional/traditional_compatible)", function
       assert.is_true(ok)
     end)
 
-    it("accepts properly percent-encoded values", function()
+    -- TODO: bump atc-router to fix it
+    it_trad_only("accepts properly percent-encoded values", function()
       local valid_paths = { "/abcd\xaa\x10\xff\xAA\xFF" }
 
       for i = 1, #valid_paths do
@@ -1054,7 +1074,8 @@ describe("routes schema (flavor = traditional/traditional_compatible)", function
         assert.falsy(ok)
         assert.same({
           ["@entity"] = {
-            "must set one of 'sources', 'destinations', 'snis' when 'protocols' is 'tcp', 'tls' or 'udp'"
+            "must set one of 'sources', 'destinations', 'snis'" ..
+            (flavor == "expressions" and ", 'expression'" or "") .. " when 'protocols' is 'tcp', 'tls' or 'udp'"
           }
         }, errs)
       end
@@ -1071,7 +1092,8 @@ describe("routes schema (flavor = traditional/traditional_compatible)", function
     assert.falsy(ok)
     assert.same({
       ["@entity"] = {
-        "must set one of 'methods', 'hosts', 'headers', 'paths' when 'protocols' is 'http'"
+        "must set one of 'methods', 'hosts', 'headers', 'paths'" ..
+        (flavor == "expressions" and ", 'expression'" or "") .. " when 'protocols' is 'http'"
       }
     }, errs)
 
@@ -1083,7 +1105,8 @@ describe("routes schema (flavor = traditional/traditional_compatible)", function
     assert.falsy(ok)
     assert.same({
       ["@entity"] = {
-        "must set one of 'methods', 'hosts', 'headers', 'paths', 'snis' when 'protocols' is 'https'"
+        "must set one of 'methods', 'hosts', 'headers', 'paths', 'snis'" ..
+        (flavor == "expressions" and ", 'expression'" or "") .. " when 'protocols' is 'https'"
       }
     }, errs)
   end)
@@ -1098,7 +1121,8 @@ describe("routes schema (flavor = traditional/traditional_compatible)", function
     assert.falsy(ok)
     assert.same({
       ["@entity"] = {
-        "must set one of 'hosts', 'headers', 'paths' when 'protocols' is 'grpc'"
+        "must set one of 'hosts', 'headers', 'paths'" ..
+        (flavor == "expressions" and ", 'expression'" or "") .." when 'protocols' is 'grpc'"
       }
     }, errs)
 
@@ -1110,7 +1134,8 @@ describe("routes schema (flavor = traditional/traditional_compatible)", function
     assert.falsy(ok)
     assert.same({
       ["@entity"] = {
-        "must set one of 'hosts', 'headers', 'paths', 'snis' when 'protocols' is 'grpcs'"
+        "must set one of 'hosts', 'headers', 'paths', 'snis'" ..
+        (flavor == "expressions" and ", 'expression'" or "") .. " when 'protocols' is 'grpcs'"
       }
     }, errs)
   end)
@@ -1172,7 +1197,7 @@ describe("routes schema (flavor = traditional/traditional_compatible)", function
   it("errors if strip_path is set on grpc/grpcs", function()
     local s = { id = "a4fbd24e-6a52-4937-bd78-2536713072d2" }
     local route = Routes:process_auto_fields({
-      hosts = { "foo.grpc.com" },
+      hosts = { "foo.grpc.test" },
       protocols = { "grpc" },
       strip_path = true,
       service = s,
@@ -1184,7 +1209,7 @@ describe("routes schema (flavor = traditional/traditional_compatible)", function
     }, errs)
 
     route = Routes:process_auto_fields({
-      hosts = { "foo.grpc.com" },
+      hosts = { "foo.grpc.test" },
       protocols = { "grpcs" },
       strip_path = true,
       service = s,
@@ -1199,7 +1224,7 @@ describe("routes schema (flavor = traditional/traditional_compatible)", function
   it("errors if tls and tls_passthrough set on a same route", function()
     local s = { id = "a4fbd24e-6a52-4937-bd78-2536713072d2" }
     local route = Routes:process_auto_fields({
-      snis = { "foo.grpc.com" },
+      snis = { "foo.grpc.test" },
       protocols = { "tls", "tls_passthrough" },
       service = s,
     }, "insert")
@@ -1210,7 +1235,7 @@ describe("routes schema (flavor = traditional/traditional_compatible)", function
     }, errs)
   end)
 
-  it("errors if snis is not set on tls_pasthrough", function()
+  it("errors if snis is not set on tls_passthrough", function()
     local s = { id = "a4fbd24e-6a52-4937-bd78-2536713072d2" }
     local route = Routes:process_auto_fields({
       sources = {{ ip = "127.0.0.1" }},
@@ -1248,6 +1273,7 @@ describe("routes schema (flavor = traditional/traditional_compatible)", function
 
   end)
 end)
+end   -- for flavor
 
 
 describe("routes schema (flavor = expressions)", function()
@@ -1255,8 +1281,9 @@ describe("routes schema (flavor = expressions)", function()
   local another_uuid = "64a8670b-900f-44e7-a900-6ec7ef5aa4d3"
 
   reload_flavor("expressions")
+  setup_global_env()
 
-  it("validates a valid route", function()
+  it("validates a valid route with only expression field", function()
     local route = {
       id             = a_valid_uuid,
       name           = "my_route",
@@ -1275,6 +1302,99 @@ describe("routes schema (flavor = expressions)", function()
     assert.falsy(route.strip_path)
   end)
 
+  it("validates a valid route without expression field", function()
+    local route = {
+      id             = a_valid_uuid,
+      name           = "my_route",
+      protocols      = { "https" },
+
+      methods        = { "GET", "POST" },
+      hosts          = { "example.com" },
+      headers        = { location = { "location-1" } },
+      paths          = { "/ovo" },
+
+      snis           = { "example.org" },
+      sources        = {{ ip = "127.0.0.1" }},
+      destinations   = {{ ip = "127.0.0.1" }},
+
+      strip_path     = false,
+      preserve_host  = true,
+      service        = { id = another_uuid },
+    }
+    route = Routes:process_auto_fields(route, "insert")
+    assert.truthy(route.created_at)
+    assert.truthy(route.updated_at)
+    assert.same(route.created_at, route.updated_at)
+    assert.truthy(Routes:validate(route))
+    assert.falsy(route.strip_path)
+  end)
+
+  it("fails when set 'expression' and others simultaneously", function()
+    local route = {
+      id             = a_valid_uuid,
+      name           = "my_route",
+      protocols      = { "http" },
+      expression     = [[(http.method == "GET")]],
+      service        = { id = another_uuid },
+    }
+
+    local others = {
+      methods        = { "GET", "POST" },
+      hosts          = { "example.com" },
+      headers        = { location = { "location-1" } },
+      paths          = { "/ovo" },
+
+      snis           = { "example.org" },
+      sources        = {{ ip = "127.0.0.1" }},
+      destinations   = {{ ip = "127.0.0.1" }},
+
+      regex_priority = 100,
+    }
+
+    for k, v in pairs(others) do
+      route[k] = v
+
+      local r = Routes:process_auto_fields(route, "insert")
+      local ok, errs = Routes:validate_insert(r)
+      assert.falsy(ok)
+      assert.truthy(errs["@entity"])
+
+      route[k] = nil
+    end
+  end)
+
+  it("fails when set 'priority' and others simultaneously", function()
+    local route = {
+      id             = a_valid_uuid,
+      name           = "my_route",
+      protocols      = { "http" },
+      priority       = 100,
+      service        = { id = another_uuid },
+    }
+
+    local others = {
+      methods        = { "GET", "POST" },
+      hosts          = { "example.com" },
+      headers        = { location = { "location-1" } },
+      paths          = { "/ovo" },
+
+      snis           = { "example.org" },
+      sources        = {{ ip = "127.0.0.1" }},
+      destinations   = {{ ip = "127.0.0.1" }},
+    }
+
+    for k, v in pairs(others) do
+      route[k] = v
+
+      local r = Routes:process_auto_fields(route, "insert")
+      local ok, errs = Routes:validate_insert(r)
+      assert.falsy(ok)
+      assert.truthy(errs["@entity"])
+
+      route[k] = nil
+    end
+  end)
+
   it("fails when priority is missing", function()
     local route = { priority = ngx.null }
     route = Routes:process_auto_fields(route, "insert")
@@ -1283,12 +1403,20 @@ describe("routes schema (flavor = expressions)", function()
     assert.truthy(errs["priority"])
   end)
 
-  it("fails when expression is missing", function()
+  it("fails when priority is more than 2^46 - 1", function()
+    local route = { priority = 2^46 }
+    route = Routes:process_auto_fields(route, "insert")
+    local ok, errs = Routes:validate_insert(route)
+    assert.falsy(ok)
+    assert.truthy(errs["priority"])
+  end)
+
+  it("fails when all fields is missing", function()
     local route = { expression = ngx.null }
     route = Routes:process_auto_fields(route, "insert")
     local ok, errs = Routes:validate_insert(route)
     assert.falsy(ok)
-    assert.truthy(errs["expression"])
+    assert.truthy(errs["@entity"])
   end)
 
   it("fails given an invalid expression", function()
@@ -1301,5 +1429,405 @@ describe("routes schema (flavor = expressions)", function()
     local ok, errs = Routes:validate(route)
     assert.falsy(ok)
     assert.truthy(errs["@entity"])
+  end)
+end)
+
+
+for _, flavor in ipairs({ "traditional_compatible", "expressions" }) do
+describe("routes schema (flavor = " .. flavor .. ")", function()
+  local a_valid_uuid = "cbb297c0-a956-486d-ad1d-f9b42df9465a"
+  local another_uuid = "64a8670b-900f-44e7-a900-6ec7ef5aa4d3"
+
+  reload_flavor(flavor)
+  setup_global_env()
+
+  it("validates a valid http route", function()
+    local route = {
+      id             = a_valid_uuid,
+      name           = "my_route",
+      protocols      = { "http" },
+      methods        = { "GET", "POST" },
+      hosts          = { "example.com" },
+      headers        = { location = { "location-1" } },
+      paths          = { "/ovo" },
+      regex_priority = 1,
+      strip_path     = false,
+      preserve_host  = true,
+      service        = { id = another_uuid },
+    }
+    route = Routes:process_auto_fields(route, "insert")
+    assert.truthy(route.created_at)
+    assert.truthy(route.updated_at)
+    assert.same(route.created_at, route.updated_at)
+    assert.truthy(Routes:validate(route))
+    assert.falsy(route.strip_path)
+  end)
+
+  it("validates a valid stream route", function()
+    local route = {
+      id             = a_valid_uuid,
+      name           = "my_route",
+      protocols      = { "tcp" },
+      sources        = { { ip = "1.2.3.4", port = 80 } },
+      service        = { id = another_uuid },
+    }
+    route = Routes:process_auto_fields(route, "insert")
+    assert.truthy(route.created_at)
+    assert.truthy(route.updated_at)
+    assert.same(route.created_at, route.updated_at)
+    assert.truthy(Routes:validate(route))
+  end)
+
+  it("fails when path is invalid", function()
+    local route = {
+      id             = a_valid_uuid,
+      name           = "my_route",
+      protocols      = { "http" },
+      paths          = { "~/[abc/*/user$" },
+      service        = { id = another_uuid },
+    }
+    route = Routes:process_auto_fields(route, "insert")
+    local ok, errs = Routes:validate_insert(route)
+    assert.falsy(ok)
+    assert.truthy(errs["paths"])
+    assert.matches("invalid regex:", errs["paths"][1],
+                   nil, true)
+
+    -- verified by `schema/typedefs.lua`
+    assert.falsy(errs["@entity"])
+  end)
+
+  it("fails when ip address is invalid", function()
+    local route = {
+      id             = a_valid_uuid,
+      name           = "my_route",
+      protocols      = { "tcp" },
+      sources        = { { ip = "x.x.x.x", port = 80 } },
+      service        = { id = another_uuid },
+    }
+    route = Routes:process_auto_fields(route, "insert")
+    local ok, errs = Routes:validate_insert(route)
+    assert.falsy(ok)
+    assert.truthy(errs["sources"])
+
+    -- verified by `schema/typedefs.lua`
+    assert.falsy(errs["@entity"])
+  end)
+
+  it("won't fail when rust.regex update to 1.8", function()
+    local route = {
+      id             = a_valid_uuid,
+      name           = "my_route",
+      protocols      = { "http" },
+      paths          = { "~/\\/*/user$" },
+      service        = { id = another_uuid },
+    }
+    route = Routes:process_auto_fields(route, "insert")
+    local ok, errs = Routes:validate_insert(route)
+    assert.truthy(ok)
+    assert.is_nil(errs)
+  end)
+
+  describe("'snis' matching attribute (wildcard)", function()
+    local s = { id = "a4fbd24e-6a52-4937-bd78-2536713072d2" }
+
+    it("accepts leftmost wildcard", function()
+      for _, sni in ipairs({ "*.example.org", "*.foo.bar.test" }) do
+        local route = Routes:process_auto_fields({
+          protocols = { "https" },
+          snis = { sni },
+          service = s,
+        }, "insert")
+        local ok, errs = Routes:validate(route)
+        assert.is_nil(errs)
+        assert.truthy(ok)
+      end
+    end)
+
+    it("accepts rightmost wildcard", function()
+      for _, sni in ipairs({ "example.*", "foo.bar.*" }) do
+        local route = Routes:process_auto_fields({
+          protocols = { "https" },
+          snis = { sni },
+          service = s,
+        }, "insert")
+        local ok, errs = Routes:validate(route)
+        assert.is_nil(errs)
+        assert.truthy(ok)
+      end
+    end)
+
+    it("rejects invalid wildcard", function()
+      for _, sni in ipairs({ "foo.*.test", "foo*.test" }) do
+        local route = Routes:process_auto_fields({
+          protocols = { "https" },
+          snis = { sni },
+          service = s,
+        }, "insert")
+        local ok, errs = Routes:validate(route)
+        assert.falsy(ok)
+        assert.same({
+          snis = {
+            "wildcard must be leftmost or rightmost character",
+          },
+        }, errs)
+      end
+    end)
+  end)
+end)
+end   -- flavor in ipairs({ "traditional_compatible", "expressions" })
+
+
+describe("routes schema (flavor = expressions)", function()
+  local a_valid_uuid = "cbb297c0-a956-486d-ad1d-f9b42df9465a"
+  local another_uuid = "64a8670b-900f-44e7-a900-6ec7ef5aa4d3"
+
+  reload_flavor("expressions")
+  setup_global_env()
+
+  it("validates a 'not' expression", function()
+    local route = {
+      id             = a_valid_uuid,
+      name           = "my_route",
+      protocols      = { "http" },
+      expression     = [[!(http.method == "GET") && !(http.host == "example.com") && !(http.path ^= "/foo")]],
+      priority       = 100,
+      strip_path     = false,
+      preserve_host  = true,
+      service        = { id = another_uuid },
+    }
+    route = Routes:process_auto_fields(route, "insert")
+    assert.truthy(route.created_at)
+    assert.truthy(route.updated_at)
+    assert.same(route.created_at, route.updated_at)
+    assert.truthy(Routes:validate(route))
+    assert.falsy(route.strip_path)
+  end)
+
+  it("validates a valid http route", function()
+    local route = {
+      id             = a_valid_uuid,
+      name           = "my_route",
+      protocols      = { "http" },
+      expression     = [[http.method == "GET" && http.host == "example.com" && http.path == "/ovo"]],
+      priority       = 100,
+      strip_path     = false,
+      preserve_host  = true,
+      service        = { id = another_uuid },
+    }
+    route = Routes:process_auto_fields(route, "insert")
+    assert.truthy(route.created_at)
+    assert.truthy(route.updated_at)
+    assert.same(route.created_at, route.updated_at)
+    assert.truthy(Routes:validate(route))
+    assert.falsy(route.strip_path)
+  end)
+
+  it("validates a valid stream route", function()
+    local route = {
+      id             = a_valid_uuid,
+      name           = "my_route",
+      protocols      = { "tcp" },
+      expression     = [[net.src.ip == 1.2.3.4 && net.src.port == 80]],
+      priority       = 100,
+      service        = { id = another_uuid },
+    }
+    route = Routes:process_auto_fields(route, "insert")
+    assert.truthy(route.created_at)
+    assert.truthy(route.updated_at)
+    assert.same(route.created_at, route.updated_at)
+    assert.truthy(Routes:validate(route))
+  end)
+
+  it("fails when path is invalid", function()
+    local route = {
+      id             = a_valid_uuid,
+      name           = "my_route",
+      protocols      = { "http" },
+      expression     = [[http.method == "GET" && http.path ~ "/[abc/*/user$"]],
+      priority       = 100,
+      service        = { id = another_uuid },
+    }
+    route = Routes:process_auto_fields(route, "insert")
+    local ok, errs = Routes:validate_insert(route)
+    assert.falsy(ok)
+
+    assert.truthy(errs["@entity"])
+  end)
+
+  it("fails when ip address is invalid", function()
+    local route = {
+      id             = a_valid_uuid,
+      name           = "my_route",
+      protocols      = { "tcp" },
+      expression     = [[net.src.ip in 1.2.3.4/16 && net.src.port == 80]],
+      priority       = 100,
+      service        = { id = another_uuid },
+    }
+    route = Routes:process_auto_fields(route, "insert")
+    local ok, errs = Routes:validate_insert(route)
+    assert.falsy(ok)
+
+    assert.truthy(errs["@entity"])
+  end)
+
+  it("fails if http route's field appears in stream route", function()
+    local route = {
+      id             = a_valid_uuid,
+      name           = "my_route",
+      protocols      = { "tcp" },
+      expression     = [[http.method == "GET" && net.src.ip == 1.2.3.4 && net.src.port == 80]],
+      priority       = 100,
+      service        = { id = another_uuid },
+    }
+    route = Routes:process_auto_fields(route, "insert")
+    local ok, errs = Routes:validate_insert(route)
+    assert.falsy(ok)
+
+    assert.truthy(errs["@entity"])
+  end)
+
+  it("http route still supports net.port but with warning", function()
+    local ngx_log = ngx.log
+    local log = spy.on(ngx, "log")
+
+    finally(function()
+      ngx.log = ngx_log  -- luacheck: ignore
+    end)
+
+    local route = {
+      id             = a_valid_uuid,
+      name           = "my_route",
+      protocols      = { "grpc" },
+      expression     = [[http.method == "GET" && net.port == 8000]],
+      priority       = 100,
+      service        = { id = another_uuid },
+    }
+    route = Routes:process_auto_fields(route, "insert")
+    assert.truthy(Routes:validate(route))
+
+    assert.spy(log).was.called_with(ngx.WARN,
+                                    "The field 'net.port' of expression is deprecated " ..
+                                    "and will be removed in the upcoming major release, " ..
+                                    "please use 'net.dst.port' instead.")
+  end)
+
+  it("http route supports net.src.* fields", function()
+    local route = {
+      id             = a_valid_uuid,
+      name           = "my_route",
+      protocols      = { "https" },
+      expression     = [[http.method == "GET" && net.src.ip == 1.2.3.4 && net.src.port == 80]],
+      priority       = 100,
+      service        = { id = another_uuid },
+    }
+    route = Routes:process_auto_fields(route, "insert")
+    assert.truthy(Routes:validate(route))
+  end)
+
+  it("http route supports net.dst.* fields", function()
+    local route = {
+      id             = a_valid_uuid,
+      name           = "my_route",
+      protocols      = { "grpcs" },
+      expression     = [[http.method == "GET" && net.dst.ip == 1.2.3.4 && net.dst.port == 80]],
+      priority       = 100,
+      service        = { id = another_uuid },
+    }
+    route = Routes:process_auto_fields(route, "insert")
+    assert.truthy(Routes:validate(route))
+  end)
+
+  it("http route supports http.path.segments.* fields", function()
+    local r = {
+      id             = a_valid_uuid,
+      name           = "my_route",
+      protocols      = { "grpcs" },
+      priority       = 100,
+      service        = { id = another_uuid },
+    }
+
+    local expressions = {
+      [[http.path.segments.0 == "foo"]],
+      [[http.path.segments.1 ^= "bar"]],
+      [[http.path.segments.20_30 ~ r#"x/y"#]],
+      [[http.path.segments.len == 10]],
+    }
+
+    for _, exp in ipairs(expressions) do
+      r.expression = exp
+
+      local route = Routes:process_auto_fields(r, "insert")
+      assert.truthy(Routes:validate(route))
+    end
+
+  end)
+
+  it("fails if http route has invalid http.path.segments.* fields", function()
+    local r = {
+      id             = a_valid_uuid,
+      name           = "my_route",
+      protocols      = { "http" },
+      priority       = 100,
+      service        = { id = another_uuid },
+    }
+
+    local wrong_expressions = {
+      [[http.path.segments.len0   == 10]],
+      [[http.path.segments.len_a  == 10]],
+      [[http.path.segments.len    == "10"]],
+
+      [[http.path.segments.       == "foo"]],
+      [[http.path.segments.abc    == "foo"]],
+      [[http.path.segments.a_c    == "foo"]],
+      [[http.path.segments.1_2_3  == "foo"]],
+      [[http.path.segments.1_     == "foo"]],
+      [[http.path.segments._1     == "foo"]],
+      [[http.path.segments.2_1    == "foo"]],
+      [[http.path.segments.1_1    == "foo"]],
+      [[http.path.segments.01_2   == "foo"]],
+      [[http.path.segments.001_2  == "foo"]],
+      [[http.path.segments.1_03   == "foo"]],
+    }
+
+    for _, exp in ipairs(wrong_expressions) do
+      r.expression = exp
+
+      local route = Routes:process_auto_fields(r, "insert")
+      local ok, errs = Routes:validate_insert(route)
+      assert.falsy(ok)
+      assert.truthy(errs["@entity"])
+    end
+  end)
+end)
+
+
+describe("routes schema (flavor = traditional_compatible)", function()
+  local a_valid_uuid = "cbb297c0-a956-486d-ad1d-f9b42df9465a"
+  local another_uuid = "64a8670b-900f-44e7-a900-6ec7ef5aa4d3"
+
+  reload_flavor("traditional_compatible")
+  setup_global_env()
+
+  it("validates a route with only expression field", function()
+    local route = {
+      id             = a_valid_uuid,
+      name           = "my_route",
+      protocols      = { "http" },
+      hosts           = { "example.com" },
+      expression     = [[(http.method == "GET")]],
+      priority       = 100,
+      service        = { id = another_uuid },
+    }
+    route = Routes:process_auto_fields(route, "insert")
+    assert.truthy(route.created_at)
+    assert.truthy(route.updated_at)
+    assert.same(route.created_at, route.updated_at)
+    local ok, errs = Routes:validate(route)
+    assert.falsy(ok)
+    assert.same({
+      ["expression"] = 'unknown field',
+      ["priority"] = 'unknown field'
+    }, errs)
   end)
 end)

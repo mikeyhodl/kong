@@ -1,6 +1,6 @@
 local constants = require "kong.constants"
-local utils = require "kong.tools.utils"
 local vault_loader = require "kong.db.schema.vault_loader"
+local load_module_if_exists = require "kong.tools.module".load_module_if_exists
 
 
 local Vaults = {}
@@ -19,7 +19,7 @@ local DEBUG = ngx.DEBUG
 
 
 local function load_vault_strategy(vault)
-  local ok, strategy = utils.load_module_if_exists("kong.vaults." .. vault)
+  local ok, strategy = load_module_if_exists("kong.vaults." .. vault)
   if not ok then
     return nil, vault .. " vault is enabled but not installed;\n" .. strategy
   end
@@ -81,6 +81,16 @@ function Vaults:load_vault_schemas(vault_set)
   self.strategies = strategies
 
   return true
+end
+
+
+function Vaults:cache_key(prefix)
+  if type(prefix) == "table" then
+    prefix = prefix.prefix
+  end
+
+  -- Always return the cache_key without a workspace because prefix is unique across workspaces
+  return "vaults:" .. prefix .. ":::::"
 end
 
 

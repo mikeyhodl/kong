@@ -16,6 +16,7 @@ local re_find       = ngx.re.find
 local header        = ngx.header
 local var           = ngx.var
 local ngx_log       = ngx.log
+local ngx_ERR       = ngx.ERR
 local worker_id     = ngx.worker.id
 local concat        = table.concat
 local sort          = table.sort
@@ -33,7 +34,7 @@ local type          = type
 local max           = math.max
 local band          = bit.band
 local bor           = bit.bor
-local yield         = require("kong.tools.utils").yield
+local yield         = require("kong.tools.yield").yield
 local server_name   = require("ngx.ssl").server_name
 
 
@@ -55,6 +56,9 @@ local ERR           = ngx.ERR
 local WARN          = ngx.WARN
 
 
+local APPENDED = {}
+
+
 local function append(destination, value)
   local n = destination[0] + 1
   destination[0] = n
@@ -67,6 +71,12 @@ do
   log = function(lvl, ...)
     ngx_log(lvl, "[router] ", ...)
   end
+end
+
+
+local get_header
+if is_http then
+  get_header = require("kong.tools.http").get_header
 end
 
 
@@ -203,8 +213,7 @@ local MATCH_SUBRULES = {
 }
 
 
-local EMPTY_T = {}
-local MAX_REQ_HEADERS = 100
+local EMPTY_T = require("kong.tools.table").EMPTY
 
 
 local match_route
@@ -257,6 +266,12 @@ local function _set_ngx(mock_ngx)
     if mock_ngx.re.find then
       re_find = mock_ngx.re.find
     end
+  end
+
+  get_header = function(key)
+    local mock_headers = mock_ngx.headers or {}
+    local mock_var = mock_ngx.var or {}
+    return mock_headers[key] or mock_var["http_" .. key]
   end
 end
 
@@ -708,23 +723,59 @@ local function sort_uris(p1, p2)
 end
 
 
-local function sort_sources(r1, _)
-  local sources = r1.sources
-  for i = 1, sources[0] do
-    if sources[i].ip and sources[i].port then
-      return true
+local function sort_sources(r1, r2)
+  local sources_r1 = r1.sources
+  local sources_r2 = r2.sources
+
+  if sources_r1 == sources_r2 then
+    return false
+  end
+
+  local ip_port_r1 = 0
+  for i = 1, sources_r1[0] do
+    if sources_r1[i].ip and sources_r1[i].port then
+      ip_port_r1 = 1
+      break
     end
   end
+
+  local ip_port_r2 = 0
+  for i = 1, sources_r2[0] do
+    if sources_r2[i].ip and sources_r2[i].port then
+      ip_port_r2 = 1
+      break
+    end
+  end
+
+  return ip_port_r1 > ip_port_r2
 end
 
 
-local function sort_destinations(r1, _)
-  local destinations = r1.destinations
-  for i = 1, destinations[0] do
-    if destinations[i].ip and destinations[i].port then
-      return true
+local function sort_destinations(r1, r2)
+  local destinations_r1 = r1.destinations
+  local destinations_r2 = r2.destinations
+
+  if destinations_r1 == destinations_r2 then
+    return false
+  end
+
+  local ip_port_r1 = 0
+  for i = 1, destinations_r1[0] do
+    if destinations_r1[i].ip and destinations_r1[i].port then
+      ip_port_r1 = 1
+      break
     end
   end
+
+  local ip_port_r2 = 0
+  for i = 1, destinations_r2[0] do
+    if destinations_r2[i].ip and destinations_r2[i].port then
+      ip_port_r2 = 1
+      break
+    end
+  end
+
+  return ip_port_r1 > ip_port_r2
 end
 
 
@@ -762,24 +813,38 @@ end
 
 
 local function categorize_src_dst(route_t, source, category)
+  if source[0] == 0 then
+    return
+  end
+
   for i = 1, source[0] do
     local src_dst_t = source[i]
-    if src_dst_t.ip then
-      if not category[src_dst_t.ip] then
-        category[src_dst_t.ip] = { [0] = 0 }
+    local ip = src_dst_t.ip
+    if ip then
+      if not category[ip] then
+        category[ip] = { [0] = 0 }
       end
 
-      append(category[src_dst_t.ip], route_t)
+      if not APPENDED[ip] then
+        append(category[ip], route_t)
+        APPENDED[ip] = true
+      end
     end
 
-    if src_dst_t.port then
-      if not category[src_dst_t.port] then
-        category[src_dst_t.port] = { [0] = 0 }
+    local port = src_dst_t.port
+    if port then
+      if not category[port] then
+        category[port] = { [0] = 0 }
       end
 
-      append(category[src_dst_t.port], route_t)
+      if not APPENDED[port] then
+        append(category[port], route_t)
+        APPENDED[port] = true
+      end
     end
   end
+
+  clear(APPENDED)
 end
 
 
@@ -1247,6 +1312,10 @@ local function find_match(ctx)
           end
         end
 
+        if matched_route.preserve_host and upstream_host == nil then
+          upstream_host = ctx.sni
+        end
+
         return {
           route           = matched_route.route,
           service         = matched_route.service,
@@ -1340,6 +1409,11 @@ function _M.new(routes, cache, cache_neg)
 
       local route = routes[i]
       local r = routes[i].route
+      if r.expression then
+        ngx_log(ngx_ERR, "expecting a traditional route while expression is given. ",
+                    "Likely it's a misconfiguration. Please check router_flavor")
+      end
+
       if r.id ~= nil then
         routes_by_id[r.id] = route
       end
@@ -1681,20 +1755,23 @@ function _M.new(routes, cache, cache_neg)
     exec = function(ctx)
       local req_method = get_method()
       local req_uri = ctx and ctx.request_uri or var.request_uri
-      local req_host = var.http_host
+      local req_host = get_header("host", ctx)
       local req_scheme = ctx and ctx.scheme or var.scheme
       local sni = server_name()
 
       local headers
       if match_headers then
         local err
-        headers, err = get_headers(MAX_REQ_HEADERS)
+        headers, err = get_headers()
         if err == "truncated" then
-          log(WARN, "retrieved ", MAX_REQ_HEADERS, " headers for evaluation ",
-                    "(max) but request had more; other headers will be ignored")
+          local lua_max_req_headers = kong and kong.configuration and kong.configuration.lua_max_req_headers or 100
+          log(ERR, "router: not all request headers were read in order to determine the route as ",
+                    "the request contains more than ", lua_max_req_headers, " headers, route selection ",
+                    "may be inaccurate, consider increasing the 'lua_max_req_headers' configuration value ",
+                    "(currently at ", lua_max_req_headers, ")")
         end
 
-        headers["host"] = nil
+        headers.host = nil
       end
 
       req_uri = strip_uri_args(req_uri)
@@ -1705,7 +1782,7 @@ function _M.new(routes, cache, cache_neg)
                                  sni, headers)
       if match_t then
         -- debug HTTP request header logic
-        add_debug_headers(var, header, match_t)
+        add_debug_headers(ctx, header, match_t)
       end
 
       return match_t
@@ -1716,8 +1793,7 @@ function _M.new(routes, cache, cache_neg)
       local src_ip = var.remote_addr
       local dst_ip = var.server_addr
       local src_port = tonumber(var.remote_port, 10)
-      local dst_port = tonumber((ctx or ngx.ctx).host_port, 10)
-                    or tonumber(var.server_port, 10)
+      local dst_port = (ctx or ngx.ctx).host_port or tonumber(var.server_port, 10)
       -- error value for non-TLS connections ignored intentionally
       local sni = server_name()
       -- fallback to preread SNI if current connection doesn't terminate TLS
@@ -1736,7 +1812,7 @@ function _M.new(routes, cache, cache_neg)
       -- rewrite the dst_ip, port back to what specified in proxy_protocol
       if var.kong_tls_passthrough_block == "1" or var.ssl_protocol then
         dst_ip = var.proxy_protocol_server_addr
-        dst_port = tonumber(var.proxy_protocol_server_port)
+        dst_port = tonumber(var.proxy_protocol_server_port, 10)
       end
 
       return find_route(nil, nil, nil, scheme,

@@ -1,6 +1,7 @@
 -- Copyright (c) Kong Inc. 2020
 
-local cjson = require "cjson"
+local cjson = require "cjson.safe".new()
+local buffer = require "string.buffer"
 local pb = require "pb"
 local grpc_tools = require "kong.tools.grpc"
 local grpc_frame = grpc_tools.frame
@@ -14,6 +15,8 @@ local re_match = ngx.re.match
 local re_gmatch = ngx.re.gmatch
 
 local encode_json = cjson.encode
+local decode_json = cjson.decode
+local pcall = pcall
 
 local deco = {}
 deco.__index = deco
@@ -90,8 +93,8 @@ local function get_proto_info(fname)
   local grpc_tools_instance = grpc_tools.new()
   grpc_tools_instance:each_method(fname, function(parsed, srvc, mthd)
     local options_bindings =  {
-      safe_access(mthd, "options", "options", "google.api.http"),
-      safe_access(mthd, "options", "options", "google.api.http", "additional_bindings")
+      safe_access(mthd, "options", "google.api.http"),
+      safe_access(mthd, "options", "google.api.http", "additional_bindings")
     }
     for _, options in ipairs(options_bindings) do
       for http_method, http_path in pairs(options) do
@@ -191,7 +194,7 @@ end
 local function add_to_table( t, path, v, typ )
   local tab = t -- set up pointer to table root
   local msg_typ = typ;
-  for m in re_gmatch( path , "([^.]+)(\\.)?") do
+  for m in re_gmatch( path , "([^.]+)(\\.)?", "jo" ) do
     local key, dot = m[1], m[2]
     msg_typ = get_field_type(msg_typ, key)
 
@@ -224,7 +227,10 @@ function deco:upstream(body)
   local body_variable = self.endpoint.body_variable
   if body_variable then
     if body and #body > 0 then
-      local body_decoded = cjson.decode(body)
+      local body_decoded, err = decode_json(body)
+      if err then
+        return nil, "decode json err: " .. err
+      end
       if body_variable ~= "*" then
         --[[
           // For HTTP methods that allow a request body, the `body` field
@@ -266,7 +272,17 @@ function deco:upstream(body)
       end
     end
   end
-  body = grpc_frame(0x0, pb.encode(self.endpoint.input_type, payload))
+
+  local pok, msg = pcall(pb.encode, self.endpoint.input_type, payload)
+  if not pok or not msg then
+    if msg then
+      ngx.log(ngx.ERR, msg)
+    end
+    -- should return error msg to client?
+    return nil, "failed to encode payload"
+  end
+
+  body = grpc_frame(0x0, msg)
   return body
 end
 
@@ -274,19 +290,18 @@ end
 function deco:downstream(chunk)
   local body = (self.downstream_body or "") .. chunk
 
-  local out, n = {}, 1
+  local out = buffer.new()
   local msg, body = grpc_unframe(body)
 
   while msg do
     msg = encode_json(pb.decode(self.endpoint.output_type, msg))
 
-    out[n] = msg
-    n = n + 1
+    out:put(msg)
     msg, body = grpc_unframe(body)
   end
 
   self.downstream_body = body
-  chunk = table.concat(out)
+  chunk = out:get()
 
   return chunk
 end

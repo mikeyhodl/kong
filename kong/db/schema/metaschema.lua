@@ -2,6 +2,8 @@
 -- @module kong.db.schema.metaschema
 
 local Schema = require "kong.db.schema"
+local json_lib = require "kong.db.schema.json"
+local constants = require "kong.constants"
 
 
 local setmetatable = setmetatable
@@ -12,6 +14,7 @@ local find = string.find
 local type = type
 local next = next
 local keys = require("pl.tablex").keys
+local values = require("pl.tablex").values
 local sub = string.sub
 local fmt = string.format
 
@@ -40,10 +43,9 @@ local match_any_list = {
   }
 }
 
-
 -- Field attributes which match a validator function in the Schema class
 local validators = {
-  { between = { type = "array", elements = { type = "integer" }, len_eq = 2 }, },
+  { between = { type = "array", elements = { type = "number" }, len_eq = 2 }, },
   { eq = { type = "any" }, },
   { ne = { type = "any" }, },
   { gt = { type = "number" }, },
@@ -66,12 +68,118 @@ local validators = {
   { mutually_exclusive_subsets = { type = "array", elements = { type = "array", elements = { type = "string" } } } },
 }
 
+-- JSON schema is supported in two different methods:
+--
+-- * inline: the JSON schema is defined in the field itself
+-- * dynamic/reference: the JSON schema is stored in the database
+--
+-- Inline schemas have the JSON schema definied statically within
+-- the typedef's `json_schema.inline` field. Example:
+--
+-- ```lua
+-- local field = {
+--   type = "json",
+--   json_schema = {
+--     inline = {
+--       type = "object",
+--       properties = {
+--         foo = { type = "string" },
+--       },
+--     },
+--   }
+-- }
+--
+-- local record = {
+--   type = "record",
+--   fields = {
+--     { name = { type = "string" } },
+--     { config = field },
+--   },
+-- }
+--
+-- ```
+--
+-- Fields with dynamic schemas function similarly to Lua subschemas, wherein
+-- the contents of the input are used to generate a string key that is used
+-- to lookup the schema from the schema storage. Example:
+--
+-- ```lua
+-- local record = {
+--   type = "record",
+--   fields = {
+--     { name = { type = "string" } },
+--     { config = {
+--         type = "json",
+--         json_schema = {
+--           namespace = "my-record-type",
+--           parent_subschema_key = "name",
+--           optional = true,
+--         },
+--       },
+--     },
+--   },
+-- }
+-- ```
+--
+-- In this case, an input value of `{ name = "foo", config = "foo config" }`
+-- will cause the validation engine to lookup a schema by the name of
+-- `my-record-type/foo`. The `optional` field determines what will happen if
+-- the schema does not exist. When `optional` is `false`, a missing schema
+-- means that input validation will fail. When `optional` is `true`, the input
+-- is always accepted.
+--
+-- Schemas which use this dynamic reference format can also optionally supply
+-- a default inline schema, which will be evaluated when the dynamic schema
+-- does not exist:
+--
+-- ```lua
+-- local record = {
+--   type = "record",
+--   fields = {
+--     { name = { type = "string" } },
+--     { config = {
+--         type = "json",
+--         json_schema = {
+--           namespace = "my-record-type",
+--           parent_subschema_key = "name",
+--           default = {
+--             { type = { "string", "null" } },
+--           },
+--         },
+--       },
+--     },
+--   },
+-- }
+-- ```
+--
+local json_metaschema = {
+  type = "record",
+  fields = {
+    { namespace = { type = "string", one_of = values(constants.SCHEMA_NAMESPACES), }, },
+    { parent_subschema_key = { type = "string" }, },
+    { optional = { type = "boolean", }, },
+    { inline = { type = "any", custom_validator = json_lib.validate_schema, }, },
+    { default = { type = "any", custom_validator = json_lib.validate_schema, }, },
+  },
+  entity_checks = {
+    { at_least_one_of = { "inline", "namespace", "parent_subschema_key" }, },
+    { mutually_required = { "namespace", "parent_subschema_key" }, },
+    { mutually_exclusive_sets = {
+        set1 = { "inline" },
+        set2 = { "namespace", "parent_subschema_key", "optional" },
+      },
+    },
+  },
+}
+
 
 -- Other field attributes, that do not correspond to validators
 local field_schema = {
   { type = { type = "string", one_of = keys(Schema.valid_types), required = true }, },
   { required = { type = "boolean" }, },
   { reference = { type = "string" }, },
+  { description = { type = "string", len_min = 10, len_max = 500}, },
+  { examples = { type = "array", elements = { type = "any" } } },
   { auto = { type = "boolean" }, },
   { unique = { type = "boolean" }, },
   { unique_across_ws = { type = "boolean" }, },
@@ -83,6 +191,32 @@ local field_schema = {
   { err = { type = "string" } },
   { encrypted = { type = "boolean" }, },
   { referenceable = { type = "boolean" }, },
+  { json_schema = json_metaschema },
+  -- Transient attribute: used to mark a field as a non-db column
+  { transient = { type = "boolean" }, },
+  -- Deprecation attribute: used to mark a field as deprecated
+  -- Results in `message` and `removal_in_version` to be printed in a warning
+  -- (via kong.deprecation) when the field is used.
+  -- If `old_default` is not set, the warning message is always printed.
+  -- If `old_default` is set, the warning message is only printed when the
+  -- field's value is different from the value of `old_default`.
+  { deprecation = {
+    type = "record",
+    fields = {
+      { message = { type = "string", required = true } },
+      { removal_in_version = { type = "string", required = true } },
+      { old_default = { type = "any", required = false } },
+      { replaced_with = { type = "array", required = false,
+          elements = { type = "record",
+            required = false,
+            fields = {
+              { path = { type = "array", len_min = 1, required = true, elements = { type = "string"}} },
+              { reverse_mapping_function = { type = "function", required = false }}
+            },
+          }
+      } },
+    },
+  } },
 }
 
 
@@ -222,6 +356,8 @@ local entity_checkers = {
       fields = {
         { field_sources = { type = "array", elements = { type = "string" } } },
         { fn = { type = "function" } },
+        { run_with_missing_fields = { type = "boolean" } },
+        { run_with_invalid_fields = { type = "boolean" } },
       }
     }
   },
@@ -294,6 +430,8 @@ local meta_errors = {
   TTL_RESERVED = "ttl is a reserved field name when ttl is enabled",
   SUBSCHEMA_KEY = "value must be a field name",
   SUBSCHEMA_KEY_TYPE = "must be a string or set field",
+  JSON_PARENT_KEY = "value must be a field name of the parent schema",
+  JSON_PARENT_KEY_TYPE = "value must be a string field of the parent schema",
 }
 
 
@@ -302,6 +440,7 @@ local required_attributes = {
   set = { "elements" },
   map = { "keys", "values" },
   record = { "fields" },
+  json = { "json_schema" },
 }
 
 
@@ -358,6 +497,17 @@ local attribute_types = {
     ["array"] = true,
     ["set"] = true,
     ["map"] = true,
+  },
+  json_schema = {
+    ["json"] = true,
+  },
+  transient = {
+    ["string"] = true,
+    ["number"] = true,
+    ["integer"] = true,
+    ["array"] = true,
+    ["set"] = true,
+    ["boolean"] = true,
   },
 }
 
@@ -456,7 +606,7 @@ local check_fields = function(schema, errors)
     end
     local field = item[k]
     if type(field) == "table" then
-      check_field(k, field, errors)
+      check_field(k, field, errors, schema)
     else
       errors[k] = meta_errors.TABLE:format(k)
     end
@@ -468,7 +618,7 @@ local check_fields = function(schema, errors)
 end
 
 
-check_field = function(k, field, errors)
+check_field = function(k, field, errors, parent_schema)
   if not field.type then
     errors[k] = meta_errors.TYPE
     return nil
@@ -493,12 +643,46 @@ check_field = function(k, field, errors)
   for name, _ in pairs(nested_attributes) do
     if field[name] then
       if type(field[name]) == "table" then
-        check_field(k, field[name], errors)
+        check_field(k, field[name], errors, field)
       else
         errors[k] = meta_errors.TABLE:format(name)
       end
     end
   end
+
+  if field.type == "json"
+    and field.json_schema
+    and field.json_schema.parent_subschema_key
+  then
+    local parent_subschema_key = field.json_schema.parent_subschema_key
+    local found = false
+
+    for i = 1, #parent_schema.fields do
+      local item = parent_schema.fields[i]
+      local parent_field_name = next(item)
+      local parent_field = item[parent_field_name]
+
+      if parent_subschema_key == parent_field_name then
+        if parent_field.type ~= "string" then
+          errors[k] = errors[k] or {}
+          errors[k].json_schema = {
+            parent_subschema_key = meta_errors.JSON_PARENT_KEY_TYPE
+          }
+        end
+        found = true
+        break
+      end
+    end
+
+    if not found then
+      errors[k] = errors[k] or {}
+      errors[k].json_schema = {
+        parent_subschema_key = meta_errors.JSON_PARENT_KEY
+      }
+      return
+    end
+  end
+
   if field.fields then
     return check_fields(field, errors)
   end

@@ -21,7 +21,7 @@ for _, strategy in helpers.each_strategy() do
         admin_client:close()
       end
 
-      helpers.stop_kong(nil, true)
+      helpers.stop_kong()
     end)
 
     describe("POST", function()
@@ -31,13 +31,13 @@ for _, strategy in helpers.each_strategy() do
         local service = bp.services:insert()
 
         route = bp.routes:insert {
-          hosts      = { "test1.com" },
+          hosts      = { "test1.test" },
           protocols  = { "http", "https" },
           service    = service
         }
 
         route2 = bp.routes:insert {
-          hosts      = { "test2.com" },
+          hosts      = { "test2.test" },
           protocols  = { "http", "https" },
           service    = service
         }
